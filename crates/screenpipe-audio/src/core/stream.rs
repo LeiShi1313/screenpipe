@@ -386,6 +386,23 @@ impl AudioStream {
                     tokio::time::sleep(std::time::Duration::from_millis(chunk_duration_ms)).await;
                 }
             }
+            // Wait for the consumer to drain the buffered chunks before
+            // signalling EOF. record_and_transcribe's outer loop checks
+            // is_disconnected on every iteration, so flipping it while
+            // chunks are still buffered would discard them. Poll the
+            // broadcast queue depth — it's the only signal we have for
+            // "consumer has caught up." 30 s cap is enough for a 60 min
+            // wav drained at non-realtime speed.
+            let drain_start = std::time::Instant::now();
+            while tx.len() > 0 && drain_start.elapsed().as_secs() < 30 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // After the broadcast queue is empty the consumer still has
+            // up to one chunk's worth of work in flight (collected_audio
+            // accumulating, prepare_segments running, run_stt blocking on
+            // whisper). Give it a settling window before we declare EOF
+            // so the in-flight chunk completes.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             is_disconnected_clone.store(true, Ordering::Relaxed);
         });
 

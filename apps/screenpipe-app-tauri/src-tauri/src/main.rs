@@ -44,6 +44,7 @@ mod capture_session;
 mod chatgpt_oauth;
 #[allow(deprecated)]
 mod commands;
+mod cpu_support;
 mod disk_usage;
 mod embedded_server;
 mod enterprise_policy;
@@ -317,6 +318,10 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
 
 #[tokio::main]
 async fn main() {
+    // Check CPU capabilities before initializing heavy dependencies
+    if !cpu_support::check_avx2_support() {
+        std::process::exit(1);
+    }
     let _ = fix_path_env::fix();
 
     // Refuse to launch while a `screenpipe db recover|cleanup` operation is in

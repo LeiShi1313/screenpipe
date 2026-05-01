@@ -312,6 +312,9 @@ commits: `eea0c865`, `cc09de61`, `e61501da`, `d25191d7`, `60096fb9`
 - [ ] **low disk space** — with <1GB free, app should warn user. no crash from failed writes.
 - [ ] **large database (>10GB)** — search still returns results within 2 seconds. app doesn't freeze on startup.
 - [ ] **Audio chunk timestamps** — `start_time` and `end_time` are correctly set for reconciled and retranscribed audio chunks in the database.
+- [ ] **concurrent chat saves don't ENOENT** — Open a chat conversation and repeatedly trigger saves (autosave + sidebar updates + router background saves). Verify no "[webview] persist browserState failed" errors in logs. (`e2ff708cb`)
+- [ ] **chat history never silently lost** — Start a conversation with 150+ messages. Force-quit the app mid-save. Relaunch. Verify all messages are present, not truncated to 100. (`71dcbd1ca`)
+- [ ] **Windows pipe-run chat sessions persist** — On Windows, run a pipe and chat about its results. Close the app. Relaunch. Verify the pipe run chat history is still present (not lost to filename sanitization). (`6c038aeb8`)
 
 ### 10. AI presets & settings
 

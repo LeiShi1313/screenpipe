@@ -1491,6 +1491,44 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Spawn the async PII reconciliation worker (issue #3185).
+    // Off by default — only runs when `--async-pii-redaction` is set.
+    // The capture path is unaffected either way.
+    if record_args.async_pii_redaction {
+        use screenpipe_redact::{
+            adapters::tinfoil::TinfoilRedactor,
+            pipeline::{Pipeline, PipelineConfig},
+            worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
+            Redactor,
+        };
+        use std::sync::Arc;
+
+        info!(
+            "starting async PII reconciliation worker (destructive={})",
+            record_args.async_pii_redaction_destructive
+        );
+
+        // Pipeline: regex pre-pass + Tinfoil enclave fallback. Regex
+        // catches structural PII deterministically and on-device; the
+        // Tinfoil call only fires for inputs longer than regex can
+        // fully cover (see PipelineConfig).
+        let tinfoil = Arc::new(TinfoilRedactor::from_env()) as Arc<dyn Redactor>;
+        let pipeline = Pipeline::regex_then_ai(tinfoil, PipelineConfig::default());
+        let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
+
+        let worker_cfg = WorkerConfig {
+            tables: ALL_TARGET_TABLES.to_vec(),
+            destructive: record_args.async_pii_redaction_destructive,
+            ..Default::default()
+        };
+        let _worker_handle = Worker::new(db.pool.clone(), pipeline_arc, worker_cfg).spawn();
+        // The worker runs for the lifetime of the engine. We don't
+        // join its handle — when the process exits the runtime
+        // tears down the task. If we ever want graceful shutdown
+        // (drain in-flight HTTP calls), wire `_worker_handle` into
+        // the shutdown_tx flow.
+    }
+
     // Add auto-destruct watcher
     if let Some(pid) = record_args.auto_destruct_pid {
         info!("watching pid {} for auto-destruction", pid);

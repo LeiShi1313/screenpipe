@@ -191,6 +191,23 @@ pub struct RecordingSettings {
     #[serde(rename = "usePiiRemoval")]
     pub use_pii_removal: bool,
 
+    /// Enable the async PII reconciliation worker. When `true`, a
+    /// background task runs after capture to populate the
+    /// `text_redacted` columns on `ocr_text`, `audio_transcriptions`,
+    /// `accessibility`, and `ui_events`. Off by default — capture
+    /// path is unaffected either way. See issue #3185 and the
+    /// `screenpipe-redact` crate for the full design.
+    #[serde(rename = "asyncPiiRedaction", default)]
+    pub async_pii_redaction: bool,
+
+    /// When `async_pii_redaction` is enabled and this is `true`, the
+    /// reconciliation worker overwrites the source column (raw text)
+    /// with the redacted version. Destroys the raw secret at rest;
+    /// trades the ability to re-redact with a better future model
+    /// for stronger at-rest privacy. Default `false`.
+    #[serde(rename = "asyncPiiRedactionDestructive", default)]
+    pub async_pii_redaction_destructive: bool,
+
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
     /// Kept as String (not Option) to match existing store.bin schema.
@@ -359,6 +376,8 @@ impl Default for RecordingSettings {
             append_typed_text_to_meeting_notes: true,
             languages: vec![],
             use_pii_removal: false,
+            async_pii_redaction: false,
+            async_pii_redaction_destructive: false,
             user_id: String::new(),
             user_name: None,
             openai_compatible_endpoint: None,

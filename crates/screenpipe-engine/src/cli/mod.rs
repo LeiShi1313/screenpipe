@@ -326,6 +326,20 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_pii_removal: bool,
 
+    /// Enable the async PII reconciliation worker (issue #3185). Runs a
+    /// background task after capture to populate `text_redacted` columns
+    /// on ocr_text, audio_transcriptions, accessibility, and ui_events.
+    /// Off by default — capture path is unaffected either way.
+    #[arg(long, default_value_t = false)]
+    pub async_pii_redaction: bool,
+
+    /// When `--async-pii-redaction` is on, also overwrite the source
+    /// column (raw text) with the redacted version. Destroys the raw
+    /// secret at rest; trades re-redaction-on-better-model for
+    /// stronger at-rest privacy. Default false.
+    #[arg(long, default_value_t = false)]
+    pub async_pii_redaction_destructive: bool,
+
     /// Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise)
     #[arg(long, default_value_t = false)]
     pub filter_music: bool,
@@ -474,6 +488,8 @@ impl RecordArgs {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            async_pii_redaction: self.async_pii_redaction,
+            async_pii_redaction_destructive: self.async_pii_redaction_destructive,
             filter_music: self.filter_music,
             #[allow(deprecated)]
             enable_input_capture: true,

@@ -39,8 +39,17 @@ pub struct WorkerConfig {
     pub idle_between_batches: Duration,
     /// Sleep when the queue IS empty (poll interval).
     pub poll_interval: Duration,
-    /// Tables to reconcile. Default: all four.
+    /// Tables to reconcile. Default: all five (ocr, audio, accessibility,
+    /// ui_events:keyboard, ui_events:clipboard).
     pub tables: Vec<TargetTable>,
+    /// When `true`, the worker overwrites the source column (`text`,
+    /// `transcription`, `text_content`) with the redacted text in
+    /// addition to populating `text_redacted`. The raw secret is gone
+    /// after the UPDATE — protects at-rest data, but trades the
+    /// ability to re-redact when a better model lands. Default
+    /// `false` (matches issue #3185 spec). Users opt in for the
+    /// stricter at-rest privacy posture.
+    pub destructive: bool,
 }
 
 impl Default for WorkerConfig {
@@ -50,6 +59,7 @@ impl Default for WorkerConfig {
             idle_between_batches: Duration::from_millis(50),
             poll_interval: Duration::from_secs(5),
             tables: ALL_TARGET_TABLES.to_vec(),
+            destructive: false,
         }
     }
 }
@@ -174,7 +184,15 @@ impl Worker {
 
         let version = self.redactor.version() as i64;
         for (row, out) in rows.iter().zip(outputs.iter()) {
-            tables::write_redacted(&self.pool, table, row.id, &out.redacted, version).await?;
+            tables::write_redacted(
+                &self.pool,
+                table,
+                row.id,
+                &out.redacted,
+                version,
+                self.cfg.destructive,
+            )
+            .await?;
         }
 
         let n = rows.len() as u32;

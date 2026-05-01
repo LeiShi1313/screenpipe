@@ -28,19 +28,30 @@ ALTER TABLE audio_transcriptions ADD COLUMN redacted_at       INTEGER;
 ALTER TABLE audio_transcriptions ADD COLUMN redaction_version INTEGER;
 
 -- Accessibility-tree text (window titles, AX nodes, app chrome).
+-- Source column is `text_content` (the column added in
+-- 20250202000000_add_accessibility_and_input_tables.sql).
 ALTER TABLE accessibility ADD COLUMN text_redacted     TEXT;
 ALTER TABLE accessibility ADD COLUMN redacted_at       INTEGER;
 ALTER TABLE accessibility ADD COLUMN redaction_version INTEGER;
 
--- Clipboard contents.
-ALTER TABLE clipboard ADD COLUMN text_redacted     TEXT;
-ALTER TABLE clipboard ADD COLUMN redacted_at       INTEGER;
-ALTER TABLE clipboard ADD COLUMN redaction_version INTEGER;
+-- UI events: typed keystrokes, clicks, clipboard payloads.
+-- The reconciliation worker only touches rows where `event_type IN
+-- ('text','key','clipboard')`; the redaction columns exist on every
+-- row but stay NULL for rows we don't process (clicks, focus events).
+ALTER TABLE ui_events ADD COLUMN text_redacted     TEXT;
+ALTER TABLE ui_events ADD COLUMN redacted_at       INTEGER;
+ALTER TABLE ui_events ADD COLUMN redaction_version INTEGER;
 
 -- Indexes on `redacted_at` so the worker's "needs redaction" query
 -- (which scans by primary key DESC) is cheap, and so search-time
 -- "show me only redacted rows" filters are cheap too.
-CREATE INDEX IF NOT EXISTS idx_ocr_text_redacted_at           ON ocr_text(redacted_at);
+CREATE INDEX IF NOT EXISTS idx_ocr_text_redacted_at             ON ocr_text(redacted_at);
 CREATE INDEX IF NOT EXISTS idx_audio_transcriptions_redacted_at ON audio_transcriptions(redacted_at);
-CREATE INDEX IF NOT EXISTS idx_accessibility_redacted_at      ON accessibility(redacted_at);
-CREATE INDEX IF NOT EXISTS idx_clipboard_redacted_at          ON clipboard(redacted_at);
+CREATE INDEX IF NOT EXISTS idx_accessibility_redacted_at        ON accessibility(redacted_at);
+CREATE INDEX IF NOT EXISTS idx_ui_events_redacted_at            ON ui_events(redacted_at);
+
+-- For the ui_events scan we also benefit from a (event_type,
+-- redacted_at) compound — keyboard-only / clipboard-only fetches
+-- otherwise scan the whole table.
+CREATE INDEX IF NOT EXISTS idx_ui_events_type_redacted_at
+  ON ui_events(event_type, redacted_at);

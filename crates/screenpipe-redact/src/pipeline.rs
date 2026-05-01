@@ -82,7 +82,6 @@ impl Pipeline {
             cache: RedactionCache::with_defaults(),
         }
     }
-
 }
 
 #[async_trait]

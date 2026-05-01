@@ -4,36 +4,64 @@
 
 //! Per-table queries used by the reconciliation worker.
 //!
-//! Each target table follows the same shape after the `20260501_*`
-//! migration:
+//! After the `20260501_*` migration, each text-bearing table grows
+//! three columns:
 //!
-//! - the existing text column (`text`, `transcription`, `text_output`,
-//!   `content`) — the raw input the worker reads
-//! - `text_redacted TEXT NULL` — written by the worker
-//! - `redacted_at INTEGER NULL` — unix-seconds the redaction landed
-//! - `redaction_version INTEGER NULL` — which adapter+version produced it
+//! - `text_redacted     TEXT NULL` — written by the worker
+//! - `redacted_at       INTEGER NULL` — unix-seconds the redaction landed
+//! - `redaction_version INTEGER NULL` — name+version of the redactor
 //!
-//! The "needs redaction" predicate is
+//! ## What we redact
+//!
+//! Four targets, distinct enough that we treat them as separate
+//! [`TargetTable`] variants:
+//!
+//! 1. **`ocr_text`** — OCR'd screen text. Source column `text`.
+//! 2. **`audio_transcriptions`** — speech-to-text output. Source column
+//!    `transcription`.
+//! 3. **`accessibility`** — accessibility-tree dumps from macOS / Windows
+//!    AX APIs. Source column **`text_content`** (NOT `text_output` —
+//!    that was a bug in an earlier draft).
+//! 4. **`ui_events`** — user input events. The same table holds both
+//!    typed/keystroke text (`event_type IN ('text', 'key')`) and
+//!    clipboard contents (`event_type = 'clipboard'`). Source column
+//!    `text_content`. We split into two variants so the row-fetch SQL
+//!    can filter by `event_type` — both go through the same
+//!    redactor but they're different deployment surfaces (a user
+//!    might want clipboard always-redacted but typed text raw, for
+//!    example).
+//!
+//! ## "Needs redaction" predicate
+//!
 //! `text_redacted IS NULL OR redaction_version < {current}`. That makes
-//! re-redaction free: the worker sweeps over old rows automatically
-//! when the redactor version bumps.
+//! re-redaction free: when the redactor's version bumps the worker
+//! sweeps over old rows automatically.
 
 use sqlx::{Row, SqlitePool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetTable {
+    /// OCR'd screen text (`ocr_text.text`).
     Ocr,
+    /// Speech-to-text (`audio_transcriptions.transcription`).
     AudioTranscription,
+    /// Accessibility-tree dumps (`accessibility.text_content`).
     Accessibility,
-    Clipboard,
+    /// Typed text + keystrokes captured via UI events
+    /// (`ui_events.text_content` filtered to `event_type IN ('text','key')`).
+    UiEventsKeyboard,
+    /// Clipboard payloads captured via UI events
+    /// (`ui_events.text_content` filtered to `event_type='clipboard'`).
+    UiEventsClipboard,
 }
 
 pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::Ocr,
     TargetTable::AudioTranscription,
     TargetTable::Accessibility,
-    TargetTable::Clipboard,
+    TargetTable::UiEventsKeyboard,
+    TargetTable::UiEventsClipboard,
 ];
 
 /// One row to redact.
@@ -44,33 +72,53 @@ pub struct UnredactedRow {
 }
 
 impl TargetTable {
-    /// Table name in the SQLite schema.
+    /// Physical SQLite table.
     pub fn table(&self) -> &'static str {
         match self {
             Self::Ocr => "ocr_text",
             Self::AudioTranscription => "audio_transcriptions",
             Self::Accessibility => "accessibility",
-            Self::Clipboard => "clipboard",
+            Self::UiEventsKeyboard | Self::UiEventsClipboard => "ui_events",
         }
     }
 
-    /// Source column the redactor reads. Different across tables for
-    /// historical reasons.
+    /// Source column the redactor reads.
     pub fn source_col(&self) -> &'static str {
         match self {
             Self::Ocr => "text",
             Self::AudioTranscription => "transcription",
-            Self::Accessibility => "text_output",
-            Self::Clipboard => "content",
+            Self::Accessibility => "text_content",
+            Self::UiEventsKeyboard | Self::UiEventsClipboard => "text_content",
         }
     }
 
-    /// Primary-key column. ocr_text is keyed by `frame_id`; the others
-    /// have an autoincrement `id`.
+    /// Primary key. `ocr_text` is keyed by `frame_id`; the rest have
+    /// an autoincrement `id`.
     pub fn pk_col(&self) -> &'static str {
         match self {
             Self::Ocr => "frame_id",
             _ => "id",
+        }
+    }
+
+    /// Extra `WHERE`-clause filter beyond `text_redacted IS NULL`. Used
+    /// to slice the `ui_events` table by `event_type`.
+    pub fn extra_filter(&self) -> Option<&'static str> {
+        match self {
+            Self::UiEventsKeyboard => Some("event_type IN ('text','key')"),
+            Self::UiEventsClipboard => Some("event_type = 'clipboard'"),
+            _ => None,
+        }
+    }
+
+    /// Stable-ish identifier for logs / status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ocr => "ocr_text",
+            Self::AudioTranscription => "audio_transcriptions",
+            Self::Accessibility => "accessibility",
+            Self::UiEventsKeyboard => "ui_events:keyboard",
+            Self::UiEventsClipboard => "ui_events:clipboard",
         }
     }
 }
@@ -83,16 +131,22 @@ pub async fn fetch_unredacted(
     table: TargetTable,
     limit: u32,
 ) -> Result<Vec<UnredactedRow>, sqlx::Error> {
+    let extra = table
+        .extra_filter()
+        .map(|f| format!(" AND {}", f))
+        .unwrap_or_default();
     let q = format!(
         "SELECT {pk} AS id, {src} AS text \
          FROM {tbl} \
          WHERE {src} IS NOT NULL AND {src} != '' \
-           AND text_redacted IS NULL \
+           AND text_redacted IS NULL\
+           {extra} \
          ORDER BY {pk} DESC \
          LIMIT ?",
         pk = table.pk_col(),
         src = table.source_col(),
         tbl = table.table(),
+        extra = extra,
     );
 
     let rows = sqlx::query(&q).bind(limit as i64).fetch_all(pool).await?;
@@ -107,28 +161,61 @@ pub async fn fetch_unredacted(
 }
 
 /// Write back the redacted text and metadata for one row.
+///
+/// When `destructive` is `false` (default, matches issue #3185 spec):
+///   `UPDATE {tbl} SET text_redacted=?, redacted_at=now, redaction_version=? WHERE pk=?`
+/// The source column (`text` / `transcription` / `text_content`) keeps
+/// the verbatim input, so the worker can re-redact when the
+/// redactor's version bumps.
+///
+/// When `destructive` is `true`:
+///   ... same as above, plus `{src} = ?` set to the redacted text.
+/// Permanent: the raw text is gone after the UPDATE returns. Trades
+/// re-redaction-ability for at-rest protection.
 pub async fn write_redacted(
     pool: &SqlitePool,
     table: TargetTable,
     id: i64,
     redacted: &str,
     version: i64,
+    destructive: bool,
 ) -> Result<(), sqlx::Error> {
-    let q = format!(
-        "UPDATE {tbl} SET \
-            text_redacted = ?, \
-            redacted_at = strftime('%s', 'now'), \
-            redaction_version = ? \
-         WHERE {pk} = ?",
-        tbl = table.table(),
-        pk = table.pk_col(),
-    );
-    sqlx::query(&q)
-        .bind(redacted)
-        .bind(version)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    if destructive {
+        let q = format!(
+            "UPDATE {tbl} SET \
+                {src} = ?, \
+                text_redacted = ?, \
+                redacted_at = strftime('%s', 'now'), \
+                redaction_version = ? \
+             WHERE {pk} = ?",
+            tbl = table.table(),
+            src = table.source_col(),
+            pk = table.pk_col(),
+        );
+        sqlx::query(&q)
+            .bind(redacted)
+            .bind(redacted)
+            .bind(version)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    } else {
+        let q = format!(
+            "UPDATE {tbl} SET \
+                text_redacted = ?, \
+                redacted_at = strftime('%s', 'now'), \
+                redaction_version = ? \
+             WHERE {pk} = ?",
+            tbl = table.table(),
+            pk = table.pk_col(),
+        );
+        sqlx::query(&q)
+            .bind(redacted)
+            .bind(version)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -152,6 +239,21 @@ mod tests {
             CREATE TABLE ocr_text (
                 frame_id INTEGER PRIMARY KEY,
                 text TEXT NOT NULL,
+                text_redacted TEXT,
+                redacted_at INTEGER,
+                redaction_version INTEGER
+            );
+            CREATE TABLE accessibility (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text_content TEXT NOT NULL,
+                text_redacted TEXT,
+                redacted_at INTEGER,
+                redaction_version INTEGER
+            );
+            CREATE TABLE ui_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                text_content TEXT,
                 text_redacted TEXT,
                 redacted_at INTEGER,
                 redaction_version INTEGER
@@ -193,26 +295,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_redacted_round_trip() {
+    async fn write_redacted_additive_keeps_source() {
         let pool = setup().await;
         sqlx::query("INSERT INTO ocr_text (frame_id, text) VALUES (1, 'alice@example.com')")
             .execute(&pool)
             .await
             .unwrap();
 
-        write_redacted(&pool, TargetTable::Ocr, 1, "[EMAIL]", 7)
+        // Non-destructive: source column UNCHANGED, redacted column populated.
+        write_redacted(&pool, TargetTable::Ocr, 1, "[EMAIL]", 7, false)
             .await
             .unwrap();
 
-        let row =
-            sqlx::query("SELECT text_redacted, redaction_version FROM ocr_text WHERE frame_id = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let red: String = row.get(0);
-        let v: i64 = row.get(1);
+        let row = sqlx::query(
+            "SELECT text, text_redacted, redaction_version FROM ocr_text WHERE frame_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let raw: String = row.get(0);
+        let red: String = row.get(1);
+        let v: i64 = row.get(2);
+        assert_eq!(
+            raw, "alice@example.com",
+            "non-destructive must preserve source"
+        );
         assert_eq!(red, "[EMAIL]");
         assert_eq!(v, 7);
+    }
+
+    #[tokio::test]
+    async fn write_redacted_destructive_overwrites_source() {
+        let pool = setup().await;
+        sqlx::query("INSERT INTO ocr_text (frame_id, text) VALUES (1, 'alice@example.com')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Destructive: source column gets overwritten with the redacted text.
+        write_redacted(&pool, TargetTable::Ocr, 1, "[EMAIL]", 7, true)
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT text, text_redacted, redaction_version FROM ocr_text WHERE frame_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let raw: String = row.get(0);
+        let red: String = row.get(1);
+        assert_eq!(raw, "[EMAIL]", "destructive must overwrite source column");
+        assert_eq!(red, "[EMAIL]");
     }
 
     #[tokio::test]
@@ -228,5 +362,50 @@ mod tests {
         let rows = fetch_unredacted(&pool, TargetTable::Ocr, 10).await.unwrap();
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn ui_events_keyboard_filter_excludes_clipboard() {
+        let pool = setup().await;
+        // Mix: 2 keyboard, 1 clipboard.
+        sqlx::query("INSERT INTO ui_events (event_type, text_content) VALUES ('text', 'hello')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO ui_events (event_type, text_content) VALUES ('key', 'a')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ui_events (event_type, text_content) VALUES ('clipboard', 'paste')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let kb = fetch_unredacted(&pool, TargetTable::UiEventsKeyboard, 10)
+            .await
+            .unwrap();
+        assert_eq!(kb.len(), 2);
+
+        let cb = fetch_unredacted(&pool, TargetTable::UiEventsClipboard, 10)
+            .await
+            .unwrap();
+        assert_eq!(cb.len(), 1);
+        assert_eq!(cb[0].text, "paste");
+    }
+
+    #[tokio::test]
+    async fn accessibility_uses_text_content_column() {
+        let pool = setup().await;
+        sqlx::query("INSERT INTO accessibility (text_content) VALUES ('AXButton[Send]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = fetch_unredacted(&pool, TargetTable::Accessibility, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "AXButton[Send]");
     }
 }

@@ -64,6 +64,7 @@ pub mod vercel;
 pub mod whatsapp;
 pub mod zapier;
 pub mod zendesk;
+pub mod zoom;
 
 use crate::oauth;
 use anyhow::Result;
@@ -228,6 +229,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(loops::Loops),
         Box::new(resend::Resend),
         Box::new(supabase::Supabase),
+        Box::new(zoom::Zoom),
     ]
 }
 

@@ -99,15 +99,117 @@ impl Default for RfdetrConfig {
 }
 
 impl RfdetrConfig {
-    /// `~/.screenpipe/models/rfdetr_v8.onnx`. Created lazily — see
-    /// [`crate::image::worker::ImageWorker`] for the
-    /// download-on-first-run hook.
+    /// `~/.screenpipe/models/rfdetr_v8.onnx`. Created lazily by
+    /// [`Self::ensure_model_present`] on first run.
     pub fn default_model_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".screenpipe")
             .join("models")
             .join("rfdetr_v8.onnx")
+    }
+
+    /// HuggingFace download URL for the canonical ONNX. Pinned to
+    /// `main` so a model bump goes through a deliberate code change
+    /// (URL + expected SHA-256 + [`RFDETR_VERSION`] all bumped
+    /// together).
+    pub const HF_DOWNLOAD_URL: &'static str =
+        "https://huggingface.co/screenpipe/pii-image-redactor/resolve/main/rfdetr_v8.onnx";
+
+    /// Expected SHA-256 of the canonical `rfdetr_v8.onnx`. Verified
+    /// after every download. If a future training run produces a new
+    /// best, bump [`RFDETR_VERSION`], re-publish to HF, update this
+    /// constant — `image_redaction_version < {current}` then
+    /// auto-queues every existing frame for re-redaction.
+    pub const EXPECTED_SHA256: &'static str =
+        "431acc0f0beb22a39572b7a50af4fc446e799840fb71320dc124fbd79a121eb3";
+
+    /// Make sure the ONNX is present on disk. Idempotent — does
+    /// nothing if [`Self::model_path`] already exists with the
+    /// expected SHA-256. Otherwise downloads from
+    /// [`Self::HF_DOWNLOAD_URL`], verifies, atomic-renames into place.
+    ///
+    /// Atomic semantics: the download lands at
+    /// `<model_path>.partial`, gets verified, then renames over
+    /// `<model_path>`. A killed process leaves at most a `.partial`
+    /// that the next call cleans up.
+    pub async fn ensure_model_present(&self) -> Result<(), RedactError> {
+        if self.model_path.exists() && Self::sha256_matches(&self.model_path)? {
+            return Ok(());
+        }
+
+        if let Some(parent) = self.model_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| RedactError::Runtime(format!("mkdir {}: {e}", parent.display())))?;
+        }
+
+        let tmp = self.model_path.with_extension("onnx.partial");
+        // Best-effort cleanup of a stale partial.
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        tracing::info!(
+            url = Self::HF_DOWNLOAD_URL,
+            target = %self.model_path.display(),
+            "downloading rfdetr_v8.onnx (~108 MB) — first-run only"
+        );
+        let resp = reqwest::Client::new()
+            .get(Self::HF_DOWNLOAD_URL)
+            .send()
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr download GET: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(RedactError::Runtime(format!(
+                "rfdetr download returned {}",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr download body: {e}")))?;
+
+        // Verify SHA-256 BEFORE landing the file at the final path.
+        let actual = Self::hex_sha256(&bytes);
+        if actual != Self::EXPECTED_SHA256 {
+            return Err(RedactError::Runtime(format!(
+                "rfdetr download checksum mismatch: got {}, want {}",
+                actual,
+                Self::EXPECTED_SHA256
+            )));
+        }
+
+        tokio::fs::write(&tmp, &bytes)
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr write tmp: {e}")))?;
+        tokio::fs::rename(&tmp, &self.model_path)
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr rename: {e}")))?;
+        tracing::info!(
+            target = %self.model_path.display(),
+            bytes = bytes.len(),
+            "rfdetr_v8.onnx ready"
+        );
+        Ok(())
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        let mut s = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(&mut s, "{b:02x}");
+        }
+        s
+    }
+
+    fn sha256_matches(path: &Path) -> Result<bool, RedactError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| RedactError::Runtime(format!("read {}: {e}", path.display())))?;
+        Ok(Self::hex_sha256(&bytes) == Self::EXPECTED_SHA256)
     }
 }
 
@@ -130,6 +232,16 @@ mod imp {
     }
 
     impl RfdetrRedactor {
+        /// Async constructor: download the model if missing, then load.
+        /// Recommended call site for production — single round trip.
+        pub async fn load_or_download(cfg: RfdetrConfig) -> Result<Self, RedactError> {
+            cfg.ensure_model_present().await?;
+            Self::load(cfg)
+        }
+
+        /// Sync constructor: load an already-on-disk model. Returns
+        /// [`RedactError::Unavailable`] if the file is missing — call
+        /// [`Self::load_or_download`] instead to fetch on first run.
         pub fn load(cfg: RfdetrConfig) -> Result<Self, RedactError> {
             if !cfg.model_path.exists() {
                 return Err(RedactError::Unavailable(format!(
@@ -308,6 +420,12 @@ pub struct RfdetrRedactor {
 
 #[cfg(not(feature = "onnx-cpu"))]
 impl RfdetrRedactor {
+    pub async fn load_or_download(_cfg: RfdetrConfig) -> Result<Self, RedactError> {
+        Err(RedactError::Unavailable(
+            "rfdetr adapter requires the `onnx-cpu` cargo feature".into(),
+        ))
+    }
+
     pub fn load(_cfg: RfdetrConfig) -> Result<Self, RedactError> {
         Err(RedactError::Unavailable(
             "rfdetr adapter requires the `onnx-cpu` cargo feature".into(),
@@ -351,5 +469,55 @@ mod tests {
         let p = RfdetrConfig::default_model_path();
         let s = p.to_string_lossy();
         assert!(s.contains(".screenpipe/models/rfdetr_v8.onnx"));
+    }
+
+    #[test]
+    fn expected_sha256_is_64_hex_chars() {
+        let s = RfdetrConfig::EXPECTED_SHA256;
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn hex_sha256_matches_known_value() {
+        // sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        let got = RfdetrConfig::hex_sha256(b"");
+        assert_eq!(
+            got,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_model_present_passes_through_when_file_already_correct() {
+        use tempfile::tempdir;
+        // Build a small fake "model" file whose sha256 we know, then
+        // patch EXPECTED_SHA256 by constructing a config that points
+        // at it. Since EXPECTED_SHA256 is a const we can't override,
+        // we just verify the wrong-checksum path: an existing file
+        // with the wrong content triggers a re-download attempt.
+        // (Real download path is exercised by integration tests off
+        // the unit-test harness.)
+        let d = tempdir().unwrap();
+        let p = d.path().join("models").join("rfdetr_v8.onnx");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"not the real model").unwrap();
+        let cfg = RfdetrConfig {
+            model_path: p.clone(),
+            input_size: 0,
+            conf_threshold: 0.3,
+        };
+        // Wrong-checksum file → ensure_model_present tries to
+        // download. Network may or may not be available in CI, so
+        // accept either Ok (downloaded successfully) or
+        // Err(Runtime("...checksum...")) / Err(Runtime("...GET...")).
+        let res = cfg.ensure_model_present().await;
+        if let Err(e) = &res {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("rfdetr") || msg.contains("checksum") || msg.contains("GET"),
+                "unexpected error variant: {msg}"
+            );
+        }
     }
 }

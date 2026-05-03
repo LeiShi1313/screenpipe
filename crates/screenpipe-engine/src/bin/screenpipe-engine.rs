@@ -1539,7 +1539,12 @@ async fn main() -> anyhow::Result<()> {
         use screenpipe_redact::ImageRedactor;
         use std::sync::Arc;
 
-        match RfdetrRedactor::load(RfdetrConfig::default()) {
+        // load_or_download fetches the ONNX from
+        // huggingface.co/screenpipe/pii-image-redactor on first run
+        // (~108 MB), verifies SHA-256, caches at
+        // ~/.screenpipe/models/rfdetr_v8.onnx. Subsequent starts are
+        // instant.
+        match RfdetrRedactor::load_or_download(RfdetrConfig::default()).await {
             Ok(detector) => {
                 info!(
                     "starting async image-PII reconciliation worker (destructive={})",
@@ -1554,10 +1559,13 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 // Loud-but-non-fatal: capture continues; user gets an
-                // explicit "model missing" message in the log.
+                // explicit "model missing or download failed" message
+                // in the log, and the regular text redactor (if
+                // enabled) keeps running.
                 tracing::warn!(
-                    "image-PII redaction enabled but model unavailable; skipping: {e}. \
-                     drop the rfdetr_v8.onnx file at ~/.screenpipe/models/ to enable."
+                    "image-PII redaction enabled but couldn't load model; skipping: {e}. \
+                     check network reachability to huggingface.co or pre-stage \
+                     rfdetr_v8.onnx at ~/.screenpipe/models/."
                 );
             }
         }

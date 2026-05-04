@@ -25,6 +25,7 @@ use screenpipe_db::DatabaseManager;
 use super::{start_device_monitor, stop_device_monitor, AudioManagerOptions, TranscriptionMode};
 use crate::{
     core::{
+        clear_device_capture_time,
         device::{parse_audio_device, AudioDevice},
         engine::AudioTranscriptionEngine,
         record_and_transcribe,
@@ -1284,6 +1285,11 @@ impl AudioManager {
 
         // Stop the device in device manager (clears streams and states)
         let _ = self.device_manager.stop_device(&device).await;
+
+        // Clear the cached capture time so the device appears inactive until it resumes delivering audio.
+        // This prevents Bluetooth devices (which often retain stale cache entries after reconnect) from
+        // incorrectly appearing "active" in the UI while the background restart is ongoing.
+        clear_device_capture_time(device_name);
 
         debug!("cleaned up stale device {} for restart", device_name);
 

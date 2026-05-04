@@ -307,6 +307,24 @@ export function PrivacySection() {
     handleSettingsChange({ usePiiRemoval: checked }, true);
   };
 
+  // "AI PII removal" — single user-facing toggle that flips both the
+  // text reconciliation worker AND the image redactor (rfdetr_v8) on
+  // or off together. The technical knobs (destructive vs sibling,
+  // text-only vs image-only) stay CLI-only so the UI stays simple.
+  const aiPiiRemovalEnabled =
+    Boolean(settings.asyncPiiRedaction ?? false) ||
+    Boolean(settings.asyncImagePiiRedaction ?? false);
+
+  const handleAiPiiRemovalChange = (checked: boolean) => {
+    handleSettingsChange(
+      {
+        asyncPiiRedaction: checked,
+        asyncImagePiiRedaction: checked,
+      },
+      true,
+    );
+  };
+
   const handleIncognitoToggle = (checked: boolean) => {
     handleSettingsChange({ ignoreIncognitoWindows: checked }, true);
   };
@@ -830,6 +848,34 @@ export function PrivacySection() {
                 id="usePiiRemoval"
                 checked={settings.usePiiRemoval}
                 onCheckedChange={handlePiiRemovalChange}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* AI PII removal — covers text + images via the async worker */}
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Shield className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    AI PII removal
+                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                      Experimental
+                    </span>
+                    <HelpTooltip text="Uses an on-device AI model to detect and remove PII from both screen frames and captured text (names, emails, addresses, secrets, URLs). Downloads a ~100 MB model on first run and uses extra CPU/GPU while it processes captures in the background." />
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Removes PII from text and images. Uses extra resources.
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="aiPiiRemoval"
+                checked={aiPiiRemovalEnabled}
+                onCheckedChange={handleAiPiiRemovalChange}
               />
             </div>
           </CardContent>

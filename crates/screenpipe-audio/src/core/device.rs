@@ -344,6 +344,25 @@ pub async fn get_cpal_device_and_config(
     // Get the highest quality configuration based on device type
     let config = if is_output_device && !is_display {
         let configs: Vec<_> = cpal_audio_device.supported_output_configs()?.collect();
+        
+        // Diagnostic: log all available output configurations
+        tracing::debug!(
+            device = %device_name,
+            config_count = configs.len(),
+            "Available output configurations for device"
+        );
+        for (idx, cfg) in configs.iter().enumerate() {
+            tracing::debug!(
+                device = %device_name,
+                config_idx = idx,
+                channels = cfg.channels(),
+                min_rate = cfg.min_sample_rate().0,
+                max_rate = cfg.max_sample_rate().0,
+                sample_format = ?cfg.sample_format(),
+                "  [output config]"
+            );
+        }
+        
         let best_config = configs
             .iter()
             .max_by(|a, b| {
@@ -354,9 +373,37 @@ pub async fn get_cpal_device_and_config(
             })
             .ok_or_else(|| anyhow!("No supported output configurations found"))?;
 
-        (*best_config).with_sample_rate(best_config.max_sample_rate())
+        let selected_rate = best_config.max_sample_rate();
+        let selected_channels = best_config.channels();
+        tracing::debug!(
+            device = %device_name,
+            selected_channels = selected_channels,
+            selected_rate = selected_rate.0,
+            "Selected output configuration (greedy max-rate)"
+        );
+
+        (*best_config).with_sample_rate(selected_rate)
     } else {
         let configs: Vec<_> = cpal_audio_device.supported_input_configs()?.collect();
+        
+        // Diagnostic: log all available input configurations
+        tracing::debug!(
+            device = %device_name,
+            config_count = configs.len(),
+            "Available input configurations for device"
+        );
+        for (idx, cfg) in configs.iter().enumerate() {
+            tracing::debug!(
+                device = %device_name,
+                config_idx = idx,
+                channels = cfg.channels(),
+                min_rate = cfg.min_sample_rate().0,
+                max_rate = cfg.max_sample_rate().0,
+                sample_format = ?cfg.sample_format(),
+                "  [input config]"
+            );
+        }
+        
         let best_config = configs
             .iter()
             .max_by(|a, b| {
@@ -367,7 +414,16 @@ pub async fn get_cpal_device_and_config(
             })
             .ok_or_else(|| anyhow!("No supported input configurations found"))?;
 
-        (*best_config).with_sample_rate(best_config.max_sample_rate())
+        let selected_rate = best_config.max_sample_rate();
+        let selected_channels = best_config.channels();
+        tracing::debug!(
+            device = %device_name,
+            selected_channels = selected_channels,
+            selected_rate = selected_rate.0,
+            "Selected input configuration (greedy max-rate)"
+        );
+
+        (*best_config).with_sample_rate(selected_rate)
     };
 
     Ok((cpal_audio_device, config))

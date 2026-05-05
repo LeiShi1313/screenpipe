@@ -229,6 +229,29 @@ pub struct RecordingSettings {
     #[serde(rename = "asyncImagePiiRedactionDestructive", default)]
     pub async_image_pii_redaction_destructive: bool,
 
+    /// Where the AI PII redaction actually runs. One switch flips
+    /// BOTH modalities (text + image) because the user-facing
+    /// "AI PII removal" toggle is one knob.
+    ///
+    /// - `"local"` (default): on-device ONNX models. Privacy by
+    ///   construction — pixels and text never leave the box. Slower,
+    ///   especially on weak hardware (~1-3 s per text row, ~60-180 ms
+    ///   per frame).
+    /// - `"tinfoil"`: send to the screenpipe Tinfoil enclave (H200,
+    ///   confidential compute). Much faster (~30-100 ms per row /
+    ///   frame). Data leaves the device but is end-to-end encrypted
+    ///   into an attested confidential-compute enclave that even
+    ///   Tinfoil ops can't read into. Requires network +
+    ///   `SCREENPIPE_PRIVACY_FILTER_API_KEY` (or the cloud auth key).
+    ///
+    /// Note on attestation: the proper attested-transport client
+    /// (Tinfoil's secure-client SDK) is Go/Python/JS-only at time of
+    /// writing. The Rust adapter currently uses plain HTTPS — which
+    /// gives confidentiality vs. the network but NOT vs. a malicious
+    /// Tinfoil operator. Tracked separately; structured for swap-in.
+    #[serde(rename = "piiBackend", default = "default_pii_backend")]
+    pub pii_backend: String,
+
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
     /// Kept as String (not Option) to match existing store.bin schema.
@@ -401,6 +424,7 @@ impl Default for RecordingSettings {
             async_pii_redaction_destructive: false,
             async_image_pii_redaction: false,
             async_image_pii_redaction_destructive: false,
+            pii_backend: default_pii_backend(),
             user_id: String::new(),
             user_name: None,
             openai_compatible_endpoint: None,
@@ -445,6 +469,10 @@ fn default_experimental_coreaudio_system_audio() -> bool {
 
 fn default_max_snapshot_width() -> u32 {
     1920
+}
+
+fn default_pii_backend() -> String {
+    "local".to_string()
 }
 
 #[cfg(test)]

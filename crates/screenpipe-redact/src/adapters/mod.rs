@@ -26,7 +26,12 @@
 //! 4. [`rfdetr`] (feature-gated) — RF-DETR-Nano detector trained on
 //!    the [screenpipe-pii-bench-image](https://github.com/screenpipe/screenpipe-pii-bench-image)
 //!    corpus. Same Execution-Provider chain as [`onnx`]. Used by the
-//!    image reconciliation worker.
+//!    image reconciliation worker for **local** mode.
+//! 5. [`tinfoil_image`] — HTTP client for the same enclave that
+//!    serves [`tinfoil`]. Sends a base64'd JPG/PNG to
+//!    `POST /image/detect` and parses bbox+label results back. Used
+//!    when the user picks **Cloud (enclave)** mode in Settings →
+//!    Privacy → AI PII removal.
 //!
 //! All ONNX-backed adapters share one cargo feature surface
 //! (`onnx-cpu` / `onnx-coreml` / `onnx-directml`) so a single build
@@ -35,6 +40,7 @@
 
 pub mod regex;
 pub mod tinfoil;
+pub mod tinfoil_image;
 
 #[cfg(feature = "onnx-cpu")]
 pub mod onnx;

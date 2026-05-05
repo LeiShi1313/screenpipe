@@ -356,6 +356,15 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub async_image_pii_redaction_destructive: bool,
 
+    /// Backend for the AI PII workers — `local` (on-device ONNX,
+    /// privacy by construction, slower on weak hardware) or
+    /// `tinfoil` (screenpipe-hosted confidential-compute enclave on
+    /// H200, fast everywhere, requires network). Single flag for
+    /// both text + image — flipping it swaps the inner adapter for
+    /// both worker types.
+    #[arg(long, default_value = "local")]
+    pub pii_backend: String,
+
     /// Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise)
     #[arg(long, default_value_t = false)]
     pub filter_music: bool,
@@ -508,6 +517,7 @@ impl RecordArgs {
             async_pii_redaction_destructive: self.async_pii_redaction_destructive,
             async_image_pii_redaction: self.async_image_pii_redaction,
             async_image_pii_redaction_destructive: self.async_image_pii_redaction_destructive,
+            pii_backend: self.pii_backend.clone(),
             filter_music: self.filter_music,
             #[allow(deprecated)]
             enable_input_capture: true,

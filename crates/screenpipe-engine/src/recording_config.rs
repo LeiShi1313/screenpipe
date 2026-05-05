@@ -45,6 +45,11 @@ pub struct RecordingConfig {
     /// When `async_image_pii_redaction` is on, overwrite the source
     /// JPG in place (vs. write `<stem>_redacted.<ext>` next to it).
     pub async_image_pii_redaction_destructive: bool,
+    /// "local" or "tinfoil" — flips both async-PII workers between
+    /// on-device ONNX and the screenpipe-hosted Tinfoil enclave.
+    /// One toggle covers both modalities; the user-facing UI is a
+    /// single radio under the AI PII removal switch.
+    pub pii_backend: String,
     /// Filter music-dominant audio before transcription using spectral analysis
     pub filter_music: bool,
     // enable_input_capture and enable_accessibility removed — always true
@@ -183,6 +188,7 @@ impl RecordingConfig {
             async_pii_redaction_destructive: settings.async_pii_redaction_destructive,
             async_image_pii_redaction: settings.async_image_pii_redaction,
             async_image_pii_redaction_destructive: settings.async_image_pii_redaction_destructive,
+            pii_backend: settings.pii_backend.clone(),
             filter_music: settings.filter_music,
             // enable_input_capture / enable_accessibility removed — always true
             enable_workflow_events: settings.enable_workflow_events,

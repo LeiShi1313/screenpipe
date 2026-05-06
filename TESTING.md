@@ -180,6 +180,7 @@ commits: calendar_speaker_id.rs, meetings.rs, meeting_persister.rs
 - [ ] **Browser meetings splitting fix** — Verify that meetings in the browser are correctly split into separate events. (`d8ba1dad3`)
 - [ ] **Meeting with hidden UI controls** — Start a Zoom/Teams meeting. Minimize the meeting window or switch apps (Zoom controls move out of accessibility tree). Verify meeting stays active and does NOT auto-terminate after 30 seconds. Audio output detection prevents false "meeting ended" events. (`4e784f620`)
 - [ ] **OpenAI-compatible transcription endpoint** — Verify that the `/v1/audio/transcriptions` endpoint works as expected, following the OpenAI specification. (`5a14e9a92`)
+- [ ] **Speaker model resilient downloads** — Verify that speaker identification models (e.g. pyannote segmentation-3.0.onnx) are downloaded with retries on transient failures, cached locally, and cleaned up if corrupted. Delete `~/Library/Caches/screenpipe/models/` while recording a meeting with 2+ speakers. Verify: audio continues, model downloads on-demand, speaker names appear after ~30s. Kill app mid-download, relaunch while still recording. Verify: no duplicate download spawn, model download resumes from checkpoint. Regression: Sentry SCREENPIPE-CLI-5J (585 events of missing ONNX), SCREENPIPE-CLI-6D. Commit: `9bd7ad6ad` (resilient downloader with concurrent-safe single-flight, stale cache cleanup, ORT load error recovery). (`9bd7ad6ad`)
 
 ### 5. frame comparison & OCR pipeline
 

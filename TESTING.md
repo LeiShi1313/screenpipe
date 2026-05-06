@@ -917,3 +917,75 @@ commits: `c6a73b17e`, `945b687ec`
 - [ ] **Persistent background chats** — Verify that chats continue to stream in the background even when navigating away from the chat view. (`0060ae9e5`, `ec5e80992`)
 - [ ] **Inline history in overlay** — Verify that inline history is restored in the overlay window. (`15b419ec7`)
 - [ ] **Notification URL actions** — Open a URL action from a native macOS notification when the overlay is not mounted. (`7fdcd2054`)
+- [ ] **Remove @input from chat** — In a chat message with @input, use the remove button to strip it. Verify the input reference is removed. (`eb587ba1f`)
+
+### 32. Document Path & File Tracking
+
+commits: `f6d5a19ab`, `338e4734d`
+
+- [ ] **TextEdit document path capture** — Open a document in TextEdit, view it in the app's activity summary. Verify the document's absolute file path appears in edited_files. (`f6d5a19ab`)
+- [ ] **Obsidian vault document path** — Open an Obsidian vault with multiple notes, switch between them. Verify edited_files shows the correct note file path. (`f6d5a19ab`)
+- [ ] **VS Code focused document detection** — Open VS Code, Cursor, or Windsurf, edit multiple files, switch between them. Verify the app's activity summary shows the currently focused file path. (`f6d5a19ab`, `338e4734d`)
+- [ ] **Electron app document path on Windows** — On Windows, open Cursor/VS Code/Windsurf and edit files. Verify document_path is populated (cross-platform fix). (`338e4734d`)
+- [ ] **Electron app document path on Linux** — On Linux, open Cursor/VS Code/Windsurf and edit files. Verify document_path is populated (cross-platform fix). (`338e4734d`)
+- [ ] **Meeting notes receipts with edited files** — During a meeting, edit files in VS Code. After the meeting, view the meeting notes. Verify the edited_files section shows the file paths as clickable links. (`f6d5a19ab`)
+- [ ] **No crash on corrupt state.vscdb** — Intentionally corrupt a VS Code state file, then open the editor. Verify the app does not crash and document_path gracefully returns to None. (`338e4734d`)
+
+### 33. CLI Presets Management
+
+commits: `cc58d7b61`
+
+- [ ] **screenpipe pipe models list** — Run `screenpipe pipe models list`. Verify all configured presets are listed with their provider (OpenAI, Anthropic, Ollama, etc.). (`cc58d7b61`)
+- [ ] **screenpipe pipe models create** — Run `screenpipe pipe models create --name my-preset --provider openai --api-key sk-... `. Verify the preset is saved and validation enforces required fields. (`cc58d7b61`)
+- [ ] **screenpipe pipe models set-default** — Create two presets and set one as default. Verify only one default is allowed (atomic invariant). (`cc58d7b61`)
+- [ ] **screenpipe pipe set-preset** — Run `screenpipe pipe set-preset my-pipe my-preset`. Verify the pipe uses the specified preset. (`cc58d7b61`)
+- [ ] **screenpipe pipe set-preset with fallback chain** — Run `screenpipe pipe set-preset my-pipe preset1 preset2 fallback-preset`. Verify fallback chain works (tries preset1, falls back to preset2, etc.). (`cc58d7b61`)
+- [ ] **Preset validation for OpenAI** — Create a preset with provider openai and missing api-key. Verify validation rejects it with a helpful error. (`cc58d7b61`)
+- [ ] **Preset validation for custom URL** — Create a preset with custom_url and api-key. Verify both are required and properly validated. (`cc58d7b61`)
+- [ ] **Delete preset with pipe reference** — Create a preset and assign it to a pipe, then try to delete the preset. Verify it's rejected unless --force flag is used. (`cc58d7b61`)
+- [ ] **Round-trip safe preset writes** — Create a preset, export the config, manually edit it, and re-import. Verify unknown keys are preserved. (`cc58d7b61`)
+
+### 34. Microsoft 365 & Teams Connection Fixes
+
+commits: `b1ef45c1b`
+
+- [ ] **Microsoft 365 proxy path documentation** — Verify that connection descriptions now document the explicit proxy prefix ("/connections/microsoft365/proxy/me/messages"). (`b1ef45c1b`)
+- [ ] **Teams proxy path documentation** — Verify that the Teams connection description includes the proxy prefix for Graph API calls. (`b1ef45c1b`)
+- [ ] **Microsoft 365 health check** — Verify that `/me/mailFolders` endpoint works for connection health checks (personal-Outlook fallback). (`b1ef45c1b`)
+- [ ] **LLM tool calls to Teams** — Use an AI agent to call a Teams action (e.g., fetch messages). Verify it no longer hits 404. (`b1ef45c1b`)
+- [ ] **Retention dialog inline picker** — In settings, open the retention-day confirmation dialog. Verify the day picker is inline (no need to bounce back to the form). (`b1ef45c1b`)
+- [ ] **PostHog connection available** — Verify the PostHog integration is available in the connections list. (`b1ef45c1b`)
+
+### 35. Speaker Model & Audio Improvements
+
+commits: `9bd7ad6ad`
+
+- [ ] **Resilient speaker model download** — On a slow network, trigger speaker model download. Verify it retries gracefully if the download stalls (does not get stuck retrying forever). (`9bd7ad6ad`)
+- [ ] **Speaker model fallback** — If the primary model download fails, verify a fallback model is used or the system degrades gracefully. (`9bd7ad6ad`)
+
+### 36. MCP & AI Integration Updates
+
+commits: `fa1982ce4`, `7cc8147d2`, `364350edc`
+
+- [ ] **MCP API key discovery via CLI** — Configure a screenpipe API key via CLI, then use Claude Desktop. Verify the MCP server finds the key without manual prompting. (`fa1982ce4`)
+- [ ] **MCP bundled bun discovery** — On a fresh install with no claude_code_token, verify the MCP server uses bundled bun for API key discovery. (`7cc8147d2`)
+- [ ] **MCP update-meeting tool** — Use the `update-meeting` MCP tool to write AI-generated summaries back to a meeting note. Verify the note is updated with the typed content. (`364350edc`)
+
+### 37. Clipboard & MacOS Fixes
+
+commits: `94a28f4a3`
+
+- [ ] **Clipboard dead-man switch on macOS** — Stress-test clipboard monitoring with many paste operations. Verify no NSPasteboard read hangs (dead-man switch timeout works). (`94a28f4a3`)
+
+### 38. Settings & UI Organization
+
+commits: `a7b2f273d`
+
+- [ ] **Clear Cache moved to Storage section** — Open Settings → Storage. Verify the "Clear Cache" button is now under Storage (not General). (`a7b2f273d`)
+
+### 39. Privacy & Debug Features
+
+commits: `d229c2cfa`, `4253ed2bd`
+
+- [ ] **Auth tokens not logged** — Start the app, trigger auth errors in the logs. Verify auth tokens and emails are NOT present in the log output. (`d229c2cfa`)
+- [ ] **API keys scrubbed from feedback** — Generate a feedback bundle, verify API keys and tokens are removed from console-log exports. (`4253ed2bd`)

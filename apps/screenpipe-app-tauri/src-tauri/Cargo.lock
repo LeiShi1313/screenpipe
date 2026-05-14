@@ -10583,7 +10583,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.4.205"
+version = "2.4.211"
 dependencies = [
  "aes",
  "anyhow",
@@ -10706,6 +10706,7 @@ version = "0.3.333"
 dependencies = [
  "anyhow",
  "audiopipe",
+ "base64 0.22.1",
  "bytemuck",
  "bytes",
  "chrono",
@@ -10748,7 +10749,9 @@ dependencies = [
  "symphonia",
  "sysinfo",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
+ "url",
  "vad-rs",
  "webrtc-vad",
  "which 7.0.3",
@@ -13947,7 +13950,9 @@ checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "tokio",
+ "tokio-native-tls",
  "tungstenite",
 ]
 
@@ -14313,6 +14318,7 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.8.5",
  "sha1 0.10.6",
  "thiserror 1.0.69",

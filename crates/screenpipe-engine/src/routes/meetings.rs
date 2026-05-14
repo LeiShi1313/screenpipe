@@ -10,7 +10,7 @@ use axum::{
 use oasgen::{oasgen, OaSchema};
 
 use screenpipe_db::DatabaseManager;
-use screenpipe_db::MeetingRecord;
+use screenpipe_db::{MeetingRecord, MeetingTranscriptSegment};
 
 use crate::server::AppState;
 use chrono::{DateTime, Utc};
@@ -54,6 +54,7 @@ pub struct BulkDeleteMeetingsRequest {
 
 #[derive(OaSchema, Deserialize, Debug)]
 pub struct StartMeetingRequest {
+    pub id: Option<i64>,
     pub app: Option<String>,
     pub title: Option<String>,
     pub attendees: Option<String>,
@@ -229,6 +230,32 @@ pub(crate) async fn get_meeting_handler(
 }
 
 #[oasgen]
+pub(crate) async fn get_meeting_transcript_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<JsonResponse<Vec<MeetingTranscriptSegment>>, (StatusCode, JsonResponse<Value>)> {
+    state.db.get_meeting_by_id(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
+        )
+    })?;
+
+    let segments = state
+        .db
+        .list_meeting_transcript_segments(id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    Ok(JsonResponse(segments))
+}
+
+#[oasgen]
 pub(crate) async fn delete_meeting_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -376,37 +403,63 @@ pub(crate) async fn start_meeting_handler(
     axum::Json(body): axum::Json<StartMeetingRequest>,
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
     let app = body.app.as_deref().unwrap_or("manual");
-    let id = state
-        .db
-        .insert_meeting(
-            app,
-            "manual",
-            body.title.as_deref(),
-            body.attendees.as_deref(),
-        )
-        .await
-        .map_err(|e| {
+    let resumed_existing = body.id.is_some();
+    let id = if let Some(id) = body.id {
+        let status = resolve_meeting_status(&state).await?;
+        if status.active && status.active_meeting_id != Some(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": "another meeting is already active"})),
+            ));
+        }
+
+        // Fetch first so a bad id is reported as a clean 404 before we try to
+        // reopen it. Reopening keeps the original note row and restarts the
+        // live meeting lifecycle for streaming transcription.
+        state.db.get_meeting_by_id(id).await.map_err(|e| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({"error": e.to_string()})),
+                StatusCode::NOT_FOUND,
+                JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
             )
         })?;
+
+        if status.active_meeting_id != Some(id) {
+            state.db.reopen_meeting(id).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?;
+        }
+        id
+    } else {
+        state
+            .db
+            .insert_meeting(
+                app,
+                "manual",
+                body.title.as_deref(),
+                body.attendees.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?
+    };
 
     {
         let mut lock = state.manual_meeting.write().await;
         *lock = Some(id);
     }
+    if let Some(detector) = state.audio_manager.meeting_detector() {
+        detector.set_v2_in_meeting(true);
+    }
 
     if let Ok(status) = resolve_meeting_status(&state).await {
         emit_meeting_status_changed(&status);
-    }
-
-    // Emit event so triggered pipes can react
-    if let Err(e) = screenpipe_events::send_event(
-        "meeting_started",
-        serde_json::json!({ "meeting_id": id, "app": app, "title": body.title }),
-    ) {
-        tracing::warn!("failed to emit meeting_started event: {}", e);
     }
 
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {
@@ -415,6 +468,23 @@ pub(crate) async fn start_meeting_handler(
             JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
         )
     })?;
+
+    // Emit event so triggered pipes can react
+    if let Err(e) = screenpipe_events::send_event(
+        "meeting_started",
+        serde_json::json!({
+            "meeting_id": id,
+            "app": meeting.meeting_app,
+            "title": meeting.title,
+            "detection_source": if resumed_existing {
+                "manual"
+            } else {
+                meeting.detection_source.as_str()
+            }
+        }),
+    ) {
+        tracing::warn!("failed to emit meeting_started event: {}", e);
+    }
 
     Ok(JsonResponse(meeting))
 }
@@ -463,6 +533,9 @@ pub(crate) async fn stop_meeting_handler(
         if *lock == Some(id) {
             *lock = None;
         }
+    }
+    if let Some(detector) = state.audio_manager.meeting_detector() {
+        detector.set_v2_in_meeting(false);
     }
 
     if let Ok(status) = resolve_meeting_status(&state).await {

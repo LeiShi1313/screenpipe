@@ -135,6 +135,10 @@ const MODEL_WEIGHTS: Record<string, number> = {
   'gemini-3-flash': 0,
   'gemini-3.1-flash-lite': 0,
   'gemini-2.5-flash': 0,
+  // OpenAI
+  'gpt-5.5': 6,
+  'gpt-5.4-mini': 1,
+  'gpt-5.4': 3,
   // OpenRouter models
   'qwen3.5-flash': 0,
   'qwen3.5-397b': 3,
@@ -489,4 +493,3 @@ export function isModelAllowed(model: string, tier: UserTier, env?: Env): boolea
     allowed.toLowerCase().includes(model.toLowerCase())
   );
 }
-

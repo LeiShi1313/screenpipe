@@ -26,7 +26,7 @@ pub async fn transcribe_with_deepgram(
     vocabulary: &[VocabularyEntry],
 ) -> Result<String> {
     transcribe_with_deepgram_detailed(
-        api_key,
+        config,
         audio_data,
         device,
         sample_rate,
@@ -38,7 +38,7 @@ pub async fn transcribe_with_deepgram(
 }
 
 pub async fn transcribe_with_deepgram_detailed(
-    api_key: &str,
+    config: &DeepgramTranscriptionConfig,
     audio_data: &[f32],
     device: &str,
     sample_rate: u32,

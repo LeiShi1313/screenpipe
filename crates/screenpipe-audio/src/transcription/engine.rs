@@ -530,7 +530,7 @@ impl TranscriptionSession {
     ) -> Result<TranscriptionOutput> {
         match self {
             Self::Deepgram {
-                api_key,
+                config,
                 languages,
                 vocabulary,
             } => {
@@ -545,7 +545,7 @@ impl TranscriptionSession {
                     Ok(TranscriptionOutput::plain(String::new()))
                 } else {
                     let mut output = transcribe_with_deepgram_detailed(
-                        api_key,
+                        config,
                         audio,
                         device,
                         sample_rate,

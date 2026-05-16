@@ -17,7 +17,9 @@ use clap::{Parser, ValueEnum};
 use screenpipe_audio::speaker::{
     embedding::EmbeddingExtractor, embedding_manager::EmbeddingManager, prepare_segments,
 };
-use screenpipe_audio::transcription::deepgram::batch::transcribe_with_deepgram_detailed;
+use screenpipe_audio::transcription::deepgram::{
+    batch::transcribe_with_deepgram_detailed, DeepgramTranscriptionConfig,
+};
 use screenpipe_audio::vad::{silero::SileroVad, VadEngine};
 use screenpipe_audio::{pcm_decode, resample};
 use screenpipe_audio_eval::{load_rttm, score_pipeline, RttmSegment};
@@ -439,9 +441,24 @@ async fn run_deepgram_prediction(args: &Args, fixtures: &[Fixture]) -> Result<Pr
     };
     let total_samples = samples.len();
     let started = Instant::now();
-    let api_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
+    let mut deepgram_config = std::env::var("CUSTOM_DEEPGRAM_API_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(DeepgramTranscriptionConfig::screenpipe_cloud)
+        .or_else(|| {
+            std::env::var("DEEPGRAM_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(DeepgramTranscriptionConfig::direct)
+        })
+        .context("deepgram config missing after readiness check")?;
+    if let Ok(endpoint) = std::env::var("DEEPGRAM_API_URL") {
+        if !endpoint.trim().is_empty() {
+            deepgram_config.endpoint = endpoint;
+        }
+    }
     let output = transcribe_with_deepgram_detailed(
-        &api_key,
+        &deepgram_config,
         &samples,
         "pipeline-replay-deepgram",
         16_000,

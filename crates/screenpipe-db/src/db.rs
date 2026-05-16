@@ -33,10 +33,10 @@ use crate::{
     text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
     AudioResult, AudioResultRaw, ContentType, DeviceType, Element, ElementRow, ElementSource,
     FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord,
-    MeetingTranscriptSegment, MemoryRecord, MemorySyncRow, OCREntry, OCRResult, OCRResultRaw,
-    OcrEngine, OcrTextBlock, Order, NewDiarizationSegment, ReplacementAudioTranscription,
-    SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds,
-    TextPosition, TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
+    MeetingTranscriptSegment, MemoryRecord, MemorySyncRow, NewDiarizationSegment, OCREntry,
+    OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, ReplacementAudioTranscription,
+    SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds, TextPosition,
+    TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
@@ -3803,6 +3803,7 @@ impl DatabaseManager {
             model: Option<String>,
             device_name: String,
             device_type: String,
+            speaker_name: Option<String>,
         }
 
         let rows = sqlx::query_as::<_, LiveAudioResultRaw>(
@@ -3815,7 +3816,8 @@ impl DatabaseManager {
                 provider,
                 model,
                 device_name,
-                device_type
+                device_type,
+                speaker_name
             FROM meeting_transcript_segments
             WHERE (?1 = '' OR transcript LIKE '%' || ?1 || '%' COLLATE NOCASE)
               AND (?2 IS NULL OR julianday(captured_at) >= julianday(?2))
@@ -3848,6 +3850,11 @@ impl DatabaseManager {
                     .unwrap_or_else(|_| Utc::now());
                 let transcription_engine =
                     raw.model.clone().unwrap_or_else(|| raw.provider.clone());
+                let speaker_label = raw
+                    .speaker_name
+                    .as_ref()
+                    .and_then(|name| (!name.trim().is_empty()).then(|| name.clone()));
+                let speaker_provisional = speaker_label.is_some();
                 AudioResult {
                     audio_chunk_id: -raw.id,
                     transcription: raw.transcription,
@@ -3863,6 +3870,10 @@ impl DatabaseManager {
                         DeviceType::Input
                     },
                     speaker: None,
+                    speaker_label,
+                    speaker_source: speaker_provisional.then(|| "live".to_string()),
+                    speaker_confidence: None,
+                    speaker_provisional,
                     start_time: None,
                     end_time: None,
                     source: Some("live".to_string()),

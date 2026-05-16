@@ -69,6 +69,7 @@ pub async fn process_transcription_result(
     db: &DatabaseManager,
     result: TranscriptionResult,
     audio_transcription_engine: Arc<AudioTranscriptionEngine>,
+    diarization_mode: &str,
     previous_transcript: Option<String>,
     previous_transcript_id: Option<i64>,
     use_pii_removal: bool,
@@ -169,7 +170,7 @@ pub async fn process_transcription_result(
                 if let Err(e) = db
                     .insert_diarization_run_with_segments(
                         audio_chunk_id,
-                        "live",
+                        diarization_mode,
                         provider,
                         Some(&transcription_engine),
                         None,
@@ -464,6 +465,7 @@ mod tests {
             &db,
             result,
             Arc::new(AudioTranscriptionEngine::WhisperLargeV3Turbo),
+            "background",
             None,
             None,
             false,

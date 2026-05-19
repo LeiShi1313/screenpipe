@@ -6,9 +6,6 @@
   "exports": {
     ".": "./lib/index.js"
   },
-  "bin": {
-    "screenpipe": "bin/screenpipe.js"
-  },
   "scripts": {
     "postinstall": "node scripts/postinstall.js"
   },

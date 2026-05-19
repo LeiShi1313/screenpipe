@@ -953,8 +953,16 @@ async fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
+        // macOS: AppleScript binds the login item to the .app bundle path so
+        // System Settings -> Login Items displays the app's product name
+        // ("screenpipe") instead of grouping under the Developer ID team
+        // display name (which reads as an individual's name for individual
+        // Apple Developer accounts). See issue #3298.
+        // The legacy LaunchAgent plist is cleaned up in the setup() hook below
+        // via a one-shot migration so users don't end up with two autostart
+        // mechanisms firing in parallel.
         .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
+            MacosLauncher::AppleScript,
             None,
         ))
         // single-instance plugin uses zbus::blocking on Linux which panics
@@ -1867,6 +1875,82 @@ async fn main() {
 
             let is_autostart_enabled = store
                 .auto_start_enabled;
+
+            // macOS one-shot migration for issue #3298:
+            // previous builds used MacosLauncher::LaunchAgent which writes
+            // ~/Library/LaunchAgents/<productName>.plist. macOS groups
+            // freestanding signed LaunchAgents under the Developer ID team
+            // display name in System Settings -> Login Items, which for an
+            // individual Apple Developer account is a person's real name.
+            // We've switched to MacosLauncher::AppleScript so the login item
+            // gets bound to the .app bundle (and is displayed as "screenpipe").
+            // Delete any leftover legacy plist on first launch after this
+            // change, otherwise both autostart paths would fire in parallel
+            // on next boot (LaunchAgent + AppleScript = duplicate process).
+            #[cfg(target_os = "macos")]
+            {
+                const LOGIN_ITEM_MIGRATION_KEY: &str =
+                    "_loginItemAppleScriptMigrationApplied";
+
+                let already_migrated = store
+                    .extra
+                    .get(LOGIN_ITEM_MIGRATION_KEY)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if !already_migrated {
+                    if let Ok(home) = std::env::var("HOME") {
+                        // The auto-launch crate writes the plist as
+                        // ~/Library/LaunchAgents/<app_name>.plist where
+                        // app_name is tauri's package_info().name (the
+                        // configured productName, e.g. "screenpipe",
+                        // "screenpipe beta", "screenpipe enterprise",
+                        // "screenpipe - Development"). Use the same source
+                        // here rather than hardcoding so beta/enterprise
+                        // builds also clean up their own legacy plists.
+                        let product_name = app.package_info().name.clone();
+                        let legacy_plist = std::path::PathBuf::from(&home)
+                            .join("Library")
+                            .join("LaunchAgents")
+                            .join(format!("{}.plist", product_name));
+
+                        if legacy_plist.exists() {
+                            match std::fs::remove_file(&legacy_plist) {
+                                Ok(()) => info!(
+                                    "removed legacy autostart LaunchAgent plist: {}",
+                                    legacy_plist.display()
+                                ),
+                                Err(e) => warn!(
+                                    "failed to remove legacy autostart plist {}: {}",
+                                    legacy_plist.display(),
+                                    e
+                                ),
+                            }
+                        } else {
+                            debug!(
+                                "no legacy autostart plist found at {}",
+                                legacy_plist.display()
+                            );
+                        }
+                    } else {
+                        warn!("HOME env var not set, skipping legacy autostart plist cleanup");
+                    }
+
+                    // Persist the flag so this only runs once per install.
+                    // We update both the in-memory copy and the on-disk store
+                    // so a re-read by other code sees the migrated state.
+                    store.extra.insert(
+                        LOGIN_ITEM_MIGRATION_KEY.to_string(),
+                        json!(true),
+                    );
+                    if let Err(e) = store.save(&app.handle()) {
+                        warn!(
+                            "failed to persist login item migration flag: {}",
+                            e
+                        );
+                    }
+                }
+            }
 
             if is_autostart_enabled {
                 let _ = autostart_manager.enable();

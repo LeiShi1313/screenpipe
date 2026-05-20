@@ -635,7 +635,7 @@ Never POST, PUT, or PATCH to a connection proxy unless the user explicitly asks 
 - "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param (for past meetings/calls captured by screenpipe)
 - "how long / time spent / which apps / most used" → activity-summary (not raw frame counts or SQL)
 - "what was on screen / what was I reading" → search with content_type: "all" or "accessibility"
-- "what was I doing / recent activity / summarize my day / anything broad" → activity-summary FIRST. It bundles windows + memories + bounded snippets + recording health + a data_status. Check data_status before saying "no data" — distinguishes "not recording" from "your range was empty" from "your q didn't match". Only call /search when you need verbatim quotes or a frame_id.
+- "what was I doing / recent activity / summarize my day" → activity-summary first. Check its data_status before claiming "no data". /search only for verbatim quotes or frame_ids.
 
 # Local server auth
 

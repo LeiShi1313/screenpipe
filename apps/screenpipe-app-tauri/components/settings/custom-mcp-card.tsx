@@ -168,7 +168,7 @@ export function CustomMcpCard() {
               .
             </p>
 
-            {servers.length > 0 && (
+            {servers.length > 0 ? (
               <div className="space-y-1.5 mb-3">
                 {servers.map((s) => (
                   <ServerRow
@@ -179,7 +179,15 @@ export function CustomMcpCard() {
                   />
                 ))}
               </div>
-            )}
+            ) : loaded ? (
+              <div className="text-[11px] text-muted-foreground bg-muted/30 rounded-md px-2.5 py-2 mb-3 leading-relaxed">
+                No servers yet. Try a public one like{" "}
+                <code className="text-[10px] bg-muted px-1 rounded">
+                  https://mcp.brave.com/v1
+                </code>
+                {" "}or point at your own internal MCP.
+              </div>
+            ) : null}
 
             <div className="flex items-center gap-2">
               <Button
@@ -202,9 +210,16 @@ export function CustomMcpCard() {
         <div className="px-4 py-2 bg-muted/50 border-t border-border">
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span>
-              {servers.length > 0
-                ? `${servers.length} HTTP MCP server${servers.length === 1 ? "" : "s"} available to the agent`
-                : "HTTP only — stdio MCP support coming later"}
+              {(() => {
+                const enabled = servers.filter((s) => s.enabled).length;
+                if (servers.length === 0)
+                  return "HTTP MCP only — stdio support coming later";
+                if (enabled === 0)
+                  return `${servers.length} server${servers.length === 1 ? "" : "s"} registered, none enabled`;
+                if (enabled === servers.length)
+                  return `${enabled} server${enabled === 1 ? "" : "s"} available to the agent`;
+                return `${enabled} of ${servers.length} servers enabled`;
+              })()}
             </span>
             <span className="ml-auto">
               {servers.some((s) => s.enabled)
@@ -280,6 +295,34 @@ function ServerRow({
   onChanged: () => void;
 }) {
   const [removing, setRemoving] = useState(false);
+  // Background tool-count probe — gives users a visible "this server
+  // is reachable + has N tools" signal without forcing them to open
+  // the editor. Failures stay quiet (the dot already shows enabled
+  // state); we render nothing rather than a noisy error.
+  const [toolCount, setToolCount] = useState<number | null>(null);
+  const [probing, setProbing] = useState(false);
+  useEffect(() => {
+    if (!server.enabled) return;
+    let cancelled = false;
+    setProbing(true);
+    localFetch(`/mcp-servers/${encodeURIComponent(server.id)}/tools`)
+      .then(async (r) => {
+        if (!r.ok) return null;
+        const body = await r.json();
+        return body?.data?.tools?.length ?? null;
+      })
+      .then((count) => {
+        if (!cancelled) setToolCount(count);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setProbing(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [server.id, server.enabled]);
+
   const handleDelete = useCallback(async () => {
     if (!confirm(`Remove "${server.name}" from MCP servers?`)) return;
     setRemoving(true);
@@ -299,14 +342,26 @@ function ServerRow({
         type="button"
         onClick={onEdit}
         className="flex-1 min-w-0 text-left flex items-center gap-2"
+        title={server.url}
       >
         <span
-          className={`w-1.5 h-1.5 rounded-full ${
+          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
             server.enabled ? "bg-foreground" : "bg-muted-foreground/40"
           }`}
         />
         <span className="font-medium truncate">{server.name}</span>
-        <span className="text-muted-foreground truncate">{server.url}</span>
+        <span className="text-muted-foreground truncate font-mono text-[10px]">
+          {server.url}
+        </span>
+        <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+          {probing
+            ? "…"
+            : toolCount !== null
+            ? `${toolCount} tool${toolCount === 1 ? "" : "s"}`
+            : server.enabled
+            ? "—"
+            : "disabled"}
+        </span>
       </button>
       <Button
         variant="ghost"

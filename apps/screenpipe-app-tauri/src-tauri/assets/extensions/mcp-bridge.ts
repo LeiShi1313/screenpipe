@@ -230,7 +230,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const result = parsed?.data ?? parsed;
-        const content = Array.isArray(result?.content)
+        const baseContent = Array.isArray(result?.content)
           ? result.content
           : [
               {
@@ -238,9 +238,26 @@ export default function (pi: ExtensionAPI) {
                 text: typeof result === "string" ? result : JSON.stringify(result, null, 2),
               },
             ];
+
+        // Surface MCP-side errors loudly. The protocol returns 200 OK
+        // with `isError: true` when a tool execution fails inside the
+        // server. Without prefixing the text, the agent can mistake
+        // the error message for a successful result and keep going.
+        if (result?.isError) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `⚠ MCP tool "${params.tool}" on server "${params.server_id}" reported an error (isError=true).`,
+              },
+              ...baseContent,
+            ],
+            details: { isError: true, server_id: params.server_id, tool: params.tool },
+          };
+        }
+
         return {
-          content,
-          details: result?.isError ? { isError: true } : undefined,
+          content: baseContent,
         };
       } catch (e: any) {
         return {

@@ -102,6 +102,14 @@ async fn upsert_server(
     let created_at = existing.as_ref().map(|c| c.created_at).unwrap_or_else(|| Utc::now().timestamp());
 
     let supplied = normalise_supplied(body.headers);
+    // CRLF / NUL in a header value would let a malicious config
+    // smuggle an extra HTTP request through reqwest. reqwest *might*
+    // reject these at .send() but the behaviour isn't documented as
+    // load-bearing — block them at the API edge so we don't depend on
+    // it.
+    if let Err(msg) = validate_headers(&supplied) {
+        return bad_request(&msg);
+    }
     let header_names: Vec<String> = supplied.iter().map(|h| h.name.clone()).collect();
     let existing_headers: Vec<McpHeader> = store.get_headers(&id).await;
     let merged = merge_headers(&existing_headers, &supplied);
@@ -136,6 +144,58 @@ async fn delete_server(
         Ok(()) => Json(json!({ "success": true })).into_response(),
         Err(e) => bad_request(&e.to_string()),
     }
+}
+
+/// Reject headers containing characters that could split / smuggle
+/// the HTTP request (CR, LF, NUL). Also reject non-ASCII bytes in the
+/// *name* (per RFC 7230 names are tokens — letters/digits/specials —
+/// values can be wider). Values are allowed to be any printable
+/// US-ASCII or extended-ASCII bytes; we just block the control bytes
+/// that matter for smuggling.
+fn validate_headers(headers: &[McpHeader]) -> Result<(), String> {
+    for h in headers {
+        if h.name.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(format!(
+                "header name contains a CR/LF/NUL byte — refusing to send"
+            ));
+        }
+        if h.value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(format!(
+                "header `{}` value contains a CR/LF/NUL byte — refusing to send",
+                h.name
+            ));
+        }
+        // RFC 7230 token rule for header names — letters, digits and
+        // a small set of specials. Anything else is a parsing
+        // mistake.
+        for b in h.name.bytes() {
+            let ok = b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                );
+            if !ok {
+                return Err(format!(
+                    "header name `{}` contains an invalid character",
+                    h.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Drop entries with blank names, trim names, keep values exactly as
@@ -371,6 +431,45 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].name, "Authorization");
         assert_eq!(out[1].name, "X-Custom");
+    }
+
+    #[test]
+    fn validate_rejects_crlf_in_value() {
+        let bad = vec![h("Authorization", "Bearer x\r\nHost: evil.com")];
+        let err = validate_headers(&bad).unwrap_err();
+        assert!(err.contains("CR/LF/NUL"));
+    }
+
+    #[test]
+    fn validate_rejects_crlf_in_name() {
+        let bad = vec![h("X-\rEvil", "v")];
+        // The CR check fires first.
+        let err = validate_headers(&bad).unwrap_err();
+        assert!(err.contains("CR/LF/NUL"));
+    }
+
+    #[test]
+    fn validate_rejects_nul() {
+        let bad = vec![h("Authorization", "Bearer x\0y")];
+        let err = validate_headers(&bad).unwrap_err();
+        assert!(err.contains("CR/LF/NUL"));
+    }
+
+    #[test]
+    fn validate_rejects_space_in_name() {
+        let bad = vec![h("X Bad Name", "v")];
+        let err = validate_headers(&bad).unwrap_err();
+        assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn validate_allows_typical_headers() {
+        let ok = vec![
+            h("Authorization", "Bearer aaa.bbb.ccc"),
+            h("X-API-Key", "key_with-underscores.and.dots"),
+            h("Notion-Version", "2022-06-28"),
+        ];
+        assert!(validate_headers(&ok).is_ok());
     }
 
     #[test]

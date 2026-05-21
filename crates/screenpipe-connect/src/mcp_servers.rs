@@ -27,9 +27,11 @@ use anyhow::{anyhow, Result};
 use screenpipe_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// One header pair stored on disk / sent with every request.
 ///
@@ -108,6 +110,12 @@ pub struct McpServerStore {
     screenpipe_dir: PathBuf,
     secret_store: Option<Arc<SecretStore>>,
     client: reqwest::Client,
+    /// Per-server mutexes — many MCP servers can't safely handle
+    /// concurrent requests on the same session (no JSON-RPC id
+    /// multiplexing). Issue #3282 comment, gotcha #5. Probes don't
+    /// take this lock (they're hand-driven from the settings UI and
+    /// it's fine if they race against a tool call).
+    call_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl McpServerStore {
@@ -125,7 +133,16 @@ impl McpServerStore {
             screenpipe_dir,
             secret_store,
             client,
+            call_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn lock_for(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut guard = self.call_locks.lock().await;
+        guard
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn list(&self) -> Vec<McpServerConfig> {
@@ -267,6 +284,12 @@ impl McpServerStore {
             return Err(anyhow!("MCP server '{}' is disabled", cfg.name));
         }
         let headers = self.get_headers(id).await;
+        // Serialise tool calls per server. The mutex is held for the
+        // full request lifetime; concurrent callers will queue. For
+        // truly long-running tools the 5-minute client timeout caps
+        // the worst-case stall.
+        let lock = self.lock_for(id).await;
+        let _guard = lock.lock().await;
         call_mcp_tool(&self.client, &cfg.url, &headers, tool, args).await
     }
 }
@@ -320,32 +343,52 @@ async fn probe_mcp_server(
     )
     .await;
 
-    // Step 2 — tools/list.
-    let response = send_jsonrpc(
-        client,
-        url,
-        headers,
-        "tools/list",
-        json!({}),
-        Some(probe_timeout),
-    )
-    .await?;
-    let tools = response
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .ok_or_else(|| anyhow!("MCP server returned no `tools` array"))?;
-
-    Ok(tools
-        .iter()
-        .filter_map(|t| {
-            let name = t.get("name").and_then(|n| n.as_str())?.to_string();
-            let description = t
-                .get("description")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string());
-            Some(McpToolDescriptor { name, description })
-        })
-        .collect())
+    // Step 2 — tools/list, paginated. MCP's `tools/list` may return
+    // `nextCursor` when the catalogue is large (Notion, GitHub,
+    // verbose internal MCPs). Iterate until the cursor disappears.
+    // Hard cap at 10 pages to bound runaway servers.
+    let mut all_tools: Vec<McpToolDescriptor> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let params = match cursor.as_deref() {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let response = send_jsonrpc(
+            client,
+            url,
+            headers,
+            "tools/list",
+            params,
+            Some(probe_timeout),
+        )
+        .await?;
+        let tools = response
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| anyhow!("MCP server returned no `tools` array"))?;
+        for t in tools {
+            if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                let description = t
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string());
+                all_tools.push(McpToolDescriptor {
+                    name: name.to_string(),
+                    description,
+                });
+            }
+        }
+        // Stop when the server omits `nextCursor` or sends `null`.
+        cursor = response
+            .get("nextCursor")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(all_tools)
 }
 
 async fn call_mcp_tool(
@@ -719,6 +762,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_follows_pagination_cursor() {
+        // First call returns 2 tools + nextCursor; second call
+        // returns 1 tool + no cursor. Final list should be 3.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(wiremock::matchers::body_string_contains("\"cursor\":"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "x",
+                "result": {
+                    "tools": [{ "name": "page2_a" }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            // First-page request omits the cursor. We can't easily
+            // assert "doesn't contain cursor" with wiremock's stock
+            // matchers, so a NotContains adapter does it.
+            .and(wiremock::matchers::body_string_contains("\"tools/list\""))
+            .and(NotContains("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "x",
+                "result": {
+                    "tools": [{ "name": "page1_a" }, { "name": "page1_b" }],
+                    "nextCursor": "cursor-2"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let tools = probe_mcp_server(&client, &server.uri(), &[])
+            .await
+            .unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["page1_a", "page1_b", "page2_a"]);
+    }
+
+    /// Custom wiremock matcher — wiremock has body_string_contains
+    /// but not its negation, and we need to distinguish first-page
+    /// (no cursor) from second-page (with cursor) requests.
+    struct NotContains(&'static str);
+    impl wiremock::Match for NotContains {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !String::from_utf8_lossy(&request.body).contains(self.0)
+        }
+    }
+
+    #[tokio::test]
     async fn probe_handles_sse_content_type() {
         let server = MockServer::start().await;
         let sse_body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"tools\":[{\"name\":\"sse_tool\"}]}}\n\n";
@@ -841,6 +937,123 @@ mod tests {
         assert_eq!(custom.value, "abc");
 
         // Wipe and confirm gone.
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_to_same_server_serialise() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        // wiremock with a deliberate delay — if both calls overlap we
+        // see <2 * delay total time; if they serialise we see >=2 *
+        // delay. We also count in-flight peak via the mock's hits.
+        let server = MockServer::start().await;
+        let delay_ms = 200u64;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(delay_ms))
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": "x",
+                        "result": { "content": [{ "type": "text", "text": "ok" }] }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = temp_dir();
+        let store = Arc::new(McpServerStore::new(dir.clone(), None));
+        let mut cfg = sample_config("brave");
+        cfg.url = server.uri();
+        store.upsert(cfg, None).await.unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let store = store.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .call_tool("brave", "search", json!({}))
+                    .await
+                    .unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        // Each call_tool does 2 HTTP requests (initialize + call),
+        // each delayed 200ms = 400ms per call. 3 serialised calls =
+        // 1200ms. If the mutex were broken they'd overlap fully
+        // (~400ms total). Require >=900ms to prove at least 2 calls
+        // fully serialised — that's the regression we actually care
+        // about and leaves room for CI slack.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected serialised calls (>=900ms), got {:?}",
+            elapsed
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_to_different_servers_do_not_block_each_other() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+        let delay = Duration::from_millis(300);
+        for server in [&server_a, &server_b] {
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(delay)
+                        .set_body_json(json!({
+                            "jsonrpc": "2.0",
+                            "id": "x",
+                            "result": { "content": [] }
+                        })),
+                )
+                .mount(server)
+                .await;
+        }
+
+        let dir = temp_dir();
+        let store = Arc::new(McpServerStore::new(dir.clone(), None));
+        let mut a = sample_config("a");
+        a.url = server_a.uri();
+        let mut b = sample_config("b");
+        b.url = server_b.uri();
+        store.upsert(a, None).await.unwrap();
+        store.upsert(b, None).await.unwrap();
+
+        let start = std::time::Instant::now();
+        let (ra, rb) = tokio::join!(
+            store.call_tool("a", "x", json!({})),
+            store.call_tool("b", "x", json!({})),
+        );
+        ra.unwrap();
+        rb.unwrap();
+        let elapsed = start.elapsed();
+        // Each call_tool does TWO requests (initialize + tools/call),
+        // each delayed 300ms by wiremock — so a single call_tool
+        // takes ~600ms minimum. With per-server locks the two
+        // call_tools overlap and we see ~600ms total. With a global
+        // lock they'd serialise → ~1200ms. Cap at 1000ms gives clean
+        // separation while leaving CI slack.
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "expected parallel calls (<1000ms), got {:?}",
+            elapsed
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

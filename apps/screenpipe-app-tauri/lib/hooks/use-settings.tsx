@@ -485,6 +485,8 @@ let DEFAULT_SETTINGS: Settings = {
 				port: 11434,
 			},
 		updateChannel: "stable",
+			autoUpdate: false,
+			autoUpdatePipes: true,
 			autoStartEnabled: true,
 			platform: "unknown",
 			disabledShortcuts: [],

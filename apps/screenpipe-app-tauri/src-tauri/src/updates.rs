@@ -164,6 +164,27 @@ pub struct PendingUpdateSnapshot {
     pub auth_required: bool,
 }
 
+fn auto_update_enabled_from_settings(settings: Result<Option<SettingsStore>, String>) -> bool {
+    settings
+        .ok()
+        .flatten()
+        .map(|settings| settings.auto_update)
+        .unwrap_or(false)
+}
+
+fn load_auto_update_enabled(app: &tauri::AppHandle) -> bool {
+    let settings = SettingsStore::get(app);
+    match &settings {
+        Ok(Some(settings)) => debug!("auto-update setting: {}", settings.auto_update),
+        Ok(None) => warn!("settings missing during update check; auto-update disabled"),
+        Err(err) => warn!(
+            "failed to read settings during update check; auto-update disabled: {}",
+            err
+        ),
+    }
+    auto_update_enabled_from_settings(settings)
+}
+
 pub struct UpdatesManager {
     interval: Duration,
     update_available: Arc<Mutex<bool>>,
@@ -315,11 +336,7 @@ impl UpdatesManager {
                 auth_required: false,
             });
 
-            let auto_update = SettingsStore::get(&self.app)
-                .ok()
-                .flatten()
-                .map(|s| s.auto_update)
-                .unwrap_or(false);
+            let auto_update = load_auto_update_enabled(&self.app);
 
             if let Some(ref item) = self.update_menu_item {
                 item.set_enabled(true)?;
@@ -754,4 +771,37 @@ pub fn start_update_check(
     });
 
     Ok(updates_manager)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_update_setting_respects_false() {
+        let mut settings = SettingsStore::default();
+        settings.auto_update = false;
+
+        assert!(!auto_update_enabled_from_settings(Ok(Some(settings))));
+    }
+
+    #[test]
+    fn auto_update_setting_respects_true() {
+        let mut settings = SettingsStore::default();
+        settings.auto_update = true;
+
+        assert!(auto_update_enabled_from_settings(Ok(Some(settings))));
+    }
+
+    #[test]
+    fn auto_update_setting_fails_closed_when_missing() {
+        assert!(!auto_update_enabled_from_settings(Ok(None)));
+    }
+
+    #[test]
+    fn auto_update_setting_fails_closed_when_unreadable() {
+        assert!(!auto_update_enabled_from_settings(Err(
+            "store unavailable".to_string()
+        )));
+    }
 }

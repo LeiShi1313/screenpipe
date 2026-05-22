@@ -71,12 +71,7 @@ mod tests {
         let db = setup_test_db().await;
         let start = Utc::now() - Duration::minutes(10);
         let end = Utc::now();
-        let meeting_id = insert_meeting(
-            &db,
-            &start.to_rfc3339(),
-            Some(&end.to_rfc3339()),
-        )
-        .await;
+        let meeting_id = insert_meeting(&db, &start.to_rfc3339(), Some(&end.to_rfc3339())).await;
 
         // Chunk captured 5 minutes after meeting start.
         let chunk_ts = start + Duration::minutes(5);
@@ -102,12 +97,7 @@ mod tests {
         let db = setup_test_db().await;
         let start = Utc::now() - Duration::minutes(10);
         let end = Utc::now();
-        let meeting_id = insert_meeting(
-            &db,
-            &start.to_rfc3339(),
-            Some(&end.to_rfc3339()),
-        )
-        .await;
+        let meeting_id = insert_meeting(&db, &start.to_rfc3339(), Some(&end.to_rfc3339())).await;
 
         // Chunk in the middle of the meeting.
         let chunk_ts = start + Duration::minutes(5);
@@ -134,12 +124,7 @@ mod tests {
         let db = setup_test_db().await;
         let start = Utc::now() - Duration::minutes(10);
         let end = Utc::now() - Duration::minutes(5);
-        let meeting_id = insert_meeting(
-            &db,
-            &start.to_rfc3339(),
-            Some(&end.to_rfc3339()),
-        )
-        .await;
+        let meeting_id = insert_meeting(&db, &start.to_rfc3339(), Some(&end.to_rfc3339())).await;
 
         // Chunk recorded AFTER the meeting ended.
         let chunk_ts = end + Duration::minutes(2);
@@ -189,12 +174,7 @@ mod tests {
         let db = setup_test_db().await;
         let start = Utc::now() - Duration::minutes(10);
         let end = Utc::now();
-        let meeting_id = insert_meeting(
-            &db,
-            &start.to_rfc3339(),
-            Some(&end.to_rfc3339()),
-        )
-        .await;
+        let meeting_id = insert_meeting(&db, &start.to_rfc3339(), Some(&end.to_rfc3339())).await;
 
         let chunk_ts = start + Duration::minutes(3);
         let chunk = db

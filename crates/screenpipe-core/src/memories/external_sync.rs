@@ -334,4 +334,104 @@ mod tests {
         let twice = splice_block(&once, "body");
         assert_eq!(once, twice);
     }
+
+    // ---------------------------------------------------------------------
+    // Filesystem tests for `write_atomic`. These exercise the temp-file +
+    // rename path and the no-op detection that the scheduler relies on
+    // to keep its tick quiet when nothing has actually changed.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn write_atomic_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let changed = write_atomic(&target, "fresh body").unwrap();
+        assert!(changed);
+        let contents = std::fs::read_to_string(&target).unwrap();
+        assert!(contents.contains(&marker_start()));
+        assert!(contents.contains("fresh body"));
+        assert!(contents.contains(&marker_end()));
+    }
+
+    #[test]
+    fn write_atomic_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Target sits two levels deep — neither directory exists yet.
+        let target = dir.path().join("nested").join("more").join("CLAUDE.md");
+        let changed = write_atomic(&target, "body").unwrap();
+        assert!(changed);
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn write_atomic_is_idempotent_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+
+        let first = write_atomic(&target, "same body").unwrap();
+        let second = write_atomic(&target, "same body").unwrap();
+
+        assert!(first, "first write should report changed");
+        assert!(!second, "second write with identical body must be a no-op");
+    }
+
+    #[test]
+    fn write_atomic_preserves_content_outside_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let preamble = "# my hand-written notes\n\nstay here\n";
+        std::fs::write(&target, preamble).unwrap();
+
+        let changed = write_atomic(&target, "auto body v1").unwrap();
+        assert!(changed);
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            after.starts_with(preamble),
+            "preamble was clobbered:\n{}",
+            after
+        );
+        assert!(after.contains("auto body v1"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_stale_block_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let stale = format!(
+            "# preface\n\n{}\nold contents\n{}\n\n# trailing notes\n",
+            marker_start(),
+            marker_end()
+        );
+        std::fs::write(&target, &stale).unwrap();
+
+        let changed = write_atomic(&target, "fresh body").unwrap();
+        assert!(changed);
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(after.starts_with("# preface"));
+        assert!(after.contains("fresh body"));
+        assert!(!after.contains("old contents"));
+        assert!(after.contains("# trailing notes"));
+        assert_eq!(after.matches(&marker_start()).count(), 1);
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_sibling_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        write_atomic(&target, "body").unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            entries.iter().all(|n| !n.contains(".screenpipe-tmp")),
+            "expected no temp sidecar, got: {:?}",
+            entries
+        );
+    }
 }

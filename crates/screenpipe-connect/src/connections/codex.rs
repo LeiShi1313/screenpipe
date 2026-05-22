@@ -56,6 +56,17 @@ impl Integration for Codex {
 /// Codex CLI itself does so screenpipe writes to the same place the
 /// user's local Codex installation reads from.
 pub fn resolve_home_path(creds: &Map<String, Value>) -> Result<std::path::PathBuf> {
+    resolve_with(creds, std::env::var("CODEX_HOME").ok().as_deref())
+}
+
+/// Inner pure-function variant of [`resolve_home_path`] — the env-var
+/// lookup is hoisted to a parameter so tests can exercise every branch
+/// without poking at process-global state. The public entry point
+/// reads `$CODEX_HOME` once and hands it here.
+pub fn resolve_with(
+    creds: &Map<String, Value>,
+    env_codex_home: Option<&str>,
+) -> Result<std::path::PathBuf> {
     let raw = creds
         .get("home_path")
         .and_then(|v| v.as_str())
@@ -65,7 +76,7 @@ pub fn resolve_home_path(creds: &Map<String, Value>) -> Result<std::path::PathBu
     if let Some(s) = raw {
         return expand_tilde(s);
     }
-    if let Ok(env) = std::env::var("CODEX_HOME") {
+    if let Some(env) = env_codex_home {
         let trimmed = env.trim();
         if !trimmed.is_empty() {
             return expand_tilde(trimmed);
@@ -84,5 +95,68 @@ fn expand_tilde(s: &str) -> Result<std::path::PathBuf> {
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not found"))
     } else {
         Ok(std::path::PathBuf::from(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn creds(home: Option<&str>) -> Map<String, Value> {
+        let mut m = Map::new();
+        if let Some(h) = home {
+            m.insert("home_path".to_string(), json!(h));
+        }
+        m
+    }
+
+    #[test]
+    fn explicit_home_path_wins_over_env() {
+        let p = resolve_with(&creds(Some("/tmp/explicit-codex")), Some("/tmp/env-codex")).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/tmp/explicit-codex"));
+    }
+
+    #[test]
+    fn env_codex_home_used_when_no_explicit() {
+        let p = resolve_with(&creds(None), Some("/tmp/env-codex")).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/tmp/env-codex"));
+    }
+
+    #[test]
+    fn defaults_to_dot_codex_when_neither_set() {
+        let p = resolve_with(&creds(None), None).unwrap();
+        let expected = dirs::home_dir().unwrap().join(".codex");
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn empty_env_falls_back_to_default() {
+        // CODEX_HOME="" should be treated as unset, not as "" → that
+        // would resolve to the filesystem root and silently misroute
+        // every sync.
+        let p = resolve_with(&creds(None), Some("   ")).unwrap();
+        let expected = dirs::home_dir().unwrap().join(".codex");
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn empty_explicit_falls_back_to_env() {
+        let p = resolve_with(&creds(Some("   ")), Some("/tmp/env-codex")).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/tmp/env-codex"));
+    }
+
+    #[test]
+    fn tilde_in_explicit_expands_to_home() {
+        let p = resolve_with(&creds(Some("~/custom-codex")), None).unwrap();
+        let expected = dirs::home_dir().unwrap().join("custom-codex");
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn tilde_in_env_expands_to_home() {
+        let p = resolve_with(&creds(None), Some("~/codex-from-env")).unwrap();
+        let expected = dirs::home_dir().unwrap().join("codex-from-env");
+        assert_eq!(p, expected);
     }
 }

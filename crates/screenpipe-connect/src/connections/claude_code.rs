@@ -82,3 +82,72 @@ fn expand_tilde(s: &str) -> Result<std::path::PathBuf> {
         Ok(std::path::PathBuf::from(s))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn creds(home: Option<&str>) -> Map<String, Value> {
+        let mut m = Map::new();
+        if let Some(h) = home {
+            m.insert("home_path".to_string(), json!(h));
+        }
+        m
+    }
+
+    #[test]
+    fn defaults_to_dot_claude_when_field_missing() {
+        let p = resolve_home_path(&creds(None)).unwrap();
+        assert_eq!(p, dirs::home_dir().unwrap().join(".claude"));
+    }
+
+    #[test]
+    fn defaults_to_dot_claude_when_field_blank() {
+        // A blank string from the UI ("   ") shouldn't resolve to the
+        // current working directory — that's a footgun. Fall back to
+        // the default like an unset field.
+        let p = resolve_home_path(&creds(Some("   "))).unwrap();
+        assert_eq!(p, dirs::home_dir().unwrap().join(".claude"));
+    }
+
+    #[test]
+    fn explicit_absolute_path_used_verbatim() {
+        let p = resolve_home_path(&creds(Some("/tmp/some/claude-home"))).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/tmp/some/claude-home"));
+    }
+
+    #[test]
+    fn tilde_prefix_expands_to_home() {
+        let p = resolve_home_path(&creds(Some("~/work-claude"))).unwrap();
+        assert_eq!(p, dirs::home_dir().unwrap().join("work-claude"));
+    }
+
+    #[test]
+    fn bare_tilde_resolves_to_home() {
+        let p = resolve_home_path(&creds(Some("~"))).unwrap();
+        assert_eq!(p, dirs::home_dir().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_creates_missing_directory_and_reports_ready() {
+        // Target a path that doesn't exist yet — `test()` should create
+        // it (matching what `claude` does on first launch) and report
+        // success. Mirrors the `claude_code.test()` UX from the
+        // connections page.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("claude");
+        let creds = creds(Some(target.to_str().unwrap()));
+
+        let result = ClaudeCode
+            .test(&reqwest::Client::new(), &creds, None)
+            .await
+            .unwrap();
+
+        assert!(target.exists());
+        assert!(result.contains("ready"));
+        // Probe file must be cleaned up so the UI doesn't show stray
+        // dotfiles next time the user opens their claude dir.
+        assert!(!target.join(".screenpipe-write-probe").exists());
+    }
+}

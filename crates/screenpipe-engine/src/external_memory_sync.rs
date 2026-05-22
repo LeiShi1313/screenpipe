@@ -268,7 +268,7 @@ async fn sync_destination(
     entries: &[MemoryEntry],
     secret_store: Option<&SecretStore>,
     screenpipe_dir: &std::path::Path,
-    resolver: fn(&serde_json::Map<String, Value>) -> Result<PathBuf>,
+    resolver: impl Fn(&serde_json::Map<String, Value>) -> Result<PathBuf>,
 ) -> ExternalSyncResult {
     let conn = load_connection(secret_store, screenpipe_dir, dest.id).await;
     let outcome = match conn {
@@ -305,7 +305,7 @@ fn apply(
     dest: &Destination,
     entries: &[MemoryEntry],
     credentials: &serde_json::Map<String, Value>,
-    resolver: fn(&serde_json::Map<String, Value>) -> Result<PathBuf>,
+    resolver: impl Fn(&serde_json::Map<String, Value>) -> Result<PathBuf>,
 ) -> Result<SyncOutcome> {
     let home = resolver(credentials)?;
     let target = dest.target_path(&home);
@@ -388,4 +388,219 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use screenpipe_core::memories::external_sync::{marker_end, marker_start};
+    use serde_json::json;
+
+    fn entry(content: &str, importance: f64) -> MemoryEntry {
+        MemoryEntry {
+            content: content.to_string(),
+            source: "user".to_string(),
+            tags: vec![],
+            importance,
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn apply_writes_block_into_destination_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = serde_json::Map::new();
+        let resolver = {
+            let p = dir.path().to_path_buf();
+            move |_: &serde_json::Map<String, Value>| Ok(p.clone())
+        };
+
+        let entries = vec![entry("user prefers bun over npm", 0.9)];
+        let outcome = apply(&Destination::CLAUDE_CODE, &entries, &creds, resolver).unwrap();
+
+        match outcome {
+            SyncOutcome::Wrote { path, entries: n } => {
+                assert_eq!(n, 1);
+                assert!(path.ends_with("CLAUDE.md"));
+                let body = std::fs::read_to_string(&path).unwrap();
+                assert!(body.contains("user prefers bun over npm"));
+                assert!(body.contains(&marker_start()));
+                assert!(body.contains(&marker_end()));
+            }
+            other => panic!("expected Wrote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_is_idempotent_on_repeat_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = serde_json::Map::new();
+        let resolver = {
+            let p = dir.path().to_path_buf();
+            move |_: &serde_json::Map<String, Value>| Ok(p.clone())
+        };
+
+        let entries = vec![entry("durable fact", 0.8)];
+
+        let first = apply(&Destination::CODEX, &entries, &creds, &resolver).unwrap();
+        let second = apply(&Destination::CODEX, &entries, &creds, &resolver).unwrap();
+
+        assert!(matches!(first, SyncOutcome::Wrote { .. }));
+        assert!(
+            matches!(second, SyncOutcome::Unchanged { .. }),
+            "second apply with identical entries must short-circuit"
+        );
+    }
+
+    #[test]
+    fn apply_reports_change_when_entries_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = serde_json::Map::new();
+        let resolver = {
+            let p = dir.path().to_path_buf();
+            move |_: &serde_json::Map<String, Value>| Ok(p.clone())
+        };
+
+        let first_entries = vec![entry("fact A", 0.8)];
+        let second_entries = vec![entry("fact A", 0.8), entry("fact B", 0.7)];
+
+        let r1 = apply(&Destination::CLAUDE_CODE, &first_entries, &creds, &resolver).unwrap();
+        let r2 = apply(
+            &Destination::CLAUDE_CODE,
+            &second_entries,
+            &creds,
+            &resolver,
+        )
+        .unwrap();
+
+        assert!(matches!(r1, SyncOutcome::Wrote { .. }));
+        match r2 {
+            SyncOutcome::Wrote { entries: n, .. } => assert_eq!(n, 2),
+            other => panic!("expected Wrote on second apply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_surfaces_resolver_error() {
+        let creds = serde_json::Map::new();
+        let resolver = |_: &serde_json::Map<String, Value>| Err(anyhow::anyhow!("bogus path"));
+
+        let result = apply(&Destination::CLAUDE_CODE, &[], &creds, resolver);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("bogus path"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn sync_destination_skips_when_connection_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = {
+            let p = dir.path().to_path_buf();
+            move |_: &serde_json::Map<String, Value>| Ok(p.clone())
+        };
+
+        // No secret store, no legacy connections.json — the integration
+        // has never been configured. We must report Skipped, not write
+        // an empty digest into the user's CLAUDE.md.
+        let result = sync_destination(
+            &Destination::CLAUDE_CODE,
+            &[entry("anything", 0.9)],
+            None,
+            dir.path(),
+            resolver,
+        )
+        .await;
+
+        match result.outcome {
+            Ok(SyncOutcome::Skipped { reason }) => {
+                assert!(
+                    reason.contains("not configured"),
+                    "expected not-configured reason, got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected Skipped, got {:?}", other),
+        }
+        assert!(!dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[tokio::test]
+    async fn sync_destination_skips_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = {
+            let p = dir.path().to_path_buf();
+            move |_: &serde_json::Map<String, Value>| Ok(p.clone())
+        };
+
+        // Seed the legacy connections.json with the integration toggled
+        // off — the scheduler should respect that and not write.
+        let store_path = dir.path().join("connections.json");
+        let saved = json!({
+            "claude_code": {
+                "enabled": false,
+                "credentials": {}
+            }
+        });
+        std::fs::write(&store_path, saved.to_string()).unwrap();
+
+        let result = sync_destination(
+            &Destination::CLAUDE_CODE,
+            &[entry("anything", 0.9)],
+            None,
+            dir.path(),
+            resolver,
+        )
+        .await;
+
+        match result.outcome {
+            Ok(SyncOutcome::Skipped { reason }) => {
+                assert!(
+                    reason.contains("disabled"),
+                    "expected disabled reason, got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected Skipped, got {:?}", other),
+        }
+        assert!(!dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[tokio::test]
+    async fn sync_destination_writes_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().to_path_buf();
+        let resolver = {
+            let p = target_dir.clone();
+            move |_: &serde_json::Map<String, Value>| Ok(p.clone())
+        };
+
+        let store_path = dir.path().join("connections.json");
+        let saved = json!({
+            "claude_code": {
+                "enabled": true,
+                "credentials": {}
+            }
+        });
+        std::fs::write(&store_path, saved.to_string()).unwrap();
+
+        let entries = vec![entry("first fact", 0.9), entry("second fact", 0.8)];
+        let result = sync_destination(
+            &Destination::CLAUDE_CODE,
+            &entries,
+            None,
+            dir.path(),
+            resolver,
+        )
+        .await;
+
+        match result.outcome {
+            Ok(SyncOutcome::Wrote { path, entries: n }) => {
+                assert_eq!(n, 2);
+                assert_eq!(path, target_dir.join("CLAUDE.md"));
+                let body = std::fs::read_to_string(&path).unwrap();
+                assert!(body.contains("first fact"));
+                assert!(body.contains("second fact"));
+            }
+            other => panic!("expected Wrote, got {:?}", other),
+        }
+    }
 }

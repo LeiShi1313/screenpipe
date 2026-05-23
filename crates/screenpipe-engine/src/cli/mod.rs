@@ -566,6 +566,27 @@ pub struct RecordArgs {
     /// in_meeting override flag stays false.
     #[arg(long, default_value_t = false)]
     pub disable_meeting_detector: bool,
+
+    /// Only persist + transcribe audio while a meeting is detected. CPAL streams
+    /// stay running for low-latency leading edge; chunks captured outside the
+    /// meeting window are dropped (with a small pre-roll buffer and a trailing
+    /// grace tail to absorb detector lag). Live meeting streaming is unaffected.
+    /// Requires the v2 meeting detector — cannot combine with
+    /// `--disable-meeting-detector`.
+    #[arg(long, default_value_t = false)]
+    pub audio_meetings_only: bool,
+
+    /// Seconds of audio kept in memory before a meeting starts, replayed into
+    /// the persist path when the detector fires so the first words aren't lost.
+    /// Ignored unless `--audio-meetings-only` is set.
+    #[arg(long, default_value_t = 60)]
+    pub audio_meetings_only_preroll_secs: u64,
+
+    /// Seconds after a meeting ends during which audio is still recorded.
+    /// Absorbs detector hysteresis and trailing audio. Ignored unless
+    /// `--audio-meetings-only` is set.
+    #[arg(long, default_value_t = 30)]
+    pub audio_meetings_only_grace_tail_secs: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -602,6 +623,9 @@ pub struct RecordArgSources {
     pub encrypt_secrets: bool,
     pub disable_snapshot_compaction: bool,
     pub disable_meeting_detector: bool,
+    pub audio_meetings_only: bool,
+    pub audio_meetings_only_preroll_secs: bool,
+    pub audio_meetings_only_grace_tail_secs: bool,
 }
 
 impl RecordArgSources {
@@ -646,6 +670,15 @@ impl RecordArgSources {
             encrypt_secrets: from_command_line(record, "encrypt_secrets"),
             disable_snapshot_compaction: from_command_line(record, "disable_snapshot_compaction"),
             disable_meeting_detector: from_command_line(record, "disable_meeting_detector"),
+            audio_meetings_only: from_command_line(record, "audio_meetings_only"),
+            audio_meetings_only_preroll_secs: from_command_line(
+                record,
+                "audio_meetings_only_preroll_secs",
+            ),
+            audio_meetings_only_grace_tail_secs: from_command_line(
+                record,
+                "audio_meetings_only_grace_tail_secs",
+            ),
         }
     }
 
@@ -682,6 +715,9 @@ impl RecordArgSources {
             || self.encrypt_secrets
             || self.disable_snapshot_compaction
             || self.disable_meeting_detector
+            || self.audio_meetings_only
+            || self.audio_meetings_only_preroll_secs
+            || self.audio_meetings_only_grace_tail_secs
     }
 }
 
@@ -772,6 +808,9 @@ impl RecordArgs {
             video_quality: self.video_quality.clone(),
             disable_snapshot_compaction: self.disable_snapshot_compaction,
             disable_meeting_detector: self.disable_meeting_detector,
+            audio_meetings_only: self.audio_meetings_only,
+            audio_meetings_only_preroll_secs: self.audio_meetings_only_preroll_secs,
+            audio_meetings_only_grace_tail_secs: self.audio_meetings_only_grace_tail_secs,
             idle_capture_interval_ms: self.idle_capture_interval_ms,
             visual_check_interval_ms: self.visual_check_interval_ms,
             visual_change_threshold: self.visual_change_threshold,
@@ -826,6 +865,18 @@ impl RecordArgs {
         let mut settings = persisted_settings.unwrap_or_else(|| self.to_recording_settings());
         if loaded_from_store {
             self.apply_explicit_overrides(&mut settings, sources);
+        }
+
+        // Validate: meetings-only audio requires the v2 meeting detector.
+        // Refuse to start rather than silently degrading — the user explicitly
+        // opted into a privacy-shaped behavior; either fail-closed (record
+        // nothing) or fail-open (record everything) is worse than telling them
+        // the combo is invalid up-front.
+        if settings.audio_meetings_only && settings.disable_meeting_detector {
+            anyhow::bail!(
+                "--audio-meetings-only requires the v2 meeting detector; \
+                 cannot be combined with --disable-meeting-detector"
+            );
         }
 
         // First-launch tier detection for CLI users
@@ -1035,6 +1086,15 @@ impl RecordArgs {
         }
         if sources.disable_meeting_detector {
             settings.disable_meeting_detector = self.disable_meeting_detector;
+        }
+        if sources.audio_meetings_only {
+            settings.audio_meetings_only = self.audio_meetings_only;
+        }
+        if sources.audio_meetings_only_preroll_secs {
+            settings.audio_meetings_only_preroll_secs = self.audio_meetings_only_preroll_secs;
+        }
+        if sources.audio_meetings_only_grace_tail_secs {
+            settings.audio_meetings_only_grace_tail_secs = self.audio_meetings_only_grace_tail_secs;
         }
     }
 }

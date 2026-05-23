@@ -87,6 +87,23 @@ pub struct AudioManagerOptions {
     pub channel_config: ChannelConfig,
     /// Disable all audio functionality (no device polling, no model downloads)
     pub is_disabled: bool,
+    /// Only persist and transcribe audio while a meeting is detected.
+    /// CPAL streams keep running (low-latency leading edge); chunks captured
+    /// outside the window are dropped — except for a small pre-roll buffer
+    /// and a trailing grace tail. Requires `meeting_detector` to be set;
+    /// otherwise the receiver fails closed (no audio is persisted).
+    /// Live meeting streaming is independent and unaffected.
+    pub audio_meetings_only: bool,
+    /// Seconds of audio kept in memory before a meeting starts, replayed into
+    /// the persist path on the leading edge so we don't miss the first words.
+    /// Default 60s. Memory ceiling enforced by `audio_meetings_only_max_preroll_chunks`.
+    pub audio_meetings_only_preroll_secs: u64,
+    /// Seconds after a meeting ends during which audio is still recorded.
+    /// Absorbs detector hysteresis and "thanks bye" tails. Default 30s.
+    pub audio_meetings_only_grace_tail_secs: u64,
+    /// Hard cap on pre-roll chunks per device — backstop against runaway memory
+    /// if chunk duration is very short. Default 8.
+    pub audio_meetings_only_max_preroll_chunks: usize,
 }
 
 impl Default for AudioManagerOptions {
@@ -123,6 +140,10 @@ impl Default for AudioManagerOptions {
             batch_max_duration_secs: None,
             channel_config: ChannelConfig::default(),
             is_disabled: false,
+            audio_meetings_only: false,
+            audio_meetings_only_preroll_secs: 60,
+            audio_meetings_only_grace_tail_secs: 30,
+            audio_meetings_only_max_preroll_chunks: 8,
         }
     }
 }
@@ -258,6 +279,21 @@ impl AudioManagerBuilder {
 
     pub fn channel_config(mut self, config: ChannelConfig) -> Self {
         self.options.channel_config = config;
+        self
+    }
+
+    pub fn audio_meetings_only(mut self, enabled: bool) -> Self {
+        self.options.audio_meetings_only = enabled;
+        self
+    }
+
+    pub fn audio_meetings_only_preroll_secs(mut self, secs: u64) -> Self {
+        self.options.audio_meetings_only_preroll_secs = secs;
+        self
+    }
+
+    pub fn audio_meetings_only_grace_tail_secs(mut self, secs: u64) -> Self {
+        self.options.audio_meetings_only_grace_tail_secs = secs;
         self
     }
 

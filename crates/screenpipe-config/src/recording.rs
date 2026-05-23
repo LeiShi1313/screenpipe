@@ -174,6 +174,33 @@ pub struct RecordingSettings {
     #[serde(rename = "disableMeetingDetector", default)]
     pub disable_meeting_detector: bool,
 
+    /// Only persist + transcribe audio while a meeting is detected. CPAL streams
+    /// stay running for low-latency leading edge; chunks captured outside the
+    /// meeting window are dropped (with a small pre-roll buffer and a trailing
+    /// grace tail to absorb detector lag). Live meeting streaming is unaffected.
+    /// Requires the v2 meeting detector — cannot combine with
+    /// `disableMeetingDetector=true`.
+    #[serde(rename = "audioMeetingsOnly", default)]
+    pub audio_meetings_only: bool,
+
+    /// Seconds of audio kept in memory before a meeting starts, replayed into
+    /// the persist path when the detector fires so the first words aren't lost.
+    /// Ignored unless `audioMeetingsOnly` is true. Default 60.
+    #[serde(
+        rename = "audioMeetingsOnlyPrerollSecs",
+        default = "default_audio_meetings_only_preroll_secs"
+    )]
+    pub audio_meetings_only_preroll_secs: u64,
+
+    /// Seconds after a meeting ends during which audio is still recorded.
+    /// Absorbs detector hysteresis and trailing audio. Ignored unless
+    /// `audioMeetingsOnly` is true. Default 30.
+    #[serde(
+        rename = "audioMeetingsOnlyGraceTailSecs",
+        default = "default_audio_meetings_only_grace_tail_secs"
+    )]
+    pub audio_meetings_only_grace_tail_secs: u64,
+
     // ── Mitsukeru fork: event-driven capture overrides ─────────────────
     // ミツケル拡張：PowerProfile に依らず個別パラメータを直接指定するための上書き値。
     // None の場合は通常通り PowerProfile が決定。デスクトップ常時記録のような用途で
@@ -493,6 +520,9 @@ impl Default for RecordingSettings {
             max_snapshot_width: default_max_snapshot_width(),
             disable_snapshot_compaction: false,
             disable_meeting_detector: false,
+            audio_meetings_only: false,
+            audio_meetings_only_preroll_secs: default_audio_meetings_only_preroll_secs(),
+            audio_meetings_only_grace_tail_secs: default_audio_meetings_only_grace_tail_secs(),
             idle_capture_interval_ms: None,
             visual_check_interval_ms: None,
             visual_change_threshold: None,
@@ -567,6 +597,14 @@ fn default_pause_extraction_on_input_ms() -> u64 {
 
 fn default_pii_backend() -> String {
     "local".to_string()
+}
+
+fn default_audio_meetings_only_preroll_secs() -> u64 {
+    60
+}
+
+fn default_audio_meetings_only_grace_tail_secs() -> u64 {
+    30
 }
 
 #[cfg(test)]

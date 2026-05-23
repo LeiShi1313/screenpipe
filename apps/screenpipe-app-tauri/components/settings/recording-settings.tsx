@@ -2537,6 +2537,85 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </Card>
         )}
 
+        {/* Audio capture window — meetings-only mode */}
+        {!settings.disableAudio && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Only record audio during meetings
+                    <HelpTooltip text="Pauses 24/7 audio capture. Audio is only persisted while a meeting is detected (with a pre-roll buffer so the first words aren't lost and a grace tail for the end of the call). Live meeting notes are unaffected. Requires the meeting detector." />
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {settings.disableMeetingDetector
+                      ? "Disabled — the meeting detector is off, so meetings can't be detected"
+                      : "Skip background recording when no meeting is active"}
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="audioMeetingsOnly"
+                checked={settings.audioMeetingsOnly ?? false}
+                disabled={settings.disableMeetingDetector}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange({ audioMeetingsOnly: checked }, true)
+                }
+              />
+            </div>
+            {(settings.audioMeetingsOnly ?? false) && !settings.disableMeetingDetector && (
+              <div className="mt-2.5 ml-[26px] flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-3">
+                  <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
+                    Pre-roll
+                    <HelpTooltip text="How much audio is kept in memory just before a meeting starts. When the detector fires, this buffer is replayed so the first seconds of the call aren't lost." />
+                  </Label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      max={300}
+                      className="h-8 w-[80px] text-xs"
+                      value={settings.audioMeetingsOnlyPrerollSecs ?? 60}
+                      onChange={(e) => {
+                        const n = Math.max(0, Math.min(300, Number(e.target.value) || 0));
+                        handleSettingsChange({ audioMeetingsOnlyPrerollSecs: n }, true);
+                      }}
+                    />
+                    <span className="text-xs text-muted-foreground">seconds</span>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
+                    Grace tail
+                    <HelpTooltip text="How long to keep recording after a meeting ends. Absorbs detector hysteresis and trailing audio (e.g. 'thanks, bye')." />
+                  </Label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      max={300}
+                      className="h-8 w-[80px] text-xs"
+                      value={settings.audioMeetingsOnlyGraceTailSecs ?? 30}
+                      onChange={(e) => {
+                        const n = Math.max(0, Math.min(300, Number(e.target.value) || 0));
+                        handleSettingsChange({ audioMeetingsOnlyGraceTailSecs: n }, true);
+                      }}
+                    />
+                    <span className="text-xs text-muted-foreground">seconds</span>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Screen recording is independent — toggle it separately above.
+                </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+        )}
+
         {/* Meeting Live Notes */}
         {!settings.disableAudio && (
         <Card className="border-border bg-card">

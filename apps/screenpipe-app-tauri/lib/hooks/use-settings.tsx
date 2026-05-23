@@ -188,6 +188,17 @@ export type Settings = SettingsStore & {
 	meetingLiveTranscriptionProvider?: "selected-engine" | "screenpipe-cloud" | "disabled" | "deepgram-live";
 	/** When true, the user's typed text (and edited files) captured during a meeting is auto-appended to the meeting note when the meeting stops. Default true. */
 	appendTypedTextToMeetingNote?: boolean;
+	/** Only persist + transcribe audio while a meeting is detected. CPAL streams
+	 * stay running; chunks captured outside the meeting window are dropped
+	 * (modulo a small pre-roll and trailing grace tail). Live meeting notes
+	 * are unaffected. Requires the v2 meeting detector. */
+	audioMeetingsOnly?: boolean;
+	/** Seconds of audio buffered in memory before a meeting starts (replayed
+	 * on the leading edge so the first words aren't lost). Default 60. */
+	audioMeetingsOnlyPrerollSecs?: number;
+	/** Seconds after a meeting ends during which audio is still recorded.
+	 * Absorbs detector hysteresis and trailing audio. Default 30. */
+	audioMeetingsOnlyGraceTailSecs?: number;
 	/** User's name for speaker identification — input device audio will be labeled with this name */
 	userName?: string;
 	/** Filters pushed from team — merged with local filters for recording */
@@ -463,6 +474,9 @@ let DEFAULT_SETTINGS: Settings = {
 			meetingLiveTranscriptionEnabled: true,
 			meetingLiveTranscriptionProvider: "selected-engine",
 			appendTypedTextToMeetingNote: true,
+			audioMeetingsOnly: false,
+			audioMeetingsOnlyPrerollSecs: 60,
+			audioMeetingsOnlyGraceTailSecs: 30,
 			ocrEngine: "default",
 			monitorIds: ["default"],
 			audioDevices: ["default"],
@@ -647,6 +661,18 @@ function createSettingsStore() {
 		}
 		if (settings.appendTypedTextToMeetingNote === undefined) {
 			settings.appendTypedTextToMeetingNote = true;
+			needsUpdate = true;
+		}
+		if (settings.audioMeetingsOnly === undefined) {
+			settings.audioMeetingsOnly = false;
+			needsUpdate = true;
+		}
+		if (settings.audioMeetingsOnlyPrerollSecs === undefined) {
+			settings.audioMeetingsOnlyPrerollSecs = 60;
+			needsUpdate = true;
+		}
+		if (settings.audioMeetingsOnlyGraceTailSecs === undefined) {
+			settings.audioMeetingsOnlyGraceTailSecs = 30;
 			needsUpdate = true;
 		}
 

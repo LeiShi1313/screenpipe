@@ -147,6 +147,14 @@ pub struct RecordingConfig {
     /// See `RecordingSettings.disable_meeting_detector` for details.
     pub disable_meeting_detector: bool,
 
+    /// Only persist + transcribe audio while a meeting is detected.
+    /// See `RecordingSettings.audio_meetings_only` for details.
+    pub audio_meetings_only: bool,
+    /// Pre-roll seconds for `audio_meetings_only` mode.
+    pub audio_meetings_only_preroll_secs: u64,
+    /// Grace-tail seconds for `audio_meetings_only` mode.
+    pub audio_meetings_only_grace_tail_secs: u64,
+
     /// Mitsukeru fork: overrides for event-driven capture parameters.
     /// None = follow active PowerProfile.
     pub idle_capture_interval_ms: Option<u64>,
@@ -311,6 +319,9 @@ impl RecordingConfig {
             max_snapshot_width: settings.max_snapshot_width,
             disable_snapshot_compaction: settings.disable_snapshot_compaction,
             disable_meeting_detector: settings.disable_meeting_detector,
+            audio_meetings_only: settings.audio_meetings_only,
+            audio_meetings_only_preroll_secs: settings.audio_meetings_only_preroll_secs,
+            audio_meetings_only_grace_tail_secs: settings.audio_meetings_only_grace_tail_secs,
             idle_capture_interval_ms: settings.idle_capture_interval_ms,
             visual_check_interval_ms: settings.visual_check_interval_ms,
             visual_change_threshold: settings.visual_change_threshold,
@@ -399,6 +410,9 @@ impl RecordingConfig {
             .vocabulary(self.vocabulary.clone())
             .batch_max_duration_secs(self.batch_max_duration_secs)
             .channel_config(self.channel_config.clone())
+            .audio_meetings_only(self.audio_meetings_only)
+            .audio_meetings_only_preroll_secs(self.audio_meetings_only_preroll_secs)
+            .audio_meetings_only_grace_tail_secs(self.audio_meetings_only_grace_tail_secs)
     }
 
     /// Build a `VisionManagerConfig` from this config.

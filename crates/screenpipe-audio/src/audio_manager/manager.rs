@@ -696,14 +696,35 @@ impl AudioManager {
         let is_batch_mode = options.transcription_mode == TranscriptionMode::Batch;
         let batch_max_duration_secs = options.batch_max_duration_secs;
         let filter_music = options.filter_music;
+        let audio_meetings_only = options.audio_meetings_only;
+        let audio_meetings_only_preroll_secs = options.audio_meetings_only_preroll_secs;
+        let audio_meetings_only_grace_tail_secs = options.audio_meetings_only_grace_tail_secs;
+        let audio_meetings_only_max_preroll_chunks =
+            options.audio_meetings_only_max_preroll_chunks;
         let vad_engine = self.vad_engine.clone();
         let whisper_receiver = self.recording_receiver.clone();
+        let recording_sender_replay = self.recording_sender.clone();
         let metrics = self.metrics.clone();
         let meeting_detector = self.meeting_detector().await;
         let meeting_audio_tap = self.meeting_audio_tap.clone();
         let db = self.db.clone();
         let shared_engine = self.engine.clone();
         let on_insert_session = self.on_transcription_insert.clone();
+
+        // Surface mode to /health regardless of detector availability — UI
+        // reads this to render the "standby / recording" status pill.
+        metrics.set_meetings_only_active(audio_meetings_only);
+        if audio_meetings_only && meeting_detector.is_none() {
+            // Fail closed: privacy-conscious users explicitly opted into
+            // "only during meetings"; silently recording 24/7 would violate
+            // intent. The receiver loop will refuse to persist anything,
+            // and the UI surface (chunks_dropped_no_meeting) makes the
+            // misconfiguration visible.
+            error!(
+                "audio_meetings_only is enabled but no meeting detector is configured; \
+                 no audio will be recorded until the detector is enabled"
+            );
+        }
 
         // Build unified transcription engine — only loads the needed model
         let engine = TranscriptionEngine::new(
@@ -744,6 +765,16 @@ impl AudioManager {
             };
             let mut deferral_started: Option<std::time::Instant> = None;
 
+            // Meetings-only mode locals — only consulted when `audio_meetings_only` is true.
+            // Owned by this task (single consumer of the recording channel), so no locks.
+            let mut preroll = super::preroll::PreRollBuffer::new(
+                audio_meetings_only_preroll_secs,
+                audio_meetings_only_max_preroll_chunks,
+            );
+            let mut was_in_meeting = false;
+            let mut last_in_meeting_at: Option<std::time::Instant> = None;
+            let grace_tail = std::time::Duration::from_secs(audio_meetings_only_grace_tail_secs);
+
             while let Ok(audio) = whisper_receiver.recv() {
                 metrics.record_chunk_received();
                 debug!("received audio from device: {:?}", audio.device.name);
@@ -763,6 +794,82 @@ impl AudioManager {
                         crate::core::device::DeviceType::Input => rms > 0.05,
                     };
                     meeting.on_audio_activity(&audio.device.device_type, has_activity);
+                }
+
+                // Meetings-only gate: drop chunks outside the meeting window.
+                // - In-meeting → fall through to normal persist + STT path
+                // - Leading edge (false→true) → replay pre-roll through the
+                //   channel first so the first words of the call are kept
+                // - Grace tail → keep recording briefly after detector flips
+                //   off (absorbs detector hysteresis and trailing audio)
+                // - Otherwise → buffer in pre-roll and skip persist
+                //
+                // Fails closed when no detector is configured: nothing is
+                // persisted so privacy intent is preserved.
+                if audio_meetings_only {
+                    let in_meeting = meeting_detector
+                        .as_ref()
+                        .map(|d| d.is_in_meeting())
+                        .unwrap_or(false);
+                    let now = std::time::Instant::now();
+
+                    if in_meeting {
+                        if !was_in_meeting {
+                            let drained = preroll.drain();
+                            if !drained.is_empty() {
+                                let count = drained.len() as u64;
+                                let mut sent: u64 = 0;
+                                for buffered in drained {
+                                    match recording_sender_replay.try_send(buffered) {
+                                        Ok(()) => sent += 1,
+                                        Err(crossbeam::channel::TrySendError::Full(_)) => {
+                                            warn!(
+                                                "meetings_only: recording channel full while \
+                                                 replaying pre-roll; dropping buffered chunk"
+                                            );
+                                        }
+                                        Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                            warn!(
+                                                "meetings_only: recording channel closed; \
+                                                 abandoning pre-roll replay"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                metrics.record_chunks_promoted_from_preroll(sent);
+                                info!(
+                                    "meetings_only: meeting started — replayed {}/{} pre-roll chunks",
+                                    sent, count
+                                );
+                            }
+                        }
+                        was_in_meeting = true;
+                        last_in_meeting_at = Some(now);
+                        // Fall through to normal processing below.
+                    } else {
+                        let within_grace = last_in_meeting_at
+                            .map(|t| now.duration_since(t) < grace_tail)
+                            .unwrap_or(false);
+                        if within_grace {
+                            // Trailing tail — keep recording as if in-meeting.
+                            // Fall through to normal processing below.
+                        } else {
+                            if was_in_meeting {
+                                info!(
+                                    "meetings_only: meeting window closed — buffering audio in pre-roll only"
+                                );
+                            }
+                            was_in_meeting = false;
+                            preroll.push(audio.clone());
+                            metrics.record_chunk_dropped_no_meeting();
+                            debug!(
+                                "meetings_only: no meeting detected — chunk buffered (pre-roll len={})",
+                                preroll.len()
+                            );
+                            continue;
+                        }
+                    }
                 }
 
                 // ALWAYS persist audio to disk immediately, before any deferral.

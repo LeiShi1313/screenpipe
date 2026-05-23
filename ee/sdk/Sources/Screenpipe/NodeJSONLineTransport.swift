@@ -57,7 +57,12 @@ final class NodeJSONLineTransport: ScreenpipeTransport, @unchecked Sendable {
 
   func events() -> AsyncStream<ScreenpipeEvent> {
     let id = UUID()
-    return AsyncStream { continuation in
+    // `.bufferingNewest(256)` keeps memory bounded if a consumer is
+    // slow — frames_progress alone can fire 12/min, app_switched can
+    // burst during alt-tab. Old events are dropped to make room for
+    // current state, which is what an "is recording happening right
+    // now" UI actually wants.
+    return AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
       queue.async {
         if self.isClosed {
           continuation.finish()

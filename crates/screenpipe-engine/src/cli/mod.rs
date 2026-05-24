@@ -16,6 +16,7 @@ pub mod presets;
 pub mod search;
 pub mod status;
 mod store_file;
+pub mod team;
 pub mod survey;
 pub mod sync;
 pub mod vault;
@@ -188,6 +189,14 @@ pub enum Command {
     /// (no daemon required — opens `~/.screenpipe/db.sqlite` read-side
     /// via WAL while sp may be writing).
     Search(SearchArgs),
+
+    /// Enterprise: query teammates' screen + audio history via
+    /// `screenpi.pe/api/enterprise/v1/*`. Admin-only — needs a
+    /// `team_api_token` minted at https://screenpi.pe/enterprise?tab=tokens.
+    Team {
+        #[command(subcommand)]
+        subcommand: TeamCommand,
+    },
 
     /// Manage pipes (scheduled agents on screen data)
     Pipe {
@@ -1486,6 +1495,99 @@ pub struct SearchArgs {
     /// The schema matches `GET /search` exactly.
     #[arg(long)]
     pub json: bool,
+}
+
+// =============================================================================
+// Team (enterprise) subcommands
+// =============================================================================
+
+/// Mirrors the `screenpipe-team` skill 1:1 — same endpoints, same vocabulary.
+/// All three variants hit `https://screenpi.pe/api/enterprise/v1/*` directly
+/// with the admin's `team_api_token` from `~/.screenpipe/enterprise.json`
+/// (or `SCREENPIPE_TEAM_API_TOKEN` env override). No daemon needed.
+#[derive(Subcommand, Debug)]
+pub enum TeamCommand {
+    /// List devices reporting to this org
+    Devices(TeamDevicesArgs),
+    /// Substring search across the team's screen + audio history
+    Search(TeamSearchArgs),
+    /// Chronological dump for one device — use after `devices` + `search`
+    /// have narrowed down a person and a moment
+    Records(TeamRecordsArgs),
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamDevicesArgs {
+    /// Emit compact JSON-lines (one device per line). Default is pretty JSON.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamSearchArgs {
+    /// Search query (case-insensitive substring across app, window, frame
+    /// text, audio transcript, speaker, device label, browser URL).
+    pub query: String,
+
+    /// Restrict to one device — get the id from `screenpipe team devices`.
+    #[arg(long)]
+    pub device_id: Option<String>,
+
+    /// Exact match on app_name (case-insensitive), e.g. `Excel`, `Slack`.
+    #[arg(long)]
+    pub app: Option<String>,
+
+    /// Relative time window — accepts `24h`, `2d`, `30m`, `1w`. Default 24h.
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// ISO 8601 start (alternative to `--since`).
+    #[arg(long)]
+    pub start: Option<String>,
+
+    /// ISO 8601 end. Defaults to now.
+    #[arg(long)]
+    pub end: Option<String>,
+
+    /// Max results. Server caps at 200; default 20 to protect terminals.
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub limit: u32,
+
+    /// Emit compact JSON-lines (one result per line). Default is pretty JSON.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct TeamRecordsArgs {
+    /// Device id to dump records for (required — without it you'd get the
+    /// whole org, which is rarely useful).
+    #[arg(long)]
+    pub device_id: String,
+
+    /// Record kind: `frame` (screen) / `audio` / `all`. Default `all`.
+    #[arg(long, default_value = "all")]
+    pub kind: String,
+
+    /// Relative time window — `4h`, `1d`, `30m`. Default 4h.
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// ISO 8601 start (alternative to `--since`).
+    #[arg(long)]
+    pub start: Option<String>,
+
+    /// ISO 8601 end. Defaults to now.
+    #[arg(long)]
+    pub end: Option<String>,
+
+    /// Max records. Server caps at 200; default 50.
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub limit: u32,
+
+    /// Emit compact JSON-lines (one record per line). Default is pretty JSON.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 // =============================================================================

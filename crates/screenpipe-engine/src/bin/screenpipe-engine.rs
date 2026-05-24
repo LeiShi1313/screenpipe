@@ -33,6 +33,7 @@ use screenpipe_engine::{
         search::handle_search_command,
         status::handle_status_command,
         sync::{handle_sync_command, start_sync_service},
+        team::handle_team_command,
         vision::handle_vision_command,
         Cli, Command, RecordArgSources,
     },
@@ -313,6 +314,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Search(ref args) => {
             handle_search_command(args).await?;
+            return Ok(());
+        }
+        Command::Team { ref subcommand } => {
+            handle_team_command(subcommand).await?;
             return Ok(());
         }
         Command::Pipe { ref subcommand } => {

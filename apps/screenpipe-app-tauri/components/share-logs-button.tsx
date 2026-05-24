@@ -258,7 +258,14 @@ export const ShareLogsButton = ({
           mergedVideoPath,
           signedUrlVideo
         );
-        if (videoResult.status !== "ok") throw new Error("Failed to upload video");
+        if (videoResult.status !== "ok") {
+          // Surface the Rust-side reason (e.g. "Upload failed with status: 403
+          // body: SignedURLExpired", "Failed to read file: …") so the toast
+          // shows something we can act on instead of a generic string.
+          throw new Error(
+            `failed to upload video: ${videoResult.error || "unknown error"}`,
+          );
+        }
       }
 
       const os = osPlatform();

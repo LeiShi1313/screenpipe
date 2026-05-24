@@ -1939,7 +1939,10 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
           );
         },
         a({ href, children, ...props }) {
-          const isMediaLink = href?.toLowerCase().match(/\.(mp4|mp3|wav|webm)$/);
+          // Require at least one path char before the extension so a bare
+          // ".mp4" / ".wav" (sometimes emitted by the model as a placeholder)
+          // doesn't get rendered as a VideoComponent that then 404s.
+          const isMediaLink = href?.toLowerCase().match(/.\.(mp4|mp3|wav|webm)$/);
           if (isMediaLink && href) {
             return <VideoComponent filePath={href} className="my-2" />;
           }
@@ -1992,7 +1995,7 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
         },
         img({ src, alt, ...props }) {
           if (!src) return null;
-          if (src.toLowerCase().endsWith(".mp4")) {
+          if (src.length > 4 && src.toLowerCase().endsWith(".mp4")) {
             return <VideoComponent filePath={src} className="my-2" />;
           }
           // try asset protocol for local paths, fall back to http serve
@@ -2032,7 +2035,8 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
         },
         code({ className, children, ...props }) {
           const content = String(children).replace(/\n$/, "");
-          const isMedia = content.trim().toLowerCase().match(/\.(mp4|mp3|wav|webm)$/);
+          // Same bare-extension guard as the `a` and `img` renderers above.
+          const isMedia = content.trim().toLowerCase().match(/.\.(mp4|mp3|wav|webm)$/);
           const match = /language-(\w+)/.exec(className || "");
           const language = match?.[1] || "";
           const isCodeBlock = className?.includes("language-");

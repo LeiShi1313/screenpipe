@@ -10,10 +10,19 @@ export async function getMediaFile(
 
 		return result;
 	} catch (error) {
-		console.error("failed to read media file:", error);
-		throw new Error(
-			`failed to read media file: ${error instanceof Error ? error.message : "unknown error"}`,
-		);
+		// Tauri rejects `invoke` with the raw Err(String) payload, not an Error
+		// instance — so an `instanceof Error` check used to discard the real
+		// reason and surface "unknown error" to the user. Hugo's "Failed to load
+		// media: failed to read media file: unknown error" feedback was actually
+		// "File does not exist: <path>" upstream.
+		const message =
+			error instanceof Error
+				? error.message
+				: typeof error === "string"
+					? error
+					: JSON.stringify(error);
+		console.error("failed to read media file:", message);
+		throw new Error(`failed to read media file: ${message}`);
 	}
 }
 

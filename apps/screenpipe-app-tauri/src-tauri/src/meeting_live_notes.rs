@@ -80,16 +80,9 @@ struct CalendarEventSignal {
     is_all_day: bool,
 }
 
-#[derive(Clone, Debug)]
-struct JoinLink {
-    url: String,
-    label: String,
-}
-
 #[derive(Clone, Debug, Default)]
 struct CalendarMatch {
     title: Option<String>,
-    join_link: Option<JoinLink>,
 }
 
 impl From<crate::calendar::CalendarEventItem> for CalendarEventSignal {
@@ -270,9 +263,13 @@ pub fn start(app: AppHandle) {
                 find_calendar_match(&events, &event.data)
             };
 
+            // Re-fetch when we couldn't enrich a title — the only field the
+            // started toast still consumes from the calendar match. Title is
+            // also used for prewarm dedup, so a missing match can let a
+            // duplicate slip through.
             if calendar_match
                 .as_ref()
-                .is_none_or(|m| m.join_link.is_none())
+                .is_none_or(|m| m.title.as_deref().is_none_or(|t| t.trim().is_empty()))
             {
                 let fresh_events = fetch_fresh_calendar_events(&app).await;
                 if !fresh_events.is_empty() {
@@ -306,27 +303,18 @@ pub fn start(app: AppHandle) {
                 continue;
             }
 
-            let mut actions = Vec::new();
-            if let Some(join) = calendar_match.and_then(|m| m.join_link) {
-                actions.push(json!({
-                    "id": "join-meeting",
-                    "action": "join-meeting",
-                    "label": join.label,
-                    "type": "meeting_join",
-                    "url": join.url,
-                    "deeplink_url": url.clone(),
-                    "primary": true,
-                }));
-            } else {
-                actions.push(json!({
-                    "id": "open-live-notes",
-                    "action": "open-live-notes",
-                    "label": "open note",
-                    "type": "deeplink",
-                    "url": url.clone(),
-                    "primary": true,
-                }));
-            }
+            // "join and take notes" is exclusively the prewarm CTA — the v2
+            // detector only fires `meeting_started` after UI/audio confirms
+            // the user is already in the call, so a join button here is
+            // misleading. The started toast always opens the live note.
+            let actions = vec![json!({
+                "id": "open-live-notes",
+                "action": "open-live-notes",
+                "label": "open note",
+                "type": "deeplink",
+                "url": url.clone(),
+                "primary": true,
+            })];
 
             client::send_typed_with_actions(
                 "meeting detected",
@@ -471,18 +459,8 @@ fn find_calendar_match(
         .max_by_key(|(score, _)| *score)
         .map(|(_, event)| event)?;
 
-    let join_link = events
-        .iter()
-        .filter_map(|event| {
-            let url = event_join_url(event)?;
-            score_calendar_event(event, &title, now).map(|score| (score, provider_join_link(url)))
-        })
-        .max_by_key(|(score, _)| *score)
-        .map(|(_, link)| link);
-
     Some(CalendarMatch {
         title: Some(best_event.title.clone()).filter(|s| !s.trim().is_empty()),
-        join_link,
     })
 }
 
@@ -524,13 +502,6 @@ fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
-fn provider_join_link(url: String) -> JoinLink {
-    JoinLink {
-        url,
-        label: "join and take notes".to_string(),
-    }
-}
-
 fn normalize_meeting_url(raw: Option<String>) -> Option<String> {
     let trimmed = raw?
         .trim()
@@ -570,7 +541,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_current_meeting_join_link() {
+    fn finds_current_meeting_title() {
         let now = chrono::Utc::now();
         let events = vec![CalendarEventSignal {
             title: "Design review".to_string(),
@@ -584,11 +555,8 @@ mod tests {
             ..Default::default()
         };
 
-        let link = find_calendar_match(&events, &meeting)
-            .and_then(|m| m.join_link)
-            .expect("join link");
-        assert_eq!(link.url, "https://meet.google.com/abc-defg-hij");
-        assert_eq!(link.label, "join and take notes");
+        let matched = find_calendar_match(&events, &meeting).expect("calendar match");
+        assert_eq!(matched.title.as_deref(), Some("Design review"));
     }
 
     #[test]
@@ -608,9 +576,6 @@ mod tests {
 
         let matched = find_calendar_match(&events, &meeting).expect("calendar match");
         assert_eq!(matched.title.as_deref(), Some("Customer onboarding"));
-        let link = matched.join_link.expect("join link");
-        assert_eq!(link.url, "https://zoom.us/j/123");
-        assert_eq!(link.label, "join and take notes");
     }
 
     #[test]

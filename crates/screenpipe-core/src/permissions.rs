@@ -283,3 +283,32 @@ pub fn check_microphone() -> PermissionStatus {
 pub fn check_accessibility() -> PermissionStatus {
     PermissionStatus::NotNeeded
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// Invariant: a successful capture probe is definitive — the kernel
+    /// just handed us a CGImage of the desktop, so permission must be
+    /// granted. Safe to assert regardless of CI's TCC state because the
+    /// invariant only fires on the positive branch.
+    #[test]
+    fn capture_probe_implies_granted() {
+        if macos_screen_recording::capture_probe() {
+            assert_eq!(check_screen_recording(), PermissionStatus::Granted);
+        }
+        if macos_screen_recording::preflight() {
+            assert_eq!(check_screen_recording(), PermissionStatus::Granted);
+        }
+    }
+
+    /// Sanity: repeated probing must not leak, hang, or destabilize.
+    /// `permission_monitor` polls every 5s for the life of the process,
+    /// so a long-running burst here mirrors hours of real usage.
+    #[test]
+    fn capture_probe_is_stable_under_repetition() {
+        for _ in 0..256 {
+            let _ = macos_screen_recording::capture_probe();
+        }
+    }
+}

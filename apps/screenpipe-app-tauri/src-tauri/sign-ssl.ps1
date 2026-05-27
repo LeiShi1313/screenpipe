@@ -134,7 +134,13 @@ while (-not $signed -and $attempt -lt $maxAttempts) {
 
     $signOutputText = ($signOutput | Out-String)
     if ($signOutputText -match "QuotaExceededError") {
-        Write-Host "ERROR: SSL.com signing quota exceeded — every retry will hit the same wall."
+        # ASCII only in this block: sign-ssl.ps1 is read by PowerShell 5.1
+        # on Windows runners with no BOM and an ANSI codepage. UTF-8
+        # multi-byte chars (em-dash, smart-quotes) mangle and break the
+        # parser at the first non-ASCII byte; the reported line number
+        # ends up far below the actual offending character. Stick to
+        # `-` and straight quotes here.
+        Write-Host "ERROR: SSL.com signing quota exceeded - every retry will hit the same wall."
         Write-Host "ERROR: Top up the account at https://www.ssl.com/dashboard or wait for the monthly quota reset, then re-run this workflow."
         Write-Host "ERROR: Failed file: $FilePath"
         exit 1

@@ -409,7 +409,7 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 				id: CHAT_PRESET_ID,
 				provider: "screenpipe-cloud",
 				url: "",
-				model: "claude-opus-4-7",
+				model: "claude-opus-4-8",
 				maxContextChars: 200000,
 				defaultPreset: true,
 				prompt: "",
@@ -822,7 +822,7 @@ function createSettingsStore() {
 					p?.model === "claude-sonnet-4-5"
 				) {
 					upgraded = true;
-					return { ...p, model: "claude-opus-4-7" };
+					return { ...p, model: "claude-opus-4-8" };
 				}
 				return p;
 			});
@@ -1087,7 +1087,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		}
 
 		const nextPresets = settings.aiPresets.map((p: any, i: number) =>
-			i === idx ? { ...p, model: "claude-opus-4-7" } : p
+			i === idx ? { ...p, model: "claude-opus-4-8" } : p
 		);
 		settingsStore.set({
 			aiPresets: nextPresets,

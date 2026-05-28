@@ -6,7 +6,6 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
-use screenpipe_audio::meeting_detector::MeetingDetector;
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::monitor::{get_monitor_by_id, list_monitors};
 use screenpipe_screen::PipelineMetrics;
@@ -20,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::event_driven_capture::{CaptureTriggerMsg, TriggerSender};
 use crate::focus_aware_controller::FocusAwareController;
 use crate::frame_linker_actor::{linker_channel, spawn_frame_linker, LinkerSender};
+use crate::high_fps_controller::HighFpsController;
 use crate::hot_frame_cache::HotFrameCache;
 use crate::power::PowerProfile;
 
@@ -59,12 +59,6 @@ pub struct VisionManagerConfig {
     /// Override `EventDrivenCaptureConfig::capture_on_clipboard`.
     /// None = engine default (false). PowerProfile does not touch this.
     pub capture_on_clipboard: Option<bool>,
-    /// While a meeting is detected (via `MeetingDetector::is_in_meeting`),
-    /// drop `min_capture_interval_ms` to `meeting_capture_interval_ms`.
-    pub meeting_high_fps_enabled: bool,
-    /// `min_capture_interval_ms` used while in a meeting.
-    /// Clamped at runtime to >= 33 ms (30 fps ceiling).
-    pub meeting_capture_interval_ms: u64,
 }
 
 /// Status of the VisionManager
@@ -104,10 +98,12 @@ pub struct VisionManager {
     /// controller report Active for all monitors, preserving the pre-feature
     /// behaviour for those users.
     focus_controller: Arc<FocusAwareController>,
-    /// Shared meeting-state flag (set by v2 meeting detector).
-    /// When `meeting_high_fps_enabled` is true, the capture loop watches this
-    /// to bump capture rate while a meeting is active.
-    meeting_detector: Option<Arc<MeetingDetector>>,
+    /// Shared runtime control for the high-FPS capture override (manual
+    /// toggle + auto-on-meeting mode + interval). `None` means the feature
+    /// is unavailable on this engine (e.g. vision-only build with no
+    /// detector / no AppState route surface). Each capture loop polls
+    /// `effective_interval_ms()` once per tick.
+    high_fps_controller: Option<Arc<HighFpsController>>,
 }
 
 impl VisionManager {
@@ -156,7 +152,7 @@ impl VisionManager {
             hot_frame_cache: None,
             power_profile_rx: None,
             focus_controller,
-            meeting_detector: None,
+            high_fps_controller: None,
         }
     }
 
@@ -172,10 +168,10 @@ impl VisionManager {
         self
     }
 
-    /// Provide the shared meeting detector so capture loops can react to
-    /// meeting-active transitions (e.g. bump FPS for replay).
-    pub fn with_meeting_detector(mut self, detector: Arc<MeetingDetector>) -> Self {
-        self.meeting_detector = Some(detector);
+    /// Wire the shared high-FPS controller so capture loops can react to
+    /// manual toggles and meeting-detected transitions at runtime.
+    pub fn with_high_fps_controller(mut self, controller: Arc<HighFpsController>) -> Self {
+        self.high_fps_controller = Some(controller);
         self
     }
 
@@ -459,14 +455,7 @@ impl VisionManager {
         let power_profile_rx = self.power_profile_rx.clone();
         let focus_controller = self.focus_controller.clone();
         let linker_tx = Some(self.linker_tx.clone());
-        // Only forward the meeting detector when the user opted in; otherwise
-        // the capture loop never reads it and we avoid the per-tick atomic load.
-        let meeting_detector = if self.config.meeting_high_fps_enabled {
-            self.meeting_detector.clone()
-        } else {
-            None
-        };
-        let meeting_capture_interval_ms = self.config.meeting_capture_interval_ms.max(33);
+        let high_fps_controller = self.high_fps_controller.clone();
 
         info!(
             "Starting event-driven capture for monitor {} (device: {})",
@@ -495,8 +484,7 @@ impl VisionManager {
                 power_profile_rx,
                 focus_controller,
                 linker_tx,
-                meeting_detector,
-                meeting_capture_interval_ms,
+                high_fps_controller,
             )
             .await
             {
@@ -621,8 +609,6 @@ mod tests {
             min_capture_interval_ms: None,
             capture_on_keystroke: None,
             capture_on_clipboard: None,
-            meeting_high_fps_enabled: false,
-            meeting_capture_interval_ms: 100,
         };
         VisionManager::new(config, db, Handle::current())
     }

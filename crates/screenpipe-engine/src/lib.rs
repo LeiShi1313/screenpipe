@@ -19,6 +19,7 @@ pub mod event_driven_capture;
 pub mod external_memory_sync;
 pub mod focus_aware_controller;
 pub mod focus_tracker;
+pub mod high_fps_controller;
 pub mod frame_linker;
 pub mod frame_linker_actor;
 pub mod hot_frame_cache;

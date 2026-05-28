@@ -153,10 +153,14 @@ pub struct RecordingConfig {
     pub visual_check_interval_ms: Option<u64>,
     pub visual_change_threshold: Option<f64>,
     pub min_capture_interval_ms: Option<u64>,
-    /// While a meeting is detected, drop `min_capture_interval_ms` to
-    /// `meeting_capture_interval_ms`. See `RecordingSettings.meeting_high_fps_enabled`.
+    /// Auto-boost capture rate whenever the v2 meeting detector reports
+    /// `in_meeting`. See `RecordingSettings.meeting_high_fps_enabled`. The
+    /// actual override lives in `HighFpsController` so it can be flipped at
+    /// runtime via `/capture/high-fps` without restart; this flag just
+    /// seeds the initial controller state.
     pub meeting_high_fps_enabled: bool,
-    /// `min_capture_interval_ms` used while in a meeting (clamped to >= 33 ms at runtime).
+    /// Capture debounce (ms) installed while the high-FPS override is
+    /// active. Clamped to >= 33 ms by the controller.
     pub meeting_capture_interval_ms: u64,
     /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
     /// None = engine default (false). See `RecordingSettings.capture_on_keystroke`.
@@ -432,8 +436,6 @@ impl RecordingConfig {
             min_capture_interval_ms: self.min_capture_interval_ms,
             capture_on_keystroke: self.capture_on_keystroke,
             capture_on_clipboard: self.capture_on_clipboard,
-            meeting_high_fps_enabled: self.meeting_high_fps_enabled,
-            meeting_capture_interval_ms: self.meeting_capture_interval_ms,
         }
     }
 }

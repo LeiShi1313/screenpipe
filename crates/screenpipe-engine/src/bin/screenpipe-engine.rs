@@ -36,6 +36,7 @@ use screenpipe_engine::{
         vision::handle_vision_command,
         Cli, Command, RecordArgSources,
     },
+    high_fps_controller::HighFpsController,
     hot_frame_cache::HotFrameCache,
     start_meeting_watcher, start_power_manager, start_sleep_monitor, start_speaker_identification,
     start_ui_recording,
@@ -930,18 +931,27 @@ async fn main() -> anyhow::Result<()> {
         info!("snapshot compaction disabled via --disable-snapshot-compaction");
     }
 
+    // Build the shared high-FPS controller once. Same instance feeds the
+    // VisionManager (so each capture loop reacts on the next tick) and the
+    // SCServer (so HTTP toggles, the tray menu, and pipes can all hit it
+    // without an engine restart). Seed from the persisted RecordingSettings
+    // so a user who already toggled the auto-mode preference keeps it.
+    let high_fps_controller = Arc::new(HighFpsController::new(
+        meeting_detector.clone(),
+        config.meeting_high_fps_enabled,
+        config.meeting_capture_interval_ms,
+    ));
+
     // Create VisionManager for event-driven capture on all monitors
     let (handle, capture_trigger_tx, linker_tx) = if !config.disable_vision {
         let vision_config =
             config.to_vision_manager_config(output_path_clone.to_string(), vision_metrics.clone());
-        let mut vision_manager_builder =
+        let vision_manager = Arc::new(
             VisionManager::new(vision_config, db_clone.clone(), vision_handle.clone())
                 .with_hot_frame_cache(hot_frame_cache.clone())
-                .with_power_profile(power_manager.subscribe());
-        if let Some(ref detector) = meeting_detector {
-            vision_manager_builder = vision_manager_builder.with_meeting_detector(detector.clone());
-        }
-        let vision_manager = Arc::new(vision_manager_builder);
+                .with_power_profile(power_manager.subscribe())
+                .with_high_fps_controller(high_fps_controller.clone()),
+        );
 
         // Get the broadcast trigger sender BEFORE moving the VisionManager into
         // the spawned task. This sender is passed to start_ui_recording so UI
@@ -1237,7 +1247,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("failed to start pipe scheduler: {}", e);
     }
     let shared_pipe_manager = std::sync::Arc::new(tokio::sync::Mutex::new(pipe_manager));
-    let server = server.with_pipe_manager(shared_pipe_manager.clone());
+    let server = server
+        .with_pipe_manager(shared_pipe_manager.clone())
+        .with_high_fps_controller(high_fps_controller.clone());
 
     // Install pi agent in background
     tokio::spawn(async move {

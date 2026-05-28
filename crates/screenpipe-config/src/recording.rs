@@ -198,21 +198,25 @@ pub struct RecordingSettings {
     #[serde(rename = "minCaptureIntervalMs", default)]
     pub min_capture_interval_ms: Option<u64>,
 
-    /// While a meeting is detected, drop `min_capture_interval_ms` to
-    /// `meeting_capture_interval_ms` so the on-disk MP4 chunks have enough
-    /// frames to rewatch the shared screen smoothly (slides flipped, doc
-    /// scrolled, demo shown). Restored when the meeting ends.
+    /// Seed for the engine's `HighFpsController.auto_enabled`: when true,
+    /// the controller bumps capture rate whenever the v2 meeting detector
+    /// reports `in_meeting`. Hot — the runtime value can be flipped via
+    /// `POST /capture/high-fps {auto: bool}` without an engine restart;
+    /// this field just persists the user preference across restarts.
     ///
-    /// Opt-in: default off. The high-FPS burst increases disk + CPU for the
-    /// duration of the meeting; we don't want to silently change the capture
-    /// budget for users who haven't asked for it.
+    /// Default off — the high-FPS burst increases disk + CPU for the
+    /// duration of the meeting, and the manual "Boost now" tray/HTTP
+    /// toggle covers the "I want this one rewatchable" case without
+    /// touching the steady-state budget.
     #[serde(rename = "meetingHighFpsEnabled", default)]
     pub meeting_high_fps_enabled: bool,
 
-    /// Capture debounce (`min_capture_interval_ms`) used while a meeting is
-    /// active and `meeting_high_fps_enabled` is true.
+    /// Seed for `HighFpsController.interval_ms` — the capture debounce
+    /// installed while the override is effective (manual or auto).
+    /// Runtime-mutable via `POST /capture/high-fps {intervalMs: u64}`;
+    /// this field just seeds the value on startup.
     /// Default 100 ms ≈ 10 fps — smooth enough for human replay without
-    /// exploding disk usage. Clamped at runtime to >= 33 ms (30 fps ceiling).
+    /// exploding disk usage. Clamped to >= 33 ms (30 fps ceiling).
     #[serde(
         rename = "meetingCaptureIntervalMs",
         default = "default_meeting_capture_interval_ms"

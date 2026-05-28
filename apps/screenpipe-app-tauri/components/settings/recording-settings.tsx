@@ -1422,6 +1422,146 @@ function TranscriptionDictionary({
   );
 }
 
+interface HighFpsState {
+  manual: boolean;
+  auto: boolean;
+  intervalMs: number;
+  meeting: boolean | null;
+  effective: boolean;
+}
+
+function HighFpsCard({
+  settings,
+  onSettingsChange,
+}: {
+  settings: any;
+  onSettingsChange: (patch: Record<string, any>) => void;
+}) {
+  const [live, setLive] = React.useState<HighFpsState | null>(null);
+  const [busy, setBusy] = React.useState(false);
+
+  const fetchState = React.useCallback(async () => {
+    try {
+      const res = await localFetch("/capture/high-fps");
+      if (res.ok) setLive(await res.json());
+    } catch {
+      /* engine may not be running yet — keep last known */
+    }
+  }, []);
+
+  React.useEffect(() => {
+    fetchState();
+    const id = setInterval(fetchState, 2000);
+    return () => clearInterval(id);
+  }, [fetchState]);
+
+  const push = React.useCallback(
+    async (patch: Partial<{ manual: boolean; auto: boolean; intervalMs: number }>) => {
+      setBusy(true);
+      try {
+        const res = await localFetch("/capture/high-fps", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+        if (res.ok) setLive(await res.json());
+      } catch {
+        /* engine may be down — settings will still persist for next start */
+      } finally {
+        setBusy(false);
+      }
+    },
+    []
+  );
+
+  const intervalMs = live?.intervalMs ?? settings.meetingCaptureIntervalMs ?? 100;
+  const fps = Math.round(1000 / intervalMs);
+  const autoOn = live?.auto ?? !!settings.meetingHighFpsEnabled;
+  const manualOn = live?.manual ?? false;
+  const effective = live?.effective ?? false;
+  const meeting = live?.meeting ?? null;
+
+  const statusBadge = effective
+    ? `Boost active — ~${fps} fps`
+    : meeting
+    ? "Meeting detected, idle"
+    : "Idle";
+
+  return (
+    <Card className="border-border bg-card">
+      <CardContent className="px-3 py-2.5 space-y-3">
+        {/* Primary action: manual one-tap boost. The setting below makes it automatic. */}
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center space-x-2.5 min-w-0">
+            <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+            <div className="min-w-0">
+              <h3 className="text-sm font-medium text-foreground">High-FPS recording</h3>
+              <p className="text-xs text-muted-foreground">
+                Bump screen capture to ~{fps} fps so you can rewatch slides, demos, and shared docs. {statusBadge}.
+                Also toggleable from the tray menu or <code className="text-[10px]">POST /capture/high-fps</code>.
+              </p>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant={manualOn ? "default" : "outline"}
+            disabled={busy}
+            onClick={() => push({ manual: !manualOn })}
+          >
+            {manualOn ? "Stop boost" : "Boost now"}
+          </Button>
+        </div>
+
+        {/* Persistent preferences — also pushed live to the controller so they apply without restart. */}
+        <div className="pt-3 border-t border-border space-y-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h4 className="text-xs font-medium text-foreground">Auto-boost during meetings</h4>
+              <p className="text-[11px] text-muted-foreground">
+                Detect calls (Zoom, Meet, Teams, Slack) and boost automatically. Restored when the meeting ends.
+              </p>
+            </div>
+            <Switch
+              id="meetingHighFpsEnabled"
+              checked={autoOn}
+              onCheckedChange={(checked) => {
+                onSettingsChange({ meetingHighFpsEnabled: checked });
+                push({ auto: checked });
+              }}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h4 className="text-xs font-medium text-foreground">Capture interval</h4>
+              <p className="text-[11px] text-muted-foreground">
+                Lower = smoother replay + more disk. Clamped to ≥ 33 ms (30 fps).
+              </p>
+            </div>
+            <Select
+              value={String(intervalMs)}
+              onValueChange={(value) => {
+                const ms = Number(value);
+                onSettingsChange({ meetingCaptureIntervalMs: ms });
+                push({ intervalMs: ms });
+              }}
+            >
+              <SelectTrigger className="w-[200px] h-8 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="200">200 ms — 5 fps (light)</SelectItem>
+                <SelectItem value="100">100 ms — 10 fps (default)</SelectItem>
+                <SelectItem value="67">67 ms — 15 fps</SelectItem>
+                <SelectItem value="33">33 ms — 30 fps (max)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export function RecordingSettings() {
   const { settings, updateSettings, getDataDir, loadUser } = useSettings();
   const [openLanguages, setOpenLanguages] = React.useState(false);
@@ -3051,52 +3191,16 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
-        {/* Meeting high-FPS recording — bumps screen capture rate while a meeting is active for shareable replay */}
+        {/* High-FPS screen recording — manual boost + auto-on-meeting. The
+            controller lives in the engine and is HTTP-controlled so changes
+            take effect on the next capture tick (no restart). The primary
+            UX is the tray quick-toggle and `POST /capture/high-fps`; this
+            settings card just exposes the persistent preferences. */}
         {!settings.disableVision && (
-          <Card className="border-border bg-card">
-            <CardContent className="px-3 py-2.5">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center space-x-2.5 min-w-0">
-                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div className="min-w-0">
-                    <h3 className="text-sm font-medium text-foreground">High-FPS meeting recording</h3>
-                    <p className="text-xs text-muted-foreground">
-                      While a meeting is detected, capture screen at ~{Math.round(1000 / (settings.meetingCaptureIntervalMs ?? 100))} fps so you can rewatch slides, demos, and shared docs after the call. Restores normal rate when the meeting ends.
-                    </p>
-                  </div>
-                </div>
-                <Switch
-                  id="meetingHighFpsEnabled"
-                  checked={!!settings.meetingHighFpsEnabled}
-                  onCheckedChange={(checked) => handleSettingsChange({ meetingHighFpsEnabled: checked }, true)}
-                />
-              </div>
-              {settings.meetingHighFpsEnabled && (
-                <div className="mt-3 pt-3 border-t border-border flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <h4 className="text-xs font-medium text-foreground">Capture interval</h4>
-                    <p className="text-[11px] text-muted-foreground">
-                      Lower = smoother replay + more disk. Clamped to ≥ 33 ms (30 fps).
-                    </p>
-                  </div>
-                  <Select
-                    value={String(settings.meetingCaptureIntervalMs ?? 100)}
-                    onValueChange={(value) => handleSettingsChange({ meetingCaptureIntervalMs: Number(value) }, true)}
-                  >
-                    <SelectTrigger className="w-[200px] h-8 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="200">200 ms — 5 fps (light)</SelectItem>
-                      <SelectItem value="100">100 ms — 10 fps (default)</SelectItem>
-                      <SelectItem value="67">67 ms — 15 fps</SelectItem>
-                      <SelectItem value="33">33 ms — 30 fps (max)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-            </CardContent>
-          </Card>
+          <HighFpsCard
+            settings={settings}
+            onSettingsChange={(patch) => handleSettingsChange(patch, true)}
+          />
         )}
 
         {/* Monitor Selection */}

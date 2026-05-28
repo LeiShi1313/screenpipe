@@ -5,7 +5,8 @@
 use crate::commands::{hide_main_window, show_main_window};
 use crate::enterprise_policy::{is_app_ui_hidden, is_tray_item_hidden};
 use crate::health::{
-    get_audio_device_status, get_recording_info, get_recording_status, DeviceKind, RecordingStatus,
+    get_audio_device_status, get_high_fps_status, get_recording_info, get_recording_status,
+    DeviceKind, RecordingStatus,
 };
 use crate::recording::{local_api_context_from_app, RecordingState};
 use crate::store::{get_store, OnboardingStore, SettingsStore};
@@ -689,6 +690,31 @@ fn create_dynamic_menu(
                 .build()?;
             menu_builder = menu_builder.item(&pause_submenu);
         }
+
+        // High-FPS screen capture quick-toggle. Hits the engine's
+        // /capture/high-fps endpoint so it takes effect on the next capture
+        // tick — no engine restart. Label reflects the cached state from
+        // the health poll (~1s lag); the CheckMenuItem also flips visually
+        // on click for instant feedback.
+        let hi_fps = get_high_fps_status();
+        let hi_fps_label = if hi_fps.effective {
+            if hi_fps.manual {
+                "High-FPS recording (on — manual)"
+            } else {
+                "High-FPS recording (on — meeting)"
+            }
+        } else if hi_fps.auto {
+            match hi_fps.meeting {
+                Some(true) => "High-FPS recording (auto, meeting starting…)",
+                _ => "High-FPS recording (auto, idle)",
+            }
+        } else {
+            "High-FPS recording"
+        };
+        let hi_fps_toggle = CheckMenuItemBuilder::with_id("toggle_high_fps", hi_fps_label)
+            .checked(hi_fps.effective)
+            .build(app)?;
+        menu_builder = menu_builder.item(&hi_fps_toggle);
     }
 
     // TODO: vault lock tray item disabled — CLI-only for now
@@ -894,6 +920,30 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
             let _ = app_handle.run_on_main_thread(move || {
                 if let Err(e) = force_tray_rebuild(&app_for_rebuild) {
                     error!("tray rebuild failed: {}", e);
+                }
+            });
+        }
+        "toggle_high_fps" => {
+            // Cache holds the most-recent poll snapshot. We flip `manual`
+            // relative to whichever path is currently driving the override
+            // — manual on → manual off, meeting-driven on → manual on
+            // (forces it to keep firing even if the meeting ends), idle
+            // off → manual on. Auto-mode preference isn't touched here;
+            // settings panel still owns that knob.
+            let cached = get_high_fps_status();
+            let want_on = !cached.effective;
+            let body = serde_json::json!({ "manual": want_on });
+            let api = local_api_context_from_app(&app_handle);
+            tauri::async_runtime::spawn(async move {
+                let client = reqwest::Client::new();
+                if let Err(e) = api
+                    .apply_auth(client.post(api.url("/capture/high-fps")))
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                {
+                    error!("toggle_high_fps POST failed: {}", e);
                 }
             });
         }

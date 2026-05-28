@@ -199,6 +199,12 @@ pub struct AppState {
     pub cloud_token: Arc<ArcSwap<Option<String>>>,
     /// Unified credential store for OAuth tokens, API keys, etc.
     pub secret_store: Option<Arc<screenpipe_secrets::SecretStore>>,
+    /// Runtime control for the high-FPS screen-capture override. Shared
+    /// with each per-monitor capture loop so HTTP toggles propagate
+    /// without a restart. `None` only when the engine was started in a
+    /// configuration that doesn't run vision capture (e.g. headless
+    /// `--disable-vision`).
+    pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
 }
 
 pub struct SCServer {
@@ -246,6 +252,9 @@ pub struct SCServer {
     /// same reasons as `oauth_refresher` — keeps the JoinHandle alive
     /// and exposes `.snapshot()` for health reporting later.
     pub external_memory_sync: Option<Arc<crate::external_memory_sync::ExternalMemorySyncScheduler>>,
+    /// Shared high-FPS controller. Set before `start()` so AppState and
+    /// the per-monitor capture loops point at the same instance.
+    pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
 }
 
 impl SCServer {
@@ -285,7 +294,18 @@ impl SCServer {
             secret_store: None,
             oauth_refresher: None,
             external_memory_sync: None,
+            high_fps_controller: None,
         }
+    }
+
+    /// Wire the shared high-FPS controller. Pass the same instance to the
+    /// `VisionManager` so the HTTP routes and capture loops point at it.
+    pub fn with_high_fps_controller(
+        mut self,
+        controller: Arc<crate::high_fps_controller::HighFpsController>,
+    ) -> Self {
+        self.high_fps_controller = Some(controller);
+        self
     }
 
     /// Set the cloud JWT used to authenticate proxied chat-completion calls
@@ -553,6 +573,7 @@ impl SCServer {
             api_auth_key: self.api_auth_key.clone(),
             cloud_token: self.cloud_token.clone(),
             secret_store: self.secret_store.clone(),
+            high_fps_controller: self.high_fps_controller.clone(),
         });
 
         // Populate the registry so /connections/browsers shows both kinds
@@ -692,6 +713,14 @@ impl SCServer {
             // Vision/audio pipeline metrics (not in OpenAPI spec — external types)
             .route("/vision/metrics", get(vision_metrics_handler))
             .route("/audio/metrics", get(audio_metrics_handler))
+            // High-FPS screen capture override (manual toggle + auto-on-meeting).
+            // GET returns the current state, POST sets any subset of {manual, auto, intervalMs}.
+            // Lets the tray, CLI, or any pipe flip capture rate without an engine restart.
+            .route(
+                "/capture/high-fps",
+                get(crate::routes::capture::get_high_fps)
+                    .post(crate::routes::capture::set_high_fps),
+            )
             // Retranscribe/transcribe (not in OpenAPI spec — opaque Response / multipart)
             .route(
                 "/audio/reconciliation/backlog",

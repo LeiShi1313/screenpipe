@@ -192,6 +192,35 @@ pub fn set_audio_device_status(devices: Vec<AudioDeviceEntry>) {
     *guard = devices;
 }
 
+/// Mirror of `routes::capture::HighFpsState` minus the irrelevant fields —
+/// what the tray needs to render the "High-FPS recording" menu item label
+/// and checked state. Updated by the health poll so the tray reads from a
+/// local cache instead of blocking on an HTTP round-trip.
+#[derive(Clone, Debug, Default)]
+pub struct HighFpsCacheEntry {
+    pub manual: bool,
+    pub auto: bool,
+    pub effective: bool,
+    pub meeting: Option<bool>,
+}
+
+static HIGH_FPS_STATUS: Lazy<RwLock<HighFpsCacheEntry>> =
+    Lazy::new(|| RwLock::new(HighFpsCacheEntry::default()));
+
+pub fn get_high_fps_status() -> HighFpsCacheEntry {
+    HIGH_FPS_STATUS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn set_high_fps_status(entry: HighFpsCacheEntry) {
+    let mut guard = HIGH_FPS_STATUS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = entry;
+}
+
 pub fn set_recording_status(status: RecordingStatus) {
     RECORDING_INFO
         .write()
@@ -628,6 +657,25 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                     }
 
                     set_audio_device_status(entries);
+                }
+            }
+
+            // Poll the high-FPS controller state for the tray's CheckMenuItem.
+            // 503 is normal (vision disabled / older engine) — keep last known.
+            if let Ok(res) = api
+                .apply_auth(reqwest::Client::new().get(api.url("/capture/high-fps")))
+                .send()
+                .await
+            {
+                if res.status().is_success() {
+                    if let Ok(body) = res.json::<serde_json::Value>().await {
+                        set_high_fps_status(HighFpsCacheEntry {
+                            manual: body["manual"].as_bool().unwrap_or(false),
+                            auto: body["auto"].as_bool().unwrap_or(false),
+                            effective: body["effective"].as_bool().unwrap_or(false),
+                            meeting: body["meeting"].as_bool(),
+                        });
+                    }
                 }
             }
 

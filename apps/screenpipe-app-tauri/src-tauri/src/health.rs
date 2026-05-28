@@ -192,16 +192,21 @@ pub fn set_audio_device_status(devices: Vec<AudioDeviceEntry>) {
     *guard = devices;
 }
 
-/// Mirror of `routes::capture::HighFpsState` minus the irrelevant fields —
-/// what the tray needs to render the "High-FPS recording" menu item label
-/// and checked state. Updated by the health poll so the tray reads from a
-/// local cache instead of blocking on an HTTP round-trip.
+/// Mirror of `routes::capture::HighFpsState` — what the tray needs to
+/// render the "High-FPS recording" menu item label and checked state.
+/// Updated by the health poll so the tray reads from a local cache
+/// instead of blocking on an HTTP round-trip, AND mutated optimistically
+/// by the tray click handler so rapid clicks compute `want_on` from the
+/// post-click state instead of the 1-sec-stale poll snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct HighFpsCacheEntry {
     pub manual: bool,
     pub auto: bool,
     pub effective: bool,
     pub meeting: Option<bool>,
+    /// Capture debounce (ms) installed while the override is effective.
+    /// Cached so the tray label can show "(~10 fps)".
+    pub interval_ms: u64,
 }
 
 static HIGH_FPS_STATUS: Lazy<RwLock<HighFpsCacheEntry>> =
@@ -674,6 +679,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                             auto: body["auto"].as_bool().unwrap_or(false),
                             effective: body["effective"].as_bool().unwrap_or(false),
                             meeting: body["meeting"].as_bool(),
+                            interval_ms: body["intervalMs"].as_u64().unwrap_or(100),
                         });
                     }
                 }

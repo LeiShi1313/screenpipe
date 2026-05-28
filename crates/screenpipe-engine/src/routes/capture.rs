@@ -9,6 +9,14 @@
 //! `POST /capture/high-fps` — set any subset of `{manual, auto, intervalMs}`
 //! without restart. Returns the post-write state in the same shape as GET so
 //! the UI and tray can update optimistically.
+//!
+//! **Persistence:** writes here are RUNTIME-ONLY — they flip atomics inside
+//! the engine and do not touch `settings.bin`. After an engine restart the
+//! controller seeds from `RecordingSettings.meeting_high_fps_*` again, so
+//! changes made via this endpoint are lost on restart unless the caller
+//! also writes the setting. The Settings UI does this dual-write; the tray
+//! intentionally does not (manual boosts are ephemeral by design). Pipes
+//! or CLI users that want a permanent change should `PUT /settings` too.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -17,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use crate::high_fps_controller::{HighFpsController, HighFpsSnapshot};
 use crate::server::AppState;
 
 #[derive(Debug, Serialize)]
@@ -37,6 +46,18 @@ pub struct HighFpsState {
     pub effective: bool,
 }
 
+impl From<HighFpsSnapshot> for HighFpsState {
+    fn from(s: HighFpsSnapshot) -> Self {
+        Self {
+            manual: s.manual,
+            auto: s.auto,
+            interval_ms: s.interval_ms,
+            meeting: s.meeting,
+            effective: s.effective,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetHighFpsRequest {
     /// `Some(true)` turns the manual override on, `Some(false)` off, `None`
@@ -49,20 +70,6 @@ pub struct SetHighFpsRequest {
     pub interval_ms: Option<u64>,
 }
 
-fn snapshot(state: &AppState) -> JsonResponse<HighFpsState> {
-    let controller = state
-        .high_fps_controller
-        .as_ref()
-        .expect("controller-only route called with no controller");
-    JsonResponse(HighFpsState {
-        manual: controller.manual_active(),
-        auto: controller.auto_enabled(),
-        interval_ms: controller.interval_ms(),
-        meeting: controller.meeting_active(),
-        effective: controller.is_effective(),
-    })
-}
-
 fn unavailable() -> (StatusCode, JsonResponse<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -72,20 +79,22 @@ fn unavailable() -> (StatusCode, JsonResponse<Value>) {
     )
 }
 
+fn require_controller(state: &AppState) -> Result<&Arc<HighFpsController>, (StatusCode, JsonResponse<Value>)> {
+    state.high_fps_controller.as_ref().ok_or_else(unavailable)
+}
+
 pub async fn get_high_fps(
     State(state): State<Arc<AppState>>,
 ) -> Result<JsonResponse<HighFpsState>, (StatusCode, JsonResponse<Value>)> {
-    if state.high_fps_controller.is_none() {
-        return Err(unavailable());
-    }
-    Ok(snapshot(&state))
+    let controller = require_controller(&state)?;
+    Ok(JsonResponse(controller.snapshot().into()))
 }
 
 pub async fn set_high_fps(
     State(state): State<Arc<AppState>>,
     JsonResponse(body): JsonResponse<SetHighFpsRequest>,
 ) -> Result<JsonResponse<HighFpsState>, (StatusCode, JsonResponse<Value>)> {
-    let controller = state.high_fps_controller.as_ref().ok_or_else(unavailable)?;
+    let controller = require_controller(&state)?;
 
     if let Some(interval_ms) = body.interval_ms {
         controller.set_interval_ms(interval_ms);
@@ -97,14 +106,20 @@ pub async fn set_high_fps(
         controller.set_manual(manual);
     }
 
+    // One final snapshot AFTER all writes so the response can't observe a
+    // partial-write state. (Writes go through the same mutex as snapshot;
+    // a concurrent POST could still interleave between our writes and the
+    // snapshot, but each *individual* response will reflect a real
+    // post-some-write state — never a torn view of the three fields.)
+    let snap = controller.snapshot();
     tracing::info!(
         target: "capture::high_fps",
-        manual = controller.manual_active(),
-        auto = controller.auto_enabled(),
-        interval_ms = controller.interval_ms(),
-        effective = controller.is_effective(),
+        manual = snap.manual,
+        auto = snap.auto,
+        interval_ms = snap.interval_ms,
+        effective = snap.effective,
         "high-fps controller updated via HTTP",
     );
 
-    Ok(snapshot(&state))
+    Ok(JsonResponse(snap.into()))
 }

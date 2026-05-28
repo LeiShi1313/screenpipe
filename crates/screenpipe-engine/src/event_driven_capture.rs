@@ -848,22 +848,19 @@ pub async fn event_driven_capture_loop(
 
         // High-FPS override: bumps capture rate while the controller reports
         // effective (manual toggle on, or auto mode on + meeting detected).
-        // The controller's interval setting is read each transition so a
-        // runtime change via HTTP propagates without a restart. Cheap atomic
-        // loads per tick; the bookkeeper coalesces redundant calls.
+        // ONE snapshot per tick: reading effective + interval_ms together
+        // guarantees the log line and the installed value can't disagree
+        // because the controller flipped between two separate atomic loads.
         if let Some(controller) = high_fps_controller.as_ref() {
+            let snap = controller.snapshot();
             if let Some(new_ms) = high_fps.on_controller_state(
-                controller.effective_interval_ms(),
+                snap.effective_interval_ms(),
                 state.config.min_capture_interval_ms,
             ) {
                 info!(
                     "high-fps: monitor {} {} min_capture_interval_ms {} -> {} ms",
                     monitor_id,
-                    if controller.is_effective() {
-                        "dropping"
-                    } else {
-                        "restoring"
-                    },
+                    if snap.effective { "dropping" } else { "restoring" },
                     state.config.min_capture_interval_ms,
                     new_ms,
                 );
@@ -2313,5 +2310,22 @@ mod tests {
         assert_eq!(o.on_controller_state(Some(33), 100), Some(33));
         // Idle: baseline still 500.
         assert_eq!(o.on_controller_state(None, 33), Some(500));
+    }
+
+    #[test]
+    fn high_fps_power_profile_then_interval_change_then_exit() {
+        // The hardest interleaving: enter override, power profile shifts
+        // baseline mid-override, then user changes the override interval,
+        // then exit. Restore target must be the *latest* baseline (1000),
+        // not the original (500) or the runtime interval (33).
+        let mut o = HighFpsBookkeeping::new(500);
+        // Enter override.
+        assert_eq!(o.on_controller_state(Some(100), 500), Some(100));
+        // Power profile drops baseline to 1000 (saver) — live config stays at 100.
+        assert_eq!(o.on_baseline_change(1000), 100);
+        // User cranks override to 30 fps via tray slider.
+        assert_eq!(o.on_controller_state(Some(33), 100), Some(33));
+        // Exit override — restore the saver baseline.
+        assert_eq!(o.on_controller_state(None, 33), Some(1000));
     }
 }

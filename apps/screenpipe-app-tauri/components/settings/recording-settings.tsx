@@ -1430,6 +1430,11 @@ interface HighFpsState {
   effective: boolean;
 }
 
+type PushOutcome =
+  | { kind: "ok"; state: HighFpsState }
+  | { kind: "engine-down" } // network failure — settings still persisted
+  | { kind: "engine-rejected"; status: number }; // 4xx / 5xx from the route
+
 function HighFpsCard({
   settings,
   onSettingsChange,
@@ -1439,11 +1444,15 @@ function HighFpsCard({
 }) {
   const [live, setLive] = React.useState<HighFpsState | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [lastError, setLastError] = React.useState<string | null>(null);
 
   const fetchState = React.useCallback(async () => {
     try {
       const res = await localFetch("/capture/high-fps");
-      if (res.ok) setLive(await res.json());
+      if (res.ok) {
+        setLive(await res.json());
+        setLastError(null);
+      }
     } catch {
       /* engine may not be running yet — keep last known */
     }
@@ -1455,8 +1464,12 @@ function HighFpsCard({
     return () => clearInterval(id);
   }, [fetchState]);
 
+  // Runtime push. Returns a structured outcome so callers can decide what
+  // to show the user — "engine-down" is recoverable (the setting still
+  // persisted, so it'll take effect on next start), but the user MUST be
+  // told the live change didn't land.
   const push = React.useCallback(
-    async (patch: Partial<{ manual: boolean; auto: boolean; intervalMs: number }>) => {
+    async (patch: Partial<{ manual: boolean; auto: boolean; intervalMs: number }>): Promise<PushOutcome> => {
       setBusy(true);
       try {
         const res = await localFetch("/capture/high-fps", {
@@ -1464,9 +1477,15 @@ function HighFpsCard({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(patch),
         });
-        if (res.ok) setLive(await res.json());
+        if (res.ok) {
+          const state: HighFpsState = await res.json();
+          setLive(state);
+          setLastError(null);
+          return { kind: "ok", state };
+        }
+        return { kind: "engine-rejected", status: res.status };
       } catch {
-        /* engine may be down — settings will still persist for next start */
+        return { kind: "engine-down" };
       } finally {
         setBusy(false);
       }
@@ -1474,7 +1493,38 @@ function HighFpsCard({
     []
   );
 
-  const intervalMs = live?.intervalMs ?? settings.meetingCaptureIntervalMs ?? 100;
+  // Convenience: persist-AND-push for the two settings that have both a
+  // persisted value (settings.bin) and a runtime override (controller).
+  // Surfaces failures rather than swallowing them — silent "saved" with no
+  // runtime effect is the most confusing failure mode.
+  const persistAndPush = React.useCallback(
+    async (
+      patch: Record<string, any>,
+      runtimePatch: Partial<{ auto: boolean; intervalMs: number }>,
+      label: string,
+    ) => {
+      onSettingsChange(patch);
+      const outcome = await push(runtimePatch);
+      if (outcome.kind === "engine-down") {
+        setLastError(
+          `${label} saved — but the engine isn't reachable, so it'll only take effect on next start.`,
+        );
+      } else if (outcome.kind === "engine-rejected") {
+        setLastError(
+          `${label} saved — but the engine rejected the live update (HTTP ${outcome.status}). Restart to apply.`,
+        );
+      }
+    },
+    [onSettingsChange, push],
+  );
+
+  // Fallback chain protects against an engine that briefly returns 0 (it
+  // shouldn't — server clamps to 33 — but stale `live` from an older build
+  // or a torn read shouldn't crash the math).
+  const intervalMs = Math.max(
+    live?.intervalMs ?? settings.meetingCaptureIntervalMs ?? 100,
+    33,
+  );
   const fps = Math.round(1000 / intervalMs);
   const autoOn = live?.auto ?? !!settings.meetingHighFpsEnabled;
   const manualOn = live?.manual ?? false;
@@ -1486,6 +1536,16 @@ function HighFpsCard({
     : meeting
     ? "Meeting detected, idle"
     : "Idle";
+
+  const handleManualClick = async () => {
+    const want = !manualOn;
+    const outcome = await push({ manual: want });
+    if (outcome.kind === "engine-down") {
+      setLastError("Engine isn't reachable. Manual boost can't apply until the engine is running.");
+    } else if (outcome.kind === "engine-rejected") {
+      setLastError(`Engine rejected the boost request (HTTP ${outcome.status}).`);
+    }
+  };
 
   return (
     <Card className="border-border bg-card">
@@ -1506,13 +1566,20 @@ function HighFpsCard({
             size="sm"
             variant={manualOn ? "default" : "outline"}
             disabled={busy}
-            onClick={() => push({ manual: !manualOn })}
+            onClick={handleManualClick}
           >
             {manualOn ? "Stop boost" : "Boost now"}
           </Button>
         </div>
 
-        {/* Persistent preferences — also pushed live to the controller so they apply without restart. */}
+        {lastError && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+            {lastError}
+          </div>
+        )}
+
+        {/* Persistent preferences — pushed live AND saved to settings.bin so
+            they survive an engine restart. Failure surfaces above. */}
         <div className="pt-3 border-t border-border space-y-2.5">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -1524,10 +1591,13 @@ function HighFpsCard({
             <Switch
               id="meetingHighFpsEnabled"
               checked={autoOn}
-              onCheckedChange={(checked) => {
-                onSettingsChange({ meetingHighFpsEnabled: checked });
-                push({ auto: checked });
-              }}
+              onCheckedChange={(checked) =>
+                persistAndPush(
+                  { meetingHighFpsEnabled: checked },
+                  { auto: checked },
+                  "Auto-boost preference",
+                )
+              }
             />
           </div>
           <div className="flex items-center justify-between gap-3">
@@ -1541,8 +1611,11 @@ function HighFpsCard({
               value={String(intervalMs)}
               onValueChange={(value) => {
                 const ms = Number(value);
-                onSettingsChange({ meetingCaptureIntervalMs: ms });
-                push({ intervalMs: ms });
+                persistAndPush(
+                  { meetingCaptureIntervalMs: ms },
+                  { intervalMs: ms },
+                  "Capture interval",
+                );
               }}
             >
               <SelectTrigger className="w-[200px] h-8 text-xs">

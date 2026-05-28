@@ -6,7 +6,7 @@ use crate::commands::{hide_main_window, show_main_window};
 use crate::enterprise_policy::{is_app_ui_hidden, is_tray_item_hidden};
 use crate::health::{
     get_audio_device_status, get_high_fps_status, get_recording_info, get_recording_status,
-    DeviceKind, RecordingStatus,
+    set_high_fps_status, DeviceKind, HighFpsCacheEntry, RecordingStatus,
 };
 use crate::recording::{local_api_context_from_app, RecordingState};
 use crate::store::{get_store, OnboardingStore, SettingsStore};
@@ -697,19 +697,27 @@ fn create_dynamic_menu(
         // the health poll (~1s lag); the CheckMenuItem also flips visually
         // on click for instant feedback.
         let hi_fps = get_high_fps_status();
+        // Derive fps from the cached interval. Guard against a zero
+        // landing here (shouldn't — server clamps to 33 — but a torn
+        // read or older engine could).
+        let fps_label = if hi_fps.interval_ms > 0 {
+            format!(" — ~{} fps", 1000 / hi_fps.interval_ms)
+        } else {
+            String::new()
+        };
         let hi_fps_label = if hi_fps.effective {
             if hi_fps.manual {
-                "High-FPS recording (on — manual)"
+                format!("High-FPS recording (on, manual{})", fps_label)
             } else {
-                "High-FPS recording (on — meeting)"
+                format!("High-FPS recording (on, meeting{})", fps_label)
             }
         } else if hi_fps.auto {
             match hi_fps.meeting {
-                Some(true) => "High-FPS recording (auto, meeting starting…)",
-                _ => "High-FPS recording (auto, idle)",
+                Some(true) => "High-FPS recording (auto, meeting starting…)".to_string(),
+                _ => "High-FPS recording (auto, idle)".to_string(),
             }
         } else {
-            "High-FPS recording"
+            "High-FPS recording".to_string()
         };
         let hi_fps_toggle = CheckMenuItemBuilder::with_id("toggle_high_fps", hi_fps_label)
             .checked(hi_fps.effective)
@@ -924,26 +932,66 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
             });
         }
         "toggle_high_fps" => {
-            // Cache holds the most-recent poll snapshot. We flip `manual`
-            // relative to whichever path is currently driving the override
-            // — manual on → manual off, meeting-driven on → manual on
-            // (forces it to keep firing even if the meeting ends), idle
-            // off → manual on. Auto-mode preference isn't touched here;
-            // settings panel still owns that knob.
+            // Cache holds the most-recent poll snapshot. Two-click problem:
+            // both clicks within ~1s see the SAME stale `effective`, both
+            // compute `want_on = true`, second POST is a no-op — the
+            // user's second click looks ignored. Fix: write the expected
+            // post-click state to the cache BEFORE the POST so the next
+            // click reads the optimistic state. We POST the absolute value
+            // (not a toggle) so the server stays authoritative — if
+            // someone else flipped it via HTTP between our read and POST,
+            // their value wins when the response (or next poll) lands.
             let cached = get_high_fps_status();
             let want_on = !cached.effective;
+            let optimistic = HighFpsCacheEntry {
+                manual: want_on,
+                effective: want_on,
+                ..cached.clone()
+            };
+            set_high_fps_status(optimistic);
+
             let body = serde_json::json!({ "manual": want_on });
             let api = local_api_context_from_app(&app_handle);
             tauri::async_runtime::spawn(async move {
                 let client = reqwest::Client::new();
-                if let Err(e) = api
+                match api
                     .apply_auth(client.post(api.url("/capture/high-fps")))
                     .header("Content-Type", "application/json")
                     .body(body.to_string())
                     .send()
                     .await
                 {
-                    error!("toggle_high_fps POST failed: {}", e);
+                    Ok(res) if res.status().is_success() => {
+                        // Reconcile with the server's authoritative view —
+                        // catches the case where someone else changed
+                        // `auto` or `intervalMs` between our last poll and
+                        // now.
+                        if let Ok(body) = res.json::<serde_json::Value>().await {
+                            set_high_fps_status(HighFpsCacheEntry {
+                                manual: body["manual"].as_bool().unwrap_or(want_on),
+                                auto: body["auto"].as_bool().unwrap_or(cached.auto),
+                                effective: body["effective"].as_bool().unwrap_or(want_on),
+                                meeting: body["meeting"].as_bool().or(cached.meeting),
+                                interval_ms: body["intervalMs"]
+                                    .as_u64()
+                                    .unwrap_or(cached.interval_ms),
+                            });
+                        }
+                    }
+                    Ok(res) => {
+                        error!(
+                            "toggle_high_fps POST returned status {}, rolling back optimistic cache",
+                            res.status()
+                        );
+                        set_high_fps_status(cached);
+                    }
+                    Err(e) => {
+                        error!(
+                            "toggle_high_fps POST failed: {} — rolling back optimistic cache",
+                            e
+                        );
+                        set_high_fps_status(cached);
+                    }
                 }
             });
         }

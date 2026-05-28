@@ -153,15 +153,13 @@ pub struct RecordingConfig {
     pub visual_check_interval_ms: Option<u64>,
     pub visual_change_threshold: Option<f64>,
     pub min_capture_interval_ms: Option<u64>,
-    /// Auto-boost capture rate whenever the v2 meeting detector reports
-    /// `in_meeting`. See `RecordingSettings.meeting_high_fps_enabled`. The
-    /// actual override lives in `HighFpsController` so it can be flipped at
-    /// runtime via `/capture/high-fps` without restart; this flag just
-    /// seeds the initial controller state.
-    pub meeting_high_fps_enabled: bool,
-    /// Capture debounce (ms) installed while the high-FPS override is
-    /// active. Clamped to >= 33 ms by the controller.
-    pub meeting_capture_interval_ms: u64,
+    /// User preference for what happens when a meeting is detected.
+    /// Seeds `HighFpsController.default_mode`; runtime-mutable via
+    /// `POST /capture/hd/settings`. See `RecordingSettings.hd_recording_default`.
+    pub hd_recording_default: crate::high_fps_controller::DefaultMode,
+    /// Capture debounce (ms) installed while an HD session is active.
+    /// Clamped to >= 33 ms by the controller.
+    pub hd_recording_interval_ms: u64,
     /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
     /// None = engine default (false). See `RecordingSettings.capture_on_keystroke`.
     pub capture_on_keystroke: Option<bool>,
@@ -324,8 +322,12 @@ impl RecordingConfig {
             visual_check_interval_ms: settings.visual_check_interval_ms,
             visual_change_threshold: settings.visual_change_threshold,
             min_capture_interval_ms: settings.min_capture_interval_ms,
-            meeting_high_fps_enabled: settings.meeting_high_fps_enabled,
-            meeting_capture_interval_ms: settings.meeting_capture_interval_ms,
+            hd_recording_default: match settings.hd_recording_default.as_str() {
+                "always" => crate::high_fps_controller::DefaultMode::Always,
+                "never" => crate::high_fps_controller::DefaultMode::Never,
+                _ => crate::high_fps_controller::DefaultMode::Ask,
+            },
+            hd_recording_interval_ms: settings.hd_recording_interval_ms,
             capture_on_keystroke: settings.capture_on_keystroke,
             capture_on_clipboard: settings.capture_on_clipboard,
             capture_scroll: settings.capture_scroll,

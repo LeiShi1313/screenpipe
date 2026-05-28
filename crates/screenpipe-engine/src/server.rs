@@ -713,13 +713,17 @@ impl SCServer {
             // Vision/audio pipeline metrics (not in OpenAPI spec — external types)
             .route("/vision/metrics", get(vision_metrics_handler))
             .route("/audio/metrics", get(audio_metrics_handler))
-            // High-FPS screen capture override (manual toggle + auto-on-meeting).
-            // GET returns the current state, POST sets any subset of {manual, auto, intervalMs}.
-            // Lets the tray, CLI, or any pipe flip capture rate without an engine restart.
+            // HD recording — bound sessions (meeting or timer), no indefinite mode.
+            // GET    /capture/hd            → current snapshot
+            // POST   /capture/hd/start      → { boundTo: "meeting"|"timer", meetingId?, durationSecs? }
+            // POST   /capture/hd/stop       → clear active session
+            // POST   /capture/hd/settings   → { defaultMode?, intervalMs? }
+            .route("/capture/hd", get(crate::routes::capture::get_hd))
+            .route("/capture/hd/start", axum::routing::post(crate::routes::capture::start_hd))
+            .route("/capture/hd/stop", axum::routing::post(crate::routes::capture::stop_hd))
             .route(
-                "/capture/high-fps",
-                get(crate::routes::capture::get_high_fps)
-                    .post(crate::routes::capture::set_high_fps),
+                "/capture/hd/settings",
+                axum::routing::post(crate::routes::capture::update_hd_settings),
             )
             // Retranscribe/transcribe (not in OpenAPI spec — opaque Response / multipart)
             .route(

@@ -938,9 +938,58 @@ async fn main() -> anyhow::Result<()> {
     // so a user who already toggled the auto-mode preference keeps it.
     let high_fps_controller = Arc::new(HighFpsController::new(
         meeting_detector.clone(),
-        config.meeting_high_fps_enabled,
-        config.meeting_capture_interval_ms,
+        config.hd_recording_default,
+        config.hd_recording_interval_ms,
     ));
+
+    // Wire `meeting_ended` → controller.handle_meeting_ended so a
+    // meeting-bound session auto-stops when the call ends. Without this,
+    // the only safety net is the 4-hour hard cap.
+    {
+        let controller = high_fps_controller.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut sub = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+            while let Some(event) = sub.next().await {
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                if let Some(id) = meeting_id {
+                    controller.handle_meeting_ended(id);
+                }
+            }
+        });
+    }
+
+    // When `default_mode = Always`, auto-start a meeting-bound session on
+    // every `meeting_started` event. Ask mode is handled by the desktop
+    // shell (it adds a "+ HD" action to the existing notification).
+    {
+        let controller = high_fps_controller.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut sub = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+            while let Some(event) = sub.next().await {
+                let snap = controller.snapshot();
+                if !matches!(
+                    snap.default_mode,
+                    screenpipe_engine::high_fps_controller::DefaultMode::Always
+                ) {
+                    continue;
+                }
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                if let Some(id) = meeting_id {
+                    controller.start_meeting_session(id);
+                }
+            }
+        });
+    }
 
     // Create VisionManager for event-driven capture on all monitors
     let (handle, capture_trigger_tx, linker_tx) = if !config.disable_vision {

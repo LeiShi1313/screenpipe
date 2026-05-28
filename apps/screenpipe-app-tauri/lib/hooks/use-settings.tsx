@@ -310,16 +310,19 @@ export type Settings = SettingsStore & {
 	}>;
 	apiAuth?: boolean;
 	apiKey?: string;
-	/** When true and a meeting is detected, drop the screen-capture
-	 * debounce to `meetingCaptureIntervalMs` so the on-disk MP4 chunks
-	 * have enough frames to rewatch the shared screen smoothly. Restored
-	 * when the meeting ends. Off by default — the higher rate adds disk
-	 * + CPU only for the meeting window. */
-	meetingHighFpsEnabled?: boolean;
-	/** `min_capture_interval_ms` to use while in a meeting and
-	 * `meetingHighFpsEnabled` is true. Default 100 ≈ 10 fps. Clamped to
-	 * >= 33 ms (30 fps ceiling) by the backend. */
-	meetingCaptureIntervalMs?: number;
+	/** Default behavior when a meeting is detected.
+	 * - `"ask"` (default): the existing meeting-start notification grows
+	 *   a "+ HD" action. Click → starts a meeting-bound session that
+	 *   auto-stops when the call ends.
+	 * - `"always"`: every detected meeting auto-starts a session.
+	 * - `"never"`: no auto-action; only the manual tray timer can start
+	 *   one.
+	 * Indefinite manual mode does not exist — every session is bound to
+	 * either a meeting or a timer, both with hard-cap safety nets. */
+	hdRecordingDefault?: "ask" | "always" | "never";
+	/** Capture debounce (ms) installed while an HD session is active.
+	 * Default 100 ≈ 10 fps. Clamped to >= 33 ms (30 fps ceiling). */
+	hdRecordingIntervalMs?: number;
 	/**
 	 * When true the backend binds the HTTP API to 0.0.0.0 instead of 127.0.0.1
 	 * so other devices on the LAN can reach it. api_auth is force-enabled
@@ -561,8 +564,8 @@ let DEFAULT_SETTINGS: Settings = {
 			localRetentionDays: 14,
 			localRetentionMode: "media",
 			encryptStore: true,
-			meetingHighFpsEnabled: false,
-			meetingCaptureIntervalMs: 100,
+			hdRecordingDefault: "ask",
+			hdRecordingIntervalMs: 100,
 		};
 
 export function createDefaultSettingsObject(): Settings {

@@ -198,30 +198,26 @@ pub struct RecordingSettings {
     #[serde(rename = "minCaptureIntervalMs", default)]
     pub min_capture_interval_ms: Option<u64>,
 
-    /// Seed for the engine's `HighFpsController.auto_enabled`: when true,
-    /// the controller bumps capture rate whenever the v2 meeting detector
-    /// reports `in_meeting`. Hot — the runtime value can be flipped via
-    /// `POST /capture/high-fps {auto: bool}` without an engine restart;
-    /// this field just persists the user preference across restarts.
+    /// Default behavior when a meeting is detected.
+    /// `"ask"` (default) surfaces a "+ HD" action on the existing meeting
+    /// notification; `"always"` auto-starts a meeting-bound HD session
+    /// every time; `"never"` is opt-out — only the manual tray timer
+    /// can start a session.
     ///
-    /// Default off — the high-FPS burst increases disk + CPU for the
-    /// duration of the meeting, and the manual "Boost now" tray/HTTP
-    /// toggle covers the "I want this one rewatchable" case without
-    /// touching the steady-state budget.
-    #[serde(rename = "meetingHighFpsEnabled", default)]
-    pub meeting_high_fps_enabled: bool,
+    /// Runtime-mutable via `POST /capture/hd/settings`; this field
+    /// just seeds the controller on startup.
+    #[serde(rename = "hdRecordingDefault", default = "default_hd_recording_default")]
+    pub hd_recording_default: String,
 
-    /// Seed for `HighFpsController.interval_ms` — the capture debounce
-    /// installed while the override is effective (manual or auto).
-    /// Runtime-mutable via `POST /capture/high-fps {intervalMs: u64}`;
-    /// this field just seeds the value on startup.
+    /// Capture debounce (ms) installed while an HD session is active.
     /// Default 100 ms ≈ 10 fps — smooth enough for human replay without
-    /// exploding disk usage. Clamped to >= 33 ms (30 fps ceiling).
+    /// exploding disk usage. Clamped to >= 33 ms (30 fps ceiling) by the
+    /// controller.
     #[serde(
-        rename = "meetingCaptureIntervalMs",
-        default = "default_meeting_capture_interval_ms"
+        rename = "hdRecordingIntervalMs",
+        default = "default_hd_recording_interval_ms"
     )]
-    pub meeting_capture_interval_ms: u64,
+    pub hd_recording_interval_ms: u64,
 
     /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
     /// None = engine default (false). When true, non-printable key events
@@ -522,8 +518,8 @@ impl Default for RecordingSettings {
             visual_check_interval_ms: None,
             visual_change_threshold: None,
             min_capture_interval_ms: None,
-            meeting_high_fps_enabled: false,
-            meeting_capture_interval_ms: default_meeting_capture_interval_ms(),
+            hd_recording_default: default_hd_recording_default(),
+            hd_recording_interval_ms: default_hd_recording_interval_ms(),
             capture_on_keystroke: None,
             capture_on_clipboard: None,
             capture_scroll: None,
@@ -596,7 +592,11 @@ fn default_pii_backend() -> String {
     "local".to_string()
 }
 
-fn default_meeting_capture_interval_ms() -> u64 {
+fn default_hd_recording_default() -> String {
+    "ask".to_string()
+}
+
+fn default_hd_recording_interval_ms() -> u64 {
     100
 }
 

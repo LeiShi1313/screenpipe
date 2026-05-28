@@ -1422,18 +1422,32 @@ function TranscriptionDictionary({
   );
 }
 
-interface HighFpsState {
-  manual: boolean;
-  auto: boolean;
+type HdDefaultMode = "ask" | "always" | "never";
+
+interface HdState {
+  active: boolean;
   intervalMs: number;
+  session: { kind: "meeting"; meeting_id: number } | { kind: "timer" } | null;
+  elapsedSecs: number | null;
+  remainingSecs: number | null;
+  defaultMode: HdDefaultMode;
   meeting: boolean | null;
-  effective: boolean;
 }
 
 type PushOutcome =
-  | { kind: "ok"; state: HighFpsState }
-  | { kind: "engine-down" } // network failure — settings still persisted
-  | { kind: "engine-rejected"; status: number }; // 4xx / 5xx from the route
+  | { kind: "ok"; state: HdState }
+  | { kind: "engine-down" }
+  | { kind: "engine-rejected"; status: number };
+
+function fmtRemaining(secs: number): string {
+  if (secs >= 3600) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return m === 0 ? `${h}h` : `${h}h ${m}m`;
+  }
+  if (secs >= 60) return `${Math.ceil(secs / 60)}m`;
+  return `${Math.max(secs, 1)}s`;
+}
 
 function HighFpsCard({
   settings,
@@ -1442,13 +1456,13 @@ function HighFpsCard({
   settings: any;
   onSettingsChange: (patch: Record<string, any>) => void;
 }) {
-  const [live, setLive] = React.useState<HighFpsState | null>(null);
+  const [live, setLive] = React.useState<HdState | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [lastError, setLastError] = React.useState<string | null>(null);
 
   const fetchState = React.useCallback(async () => {
     try {
-      const res = await localFetch("/capture/high-fps");
+      const res = await localFetch("/capture/hd");
       if (res.ok) {
         setLive(await res.json());
         setLastError(null);
@@ -1464,21 +1478,17 @@ function HighFpsCard({
     return () => clearInterval(id);
   }, [fetchState]);
 
-  // Runtime push. Returns a structured outcome so callers can decide what
-  // to show the user — "engine-down" is recoverable (the setting still
-  // persisted, so it'll take effect on next start), but the user MUST be
-  // told the live change didn't land.
-  const push = React.useCallback(
-    async (patch: Partial<{ manual: boolean; auto: boolean; intervalMs: number }>): Promise<PushOutcome> => {
+  const pushSettings = React.useCallback(
+    async (patch: Partial<{ defaultMode: HdDefaultMode; intervalMs: number }>): Promise<PushOutcome> => {
       setBusy(true);
       try {
-        const res = await localFetch("/capture/high-fps", {
+        const res = await localFetch("/capture/hd/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(patch),
         });
         if (res.ok) {
-          const state: HighFpsState = await res.json();
+          const state: HdState = await res.json();
           setLive(state);
           setLastError(null);
           return { kind: "ok", state };
@@ -1493,18 +1503,29 @@ function HighFpsCard({
     []
   );
 
-  // Convenience: persist-AND-push for the two settings that have both a
-  // persisted value (settings.bin) and a runtime override (controller).
-  // Surfaces failures rather than swallowing them — silent "saved" with no
-  // runtime effect is the most confusing failure mode.
+  const stopSession = React.useCallback(async () => {
+    setBusy(true);
+    try {
+      const res = await localFetch("/capture/hd/stop", { method: "POST" });
+      if (res.ok) setLive(await res.json());
+    } catch {
+      /* engine may be down */
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  // Persist preference to settings.bin AND push to running engine.
+  // Surfaces failures so a silent "saved" with no runtime effect can't
+  // confuse the user — that was the #1 bug in the previous design.
   const persistAndPush = React.useCallback(
     async (
       patch: Record<string, any>,
-      runtimePatch: Partial<{ auto: boolean; intervalMs: number }>,
+      runtimePatch: Partial<{ defaultMode: HdDefaultMode; intervalMs: number }>,
       label: string,
     ) => {
       onSettingsChange(patch);
-      const outcome = await push(runtimePatch);
+      const outcome = await pushSettings(runtimePatch);
       if (outcome.kind === "engine-down") {
         setLastError(
           `${label} saved — but the engine isn't reachable, so it'll only take effect on next start.`,
@@ -1515,61 +1536,57 @@ function HighFpsCard({
         );
       }
     },
-    [onSettingsChange, push],
+    [onSettingsChange, pushSettings],
   );
 
-  // Fallback chain protects against an engine that briefly returns 0 (it
-  // shouldn't — server clamps to 33 — but stale `live` from an older build
-  // or a torn read shouldn't crash the math).
+  // Guard against intervalMs ever leaking through as 0 (engine clamps to
+  // 33, but a stale or older response shouldn't divide-by-zero the UI).
   const intervalMs = Math.max(
-    live?.intervalMs ?? settings.meetingCaptureIntervalMs ?? 100,
+    live?.intervalMs ?? settings.hdRecordingIntervalMs ?? 100,
     33,
   );
   const fps = Math.round(1000 / intervalMs);
-  const autoOn = live?.auto ?? !!settings.meetingHighFpsEnabled;
-  const manualOn = live?.manual ?? false;
-  const effective = live?.effective ?? false;
-  const meeting = live?.meeting ?? null;
+  const defaultMode: HdDefaultMode =
+    live?.defaultMode ?? settings.hdRecordingDefault ?? "ask";
+  const active = live?.active ?? false;
+  const sessionKind = live?.session?.kind ?? null;
+  const remaining = live?.remainingSecs ?? 0;
 
-  const statusBadge = effective
-    ? `Boost active — ~${fps} fps`
-    : meeting
-    ? "Meeting detected, idle"
+  const statusBadge = active
+    ? sessionKind === "meeting"
+      ? `Recording at ~${fps} fps — stops when call ends`
+      : `Recording at ~${fps} fps — ${fmtRemaining(remaining)} left`
     : "Idle";
-
-  const handleManualClick = async () => {
-    const want = !manualOn;
-    const outcome = await push({ manual: want });
-    if (outcome.kind === "engine-down") {
-      setLastError("Engine isn't reachable. Manual boost can't apply until the engine is running.");
-    } else if (outcome.kind === "engine-rejected") {
-      setLastError(`Engine rejected the boost request (HTTP ${outcome.status}).`);
-    }
-  };
 
   return (
     <Card className="border-border bg-card">
       <CardContent className="px-3 py-2.5 space-y-3">
-        {/* Primary action: manual one-tap boost. The setting below makes it automatic. */}
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center space-x-2.5 min-w-0">
             <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
             <div className="min-w-0">
-              <h3 className="text-sm font-medium text-foreground">High-FPS recording</h3>
+              <h3 className="text-sm font-medium text-foreground">HD recording for meetings</h3>
               <p className="text-xs text-muted-foreground">
-                Bump screen capture to ~{fps} fps so you can rewatch slides, demos, and shared docs. {statusBadge}.
-                Also toggleable from the tray menu or <code className="text-[10px]">POST /capture/high-fps</code>.
+                Capture screen at higher rate during calls so you can rewatch
+                slides, demos, and shared docs. {statusBadge}.
+              </p>
+              <p className="text-[11px] text-muted-foreground mt-1">
+                Start from the meeting-start notification, the tray menu, or{" "}
+                <code>POST /capture/hd/start</code>. Every session has a
+                natural end — no indefinite mode.
               </p>
             </div>
           </div>
-          <Button
-            size="sm"
-            variant={manualOn ? "default" : "outline"}
-            disabled={busy}
-            onClick={handleManualClick}
-          >
-            {manualOn ? "Stop boost" : "Boost now"}
-          </Button>
+          {active && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={stopSession}
+            >
+              Stop now
+            </Button>
+          )}
         </div>
 
         {lastError && (
@@ -1578,33 +1595,47 @@ function HighFpsCard({
           </div>
         )}
 
-        {/* Persistent preferences — pushed live AND saved to settings.bin so
-            they survive an engine restart. Failure surfaces above. */}
         <div className="pt-3 border-t border-border space-y-2.5">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <h4 className="text-xs font-medium text-foreground">Auto-boost during meetings</h4>
-              <p className="text-[11px] text-muted-foreground">
-                Detect calls (Zoom, Meet, Teams, Slack) and boost automatically. Restored when the meeting ends.
-              </p>
+          <div>
+            <h4 className="text-xs font-medium text-foreground mb-1.5">
+              When a meeting starts
+            </h4>
+            <div className="flex flex-col gap-1">
+              {(
+                [
+                  { v: "ask" as const, label: "Ask me", hint: "Adds a “+ HD” action to the meeting-start notification (recommended)" },
+                  { v: "always" as const, label: "Always record at HD", hint: "Auto-start every detected meeting — more disk + CPU per call" },
+                  { v: "never" as const, label: "Never", hint: "No prompt; only the tray timer can start a session" },
+                ] satisfies Array<{ v: HdDefaultMode; label: string; hint: string }>
+              ).map(({ v, label, hint }) => (
+                <label key={v} className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="hdDefault"
+                    className="mt-1"
+                    checked={defaultMode === v}
+                    onChange={() =>
+                      persistAndPush(
+                        { hdRecordingDefault: v },
+                        { defaultMode: v },
+                        "Meeting default",
+                      )
+                    }
+                  />
+                  <span>
+                    <span className="text-xs text-foreground">{label}</span>
+                    <span className="block text-[11px] text-muted-foreground">{hint}</span>
+                  </span>
+                </label>
+              ))}
             </div>
-            <Switch
-              id="meetingHighFpsEnabled"
-              checked={autoOn}
-              onCheckedChange={(checked) =>
-                persistAndPush(
-                  { meetingHighFpsEnabled: checked },
-                  { auto: checked },
-                  "Auto-boost preference",
-                )
-              }
-            />
           </div>
-          <div className="flex items-center justify-between gap-3">
+
+          <div className="flex items-center justify-between gap-3 pt-2 border-t border-border">
             <div className="min-w-0">
-              <h4 className="text-xs font-medium text-foreground">Capture interval</h4>
+              <h4 className="text-xs font-medium text-foreground">Quality</h4>
               <p className="text-[11px] text-muted-foreground">
-                Lower = smoother replay + more disk. Clamped to ≥ 33 ms (30 fps).
+                Lower interval = smoother replay + more disk. ≥ 33 ms (30 fps).
               </p>
             </div>
             <Select
@@ -1612,7 +1643,7 @@ function HighFpsCard({
               onValueChange={(value) => {
                 const ms = Number(value);
                 persistAndPush(
-                  { meetingCaptureIntervalMs: ms },
+                  { hdRecordingIntervalMs: ms },
                   { intervalMs: ms },
                   "Capture interval",
                 );
@@ -3264,11 +3295,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
-        {/* High-FPS screen recording — manual boost + auto-on-meeting. The
-            controller lives in the engine and is HTTP-controlled so changes
-            take effect on the next capture tick (no restart). The primary
-            UX is the tray quick-toggle and `POST /capture/high-fps`; this
-            settings card just exposes the persistent preferences. */}
+        {/* HD recording — bound sessions only (meeting or timer; no
+            indefinite mode). The controller lives in the engine and is
+            HTTP-controlled so settings take effect immediately. Primary
+            UX is the meeting-start notification's "+ HD" action and the
+            tray timer submenu; this card exposes the persistent prefs. */}
         {!settings.disableVision && (
           <HighFpsCard
             settings={settings}

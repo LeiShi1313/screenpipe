@@ -193,20 +193,21 @@ pub fn set_audio_device_status(devices: Vec<AudioDeviceEntry>) {
 }
 
 /// Mirror of `routes::capture::HighFpsState` — what the tray needs to
-/// render the "High-FPS recording" menu item label and checked state.
+/// render the "HD recording" menu item label and checked state.
 /// Updated by the health poll so the tray reads from a local cache
 /// instead of blocking on an HTTP round-trip, AND mutated optimistically
-/// by the tray click handler so rapid clicks compute `want_on` from the
-/// post-click state instead of the 1-sec-stale poll snapshot.
+/// by the tray click handler so rapid clicks compute the next action
+/// from post-click state instead of the 1-sec-stale poll snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct HighFpsCacheEntry {
-    pub manual: bool,
-    pub auto: bool,
-    pub effective: bool,
-    pub meeting: Option<bool>,
-    /// Capture debounce (ms) installed while the override is effective.
-    /// Cached so the tray label can show "(~10 fps)".
+    /// True iff an HD session is currently active.
+    pub active: bool,
+    /// Capture debounce (ms). Cached so the label can show "~10 fps".
     pub interval_ms: u64,
+    /// Session kind serialized as `"meeting"` | `"timer"` | empty.
+    pub session_kind: String,
+    /// Seconds until the active session auto-expires. 0 when idle.
+    pub remaining_secs: u64,
 }
 
 static HIGH_FPS_STATUS: Lazy<RwLock<HighFpsCacheEntry>> =
@@ -665,21 +666,26 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 }
             }
 
-            // Poll the high-FPS controller state for the tray's CheckMenuItem.
+            // Poll the HD controller state for the tray's menu item.
             // 503 is normal (vision disabled / older engine) — keep last known.
             if let Ok(res) = api
-                .apply_auth(reqwest::Client::new().get(api.url("/capture/high-fps")))
+                .apply_auth(reqwest::Client::new().get(api.url("/capture/hd")))
                 .send()
                 .await
             {
                 if res.status().is_success() {
                     if let Ok(body) = res.json::<serde_json::Value>().await {
+                        let kind = body
+                            .get("session")
+                            .and_then(|s| s.get("kind"))
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         set_high_fps_status(HighFpsCacheEntry {
-                            manual: body["manual"].as_bool().unwrap_or(false),
-                            auto: body["auto"].as_bool().unwrap_or(false),
-                            effective: body["effective"].as_bool().unwrap_or(false),
-                            meeting: body["meeting"].as_bool(),
+                            active: body["active"].as_bool().unwrap_or(false),
                             interval_ms: body["intervalMs"].as_u64().unwrap_or(100),
+                            session_kind: kind,
+                            remaining_secs: body["remainingSecs"].as_u64().unwrap_or(0),
                         });
                     }
                 }

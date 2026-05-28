@@ -860,7 +860,7 @@ pub async fn event_driven_capture_loop(
                 info!(
                     "high-fps: monitor {} {} min_capture_interval_ms {} -> {} ms",
                     monitor_id,
-                    if snap.effective { "dropping" } else { "restoring" },
+                    if snap.active { "dropping" } else { "restoring" },
                     state.config.min_capture_interval_ms,
                     new_ms,
                 );

@@ -57,7 +57,7 @@ use crate::{
             mark_as_hallucination_handler, merge_speakers_handler, reassign_speaker_handler,
             search_speakers_handler, undo_speaker_reassign_handler, update_speaker_handler,
         },
-        streaming::{handle_video_export_post, handle_video_export_ws, stream_frames_handler},
+        streaming::stream_frames_handler,
         websocket::{
             ws_events_handler, ws_health_handler, ws_meeting_status_handler, ws_metrics_handler,
         },
@@ -978,10 +978,6 @@ impl SCServer {
                         crate::routes::browser::browser_status_handler(axum::extract::State(bridge))
                     }
                 }),
-            )
-            .route(
-                "/frames/export",
-                get(handle_video_export_ws).post(handle_video_export_post),
             )
             .with_state(app_state.clone())
             .layer(axum::middleware::from_fn_with_state(

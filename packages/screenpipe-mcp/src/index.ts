@@ -12,7 +12,6 @@ import {
   ReadResourceRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { WebSocket } from "ws";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -389,20 +388,21 @@ const TOOLS: Tool[] = [
   {
     name: "export-video",
     description:
-      "Export an MP4 of screen recordings for a time range, WITH synced microphone audio by default. " +
-      "Returns the file path. Can take a few minutes for long ranges. " +
-      "Pass `fps` only if you want a silent timelapse instead of a real-time video with audio.",
+      "Export an MP4 of screen recordings for a time range, with synced microphone audio. " +
+      "Frames are placed at their real timestamps, so the clip's duration matches the " +
+      "wall-clock span you requested (not a sped-up timelapse). Returns the file path. " +
+      "Can take a few minutes for long ranges.",
     annotations: { title: "Export Video", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     inputSchema: {
       type: "object",
       properties: {
-        start_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        end_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        fps: {
-          type: "number",
+        start_time: { type: "string", description: 'ISO 8601 UTC or relative (e.g. "5m ago", "now")' },
+        end_time: { type: "string", description: 'ISO 8601 UTC or relative (e.g. "5m ago", "now")' },
+        output_path: {
+          type: "string",
           description:
-            "Optional. If set, exports a SILENT timelapse at this FPS (no audio). " +
-            "Omit it to get a real-time video with synced audio.",
+            "Optional absolute path for the MP4 (e.g. ~/Downloads/clip.mp4). " +
+            "Defaults to the screenpipe data dir's exports/ folder.",
         },
       },
       required: ["start_time", "end_time"],
@@ -1346,174 +1346,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Default path: a real-time MP4 with synced microphone audio, rendered
-        // server-side by the engine export core (the `screenpipe export` CLI's HTTP
-        // twin). MCP runs on the same host as the backend, so the returned path is a
-        // local file. `fps` opts into the legacy silent timelapse below instead.
-        if (args.fps === undefined || args.fps === null) {
-          try {
-            const response = await callAPI("/export", {
-              method: "POST",
-              body: JSON.stringify({ start: startTime, end: endTime }),
-            });
-            const data = (await response.json()) as {
-              output_path: string;
-              frame_count: number;
-              audio_chunk_count: number;
-              duration_secs: number;
-              file_size_bytes: number;
-            };
-            const sizeMb = data.file_size_bytes
-              ? (data.file_size_bytes / (1024 * 1024)).toFixed(1)
-              : null;
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Video exported (with audio): ${data.output_path}\n` +
-                    `${data.frame_count ?? 0} frames | ${data.audio_chunk_count ?? 0} audio chunks` +
-                    (sizeMb ? ` | ${sizeMb} MB` : "") +
-                    ` | ${startTime} → ${endTime}`,
-                },
-              ],
-            };
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
-                },
-              ],
-            };
+        // A real-time MP4 with synced microphone audio, rendered server-side by the
+        // engine export core (the `screenpipe export` CLI's HTTP twin). MCP runs on the
+        // same host as the backend, so the returned path is a local file. Frames sit at
+        // their real timestamps, so the clip duration matches the wall-clock span.
+        try {
+          const body: Record<string, unknown> = { start: startTime, end: endTime };
+          if (typeof args.output_path === "string" && args.output_path.trim()) {
+            body.output_path = args.output_path;
           }
-        }
-
-        // --- legacy silent timelapse path (fps explicitly set) ---
-        const fps = args.fps as number;
-
-        // Get frame IDs for the time range
-        const searchParams = new URLSearchParams({
-          content_type: "ocr",
-          start_time: startTime,
-          end_time: endTime,
-          limit: "10000",
-        });
-
-        const searchResponse = await callAPI(`/search?${searchParams.toString()}`);
-        const searchData = await searchResponse.json();
-        const results = searchData.data || [];
-
-        if (results.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No screen recordings found between ${startTime} and ${endTime}.`,
-              },
-            ],
+          const response = await callAPI("/export", {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
+          const data = (await response.json()) as {
+            output_path: string;
+            frame_count: number;
+            audio_chunk_count: number;
+            duration_secs: number;
+            file_size_bytes: number;
           };
-        }
-
-        const frameIds: number[] = [];
-        const seenIds = new Set<number>();
-        for (const result of results) {
-          if (result.type === "OCR" && result.content?.frame_id) {
-            const frameId = result.content.frame_id;
-            if (!seenIds.has(frameId)) {
-              seenIds.add(frameId);
-              frameIds.push(frameId);
-            }
-          }
-        }
-
-        if (frameIds.length === 0) {
-          return {
-            content: [{ type: "text", text: "No valid frame IDs found (audio-only?)." }],
-          };
-        }
-
-        frameIds.sort((a, b) => a - b);
-
-        const wsUrl = `ws://localhost:${port}/frames/export?fps=${fps}`;
-
-        const exportResult = await new Promise<{
-          success: boolean;
-          filePath?: string;
-          error?: string;
-          frameCount?: number;
-        }>((resolve) => {
-          const ws = new WebSocket(wsUrl);
-          let resolved = false;
-
-          const timeout = setTimeout(() => {
-            if (!resolved) {
-              resolved = true;
-              ws.close();
-              resolve({ success: false, error: "Export timed out after 5 minutes" });
-            }
-          }, 5 * 60 * 1000);
-
-          ws.on("open", () => {
-            ws.send(JSON.stringify({ frame_ids: frameIds }));
-          });
-
-          ws.on("error", (error) => {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve({ success: false, error: `WebSocket error: ${error.message}` });
-            }
-          });
-
-          ws.on("close", () => {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve({ success: false, error: "Connection closed unexpectedly" });
-            }
-          });
-
-          ws.on("message", (data) => {
-            try {
-              const message = JSON.parse(data.toString());
-              if (message.status === "completed" && message.video_data) {
-                const tempDir = os.tmpdir();
-                const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-                const filename = `screenpipe_export_${timestamp}.mp4`;
-                const filePath = path.join(tempDir, filename);
-                fs.writeFileSync(filePath, Buffer.from(message.video_data));
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({ success: true, filePath, frameCount: frameIds.length });
-              } else if (message.status === "error") {
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({ success: false, error: message.error || "Export failed" });
-              }
-            } catch {
-              // Ignore parse errors for progress messages
-            }
-          });
-        });
-
-        if (exportResult.success && exportResult.filePath) {
+          const sizeMb = data.file_size_bytes
+            ? (data.file_size_bytes / (1024 * 1024)).toFixed(1)
+            : null;
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `Timelapse exported (no audio): ${exportResult.filePath}\n` +
-                  `Frames: ${exportResult.frameCount} | ${startTime} → ${endTime} | ${fps} fps`,
+                  `Video exported (with audio): ${data.output_path}\n` +
+                  `${data.frame_count ?? 0} frames | ${data.audio_chunk_count ?? 0} audio chunks` +
+                  (sizeMb ? ` | ${sizeMb} MB` : "") +
+                  (data.duration_secs ? ` | ${data.duration_secs}s` : "") +
+                  ` | ${startTime} → ${endTime}`,
               },
             ],
           };
-        } else {
+        } catch (err) {
           return {
-            content: [{ type: "text", text: `Export failed: ${exportResult.error}` }],
+            content: [
+              {
+                type: "text",
+                text: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
           };
         }
       }

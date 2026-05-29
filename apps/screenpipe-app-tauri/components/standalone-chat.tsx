@@ -1312,7 +1312,7 @@ function classifyCurl(cmd: string): CurlPresentation | null {
     return { label: `Pipe ${name}` };
   }
 
-  if (path === "/frames/export") return { label: "Exported video" };
+  if (path === "/export") return { label: "Exported video" };
   if (path === "/health") return { label: "Health check" };
   if (path === "/list-monitors") return { label: "Listed monitors" };
   if (path === "/list-audio-devices") return { label: "Listed audio devices" };

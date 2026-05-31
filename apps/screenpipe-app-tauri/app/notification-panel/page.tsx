@@ -17,24 +17,10 @@ import {
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import localforage from "localforage";
 import { localFetch } from "@/lib/api";
-
-interface NotificationAction {
-  label: string;
-  action: string;
-  primary?: boolean;
-  // Pipe notification action fields
-  id?: string;
-  type?: "pipe" | "api" | "deeplink" | "meeting_join" | "dismiss";
-  pipe?: string;
-  context?: Record<string, unknown>;
-  url?: string;
-  deeplink_url?: string;
-  deeplinkUrl?: string;
-  method?: string;
-  body?: Record<string, unknown>;
-  toast?: string;
-  open_in_chat?: boolean;
-}
+import {
+  executeNotificationAction,
+  type NotificationAction,
+} from "@/lib/notifications/actions";
 
 interface NotificationPayload {
   id: string;
@@ -44,13 +30,6 @@ interface NotificationPayload {
   actions: NotificationAction[];
   autoDismissMs?: number;
   pipe_name?: string;
-}
-
-function windowForDeeplink(url: string) {
-  return url.startsWith("screenpipe://meeting/") ||
-    url.startsWith("screenpipe://meeting?")
-    ? { Home: { page: "meetings" } }
-    : "Main";
 }
 
 async function openNotificationLink(href: string) {
@@ -128,96 +107,14 @@ export default function NotificationPanelPage() {
       });
 
       try {
-        // New typed action dispatch (pipe notifications)
+        // New typed action dispatch (pipe notifications) — shared with the
+        // notification bell so the toast and the persistent center resolve an
+        // action identically. See lib/notifications/actions.ts.
         if (actionObj?.type) {
-          switch (actionObj.type) {
-            case "pipe": {
-              const pipeName = actionObj.pipe || payload?.pipe_name;
-              if (pipeName) {
-                if (actionObj.open_in_chat) {
-                  // Open in chat UI so user sees the output live
-                  const contextStr = actionObj.context
-                    ? JSON.stringify(actionObj.context, null, 2)
-                    : "";
-                  await showChatWithPrefill({
-                    context: `run pipe "${pipeName}" with this context:\n${contextStr}`,
-                    prompt: `run the ${pipeName} pipe${actionObj.context ? " with the provided context" : ""}`,
-                    autoSend: true,
-                    source: `notification-${payload?.id}`,
-                  });
-                } else {
-                  // Run in background
-                  await localFetch(`/pipes/${pipeName}/run`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ notification_context: actionObj.context }),
-                  });
-                }
-              }
-              break;
-            }
-            case "api": {
-              if (actionObj.url) {
-                await localFetch(actionObj.url, {
-                  method: actionObj.method || "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: actionObj.body ? JSON.stringify(actionObj.body) : undefined,
-                });
-              }
-              break;
-            }
-            case "deeplink": {
-              if (actionObj.url) {
-                if (actionObj.url.startsWith("screenpipe://")) {
-                  // Show the Main window FIRST — its DeeplinkHandler only
-                  // routes events once mounted, and on macOS the window
-                  // won't actually come to the foreground unless we activate
-                  // the app (see show_window_activated for the rationale).
-                  // Then give React ~150ms to mount the listener before
-                  // emitting. Without this ordering, the emit fires into a
-                  // handler that hasn't subscribed yet and the click silently
-                  // does nothing.
-                  await commands.showWindowActivated(windowForDeeplink(actionObj.url));
-                  await new Promise((r) => setTimeout(r, 150));
-                  await emit("deep-link-received", actionObj.url);
-                } else {
-                  // External URL — open in system browser
-                  try {
-                    const { open } = await import("@tauri-apps/plugin-shell");
-                    await open(actionObj.url);
-                  } catch (e) {
-                    console.error(
-                      "notification open: shell plugin unavailable",
-                      e
-                    );
-                  }
-                }
-              }
-              break;
-            }
-            case "meeting_join": {
-              if (actionObj.url) {
-                try {
-                  const { open } = await import("@tauri-apps/plugin-shell");
-                  await open(actionObj.url);
-                } catch (e) {
-                  console.error(
-                    "notification open: shell plugin unavailable",
-                    e
-                  );
-                }
-              }
-              const deeplink = actionObj.deeplink_url || actionObj.deeplinkUrl;
-              if (typeof deeplink === "string" && deeplink.startsWith("screenpipe://")) {
-                await commands.showWindowActivated(windowForDeeplink(deeplink));
-                await new Promise((r) => setTimeout(r, 150));
-                await emit("deep-link-received", deeplink);
-              }
-              break;
-            }
-            case "dismiss":
-              break;
-          }
+          await executeNotificationAction(actionObj, {
+            pipeName: payload?.pipe_name,
+            sourceId: payload?.id,
+          });
           await hide(false);
           return;
         }

@@ -34,11 +34,13 @@ pub async fn send_notification(
         "type": payload.notification_type.unwrap_or_else(|| "pipe".to_string()),
         "title": payload.title,
         "body": body,
-        "actions": payload.actions,
+        "actions": payload.actions.clone(),
         "autoDismissMs": dismiss_ms,
     });
 
-    // Persist to disk before attempting to show — survives crashes/restarts
+    // Persist to disk before attempting to show — survives crashes/restarts.
+    // Actions ride along so the notification bell can re-offer them after the
+    // toast is gone.
     store::push(NotificationHistoryEntry {
         id: panel_id.clone(),
         notification_type: panel_payload["type"].as_str().unwrap_or("pipe").to_string(),
@@ -47,6 +49,7 @@ pub async fn send_notification(
         pipe_name: None,
         timestamp: chrono::Utc::now().to_rfc3339(),
         read: false,
+        actions: payload.actions,
     });
 
     let panel_json = panel_payload.to_string();

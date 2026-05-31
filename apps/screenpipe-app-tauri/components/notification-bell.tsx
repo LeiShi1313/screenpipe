@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Fragment, type ReactNode } from "react";
 import { Bell, ChevronRight, ChevronDown, MessageSquare, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { notificationUrlTransform, openScreenpipeViewerLink } from "@/components/markdown";
@@ -18,6 +18,11 @@ import {
 } from "@/components/ui/popover";
 import { useRouter } from "next/navigation";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import { cn } from "@/lib/utils";
+import {
+  executeNotificationAction,
+  type NotificationAction,
+} from "@/lib/notifications/actions";
 
 interface NotificationEntry {
   id: string;
@@ -27,9 +32,25 @@ interface NotificationEntry {
   pipe_name?: string;
   timestamp: string;
   read: boolean;
+  actions?: NotificationAction[];
 }
 
 const API_BASE = "http://localhost:11435";
+
+// Actions worth rendering as buttons. `dismiss` is excluded — the row's own
+// "✕" already covers it, and a notification with only a dismiss action is not
+// something that "needs you".
+function actionsFor(entry: NotificationEntry): NotificationAction[] {
+  return (entry.actions ?? []).filter((a) => a.label && a.type !== "dismiss");
+}
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="px-3 pt-2 pb-1 text-[9px] tracking-wide text-muted-foreground/50">
+      {children}
+    </div>
+  );
+}
 
 async function openNotificationLink(href: string) {
   const raw = href.trim();
@@ -115,17 +136,51 @@ export function NotificationBell() {
     } catch {}
   };
 
-  const dismissOne = async (id: string) => {
+  const removeEntry = useCallback(async (id: string) => {
+    setHistory((prev) => prev.filter((n) => n.id !== id));
+    setExpandedId((prev) => (prev === id ? null : prev));
+    try {
+      await fetch(`${API_BASE}/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
+    } catch {}
+  }, []);
+
+  const dismissOne = (id: string) => {
     const entry = history.find((n) => n.id === id);
     posthog.capture("notification_bell_dismiss", {
       notification_type: entry?.type,
       pipe_name: entry?.pipe_name,
     });
-    setHistory((prev) => prev.filter((n) => n.id !== id));
-    if (expandedId === id) setExpandedId(null);
+    removeEntry(id);
+  };
+
+  const runAction = async (entry: NotificationEntry, action: NotificationAction) => {
+    posthog.capture("notification_bell_action", {
+      notification_type: entry.type,
+      pipe_name: entry.pipe_name,
+      action: action.action,
+      action_type: action.type,
+    });
+    // Navigating actions need the popover closed so the target surface
+    // (chat, a window) isn't hidden behind it.
+    if (action.open_in_chat || action.type === "deeplink" || action.type === "meeting_join") {
+      setOpen(false);
+    }
     try {
-      await fetch(`${API_BASE}/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
-    } catch {}
+      await executeNotificationAction(action, {
+        pipeName: entry.pipe_name,
+        sourceId: entry.id,
+      });
+    } catch (err) {
+      console.error("notification action failed", { action: action.action, type: action.type }, err);
+      posthog.capture("notification_bell_action_error", {
+        notification_type: entry.type,
+        action: action.action,
+        action_type: action.type,
+        error: String(err),
+      });
+    }
+    // Resolve in place: once acted on, the row leaves the inbox.
+    removeEntry(entry.id);
   };
 
   const formatTime = (ts: string) => {
@@ -137,6 +192,12 @@ export function NotificationBell() {
     if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
     return d.toLocaleDateString();
   };
+
+  // Float notifications that carry actions ("needs you") above passive ones
+  // ("earlier") — mirrors how Linear / Slack surface actionable items first.
+  const needsYou = history.filter((n) => actionsFor(n).length > 0);
+  const earlier = history.filter((n) => actionsFor(n).length === 0);
+  const displayed = [...needsYou, ...earlier];
 
   return (
     <Popover
@@ -189,13 +250,20 @@ export function NotificationBell() {
               no notifications yet
             </div>
           ) : (
-            history.map((entry) => {
+            displayed.map((entry, idx) => {
               const isExpanded = expandedId === entry.id;
+              const rowActions = actionsFor(entry);
               return (
-                <div
-                  key={entry.id}
-                  className="border-b border-border/50 last:border-0"
-                >
+                <Fragment key={entry.id}>
+                  {idx === 0 && needsYou.length > 0 && (
+                    <SectionLabel>needs you</SectionLabel>
+                  )}
+                  {idx === needsYou.length &&
+                    needsYou.length > 0 &&
+                    earlier.length > 0 && (
+                      <SectionLabel>earlier</SectionLabel>
+                    )}
+                  <div className="border-b border-border/50 last:border-0">
                   <div
                     className="group/notif px-3 py-2 hover:bg-muted/30 cursor-pointer"
                     onClick={() => {
@@ -272,6 +340,27 @@ export function NotificationBell() {
                         </button>
                       </div>
                     </div>
+                    {rowActions.length > 0 && (
+                      <div
+                        className="flex flex-wrap items-center gap-1 mt-1.5 pl-4"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {rowActions.map((action, i) => (
+                          <button
+                            key={action.id ?? action.action ?? i}
+                            onClick={() => runAction(entry, action)}
+                            className={cn(
+                              "text-[10px] px-2 py-0.5 rounded transition-colors",
+                              action.primary
+                                ? "bg-foreground text-background hover:bg-foreground/90"
+                                : "border border-border text-muted-foreground hover:text-foreground hover:bg-muted/40",
+                            )}
+                          >
+                            {action.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   {isExpanded && (
                     <div className="px-3 pb-2 pl-7">
@@ -332,7 +421,8 @@ export function NotificationBell() {
                       </button>
                     </div>
                   )}
-                </div>
+                  </div>
+                </Fragment>
               );
             })
           )}

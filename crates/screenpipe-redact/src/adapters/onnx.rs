@@ -50,8 +50,8 @@ use async_trait::async_trait;
 
 use crate::{RedactError, RedactedSpan, RedactionOutput, Redactor, SpanLabel};
 
-const ONNX_REDACTOR_NAME: &str = "v45_phase3_onnx";
-const ONNX_REDACTOR_VERSION: u32 = 3;
+const ONNX_REDACTOR_NAME: &str = "v45_phase4_onnx";
+const ONNX_REDACTOR_VERSION: u32 = 4;
 
 /// Configuration for an ONNX text redactor.
 #[derive(Debug, Clone)]
@@ -78,11 +78,11 @@ impl Default for OnnxConfig {
 }
 
 impl OnnxConfig {
-    /// `~/.screenpipe/models/v45_phase3_onnx/` by convention.
+    /// `~/.screenpipe/models/v45_phase4_onnx/` by convention.
     pub fn default_model_dir() -> PathBuf {
         dirs::home_dir()
-            .map(|h| h.join(".screenpipe").join("models").join("v45_phase3_onnx"))
-            .unwrap_or_else(|| PathBuf::from(".screenpipe/models/v45_phase3_onnx"))
+            .map(|h| h.join(".screenpipe").join("models").join("v45_phase4_onnx"))
+            .unwrap_or_else(|| PathBuf::from(".screenpipe/models/v45_phase4_onnx"))
     }
 
     fn resolve_model_file(&self) -> PathBuf {
@@ -109,7 +109,7 @@ impl OnnxConfig {
     /// code change (URL + expected SHA-256 + [`ONNX_REDACTOR_VERSION`]
     /// all bumped together — same discipline as `RfdetrConfig`).
     pub const HF_REPO_BASE: &'static str =
-        "https://huggingface.co/screenpipe/pii-redactor/resolve/main/v45_phase3_onnx";
+        "https://huggingface.co/screenpipe/pii-redactor/resolve/main/v45_phase4_onnx";
 
     /// Files to download from the HF repo on first run. Each is
     /// (filename, expected sha256). Recompute via
@@ -119,17 +119,17 @@ impl OnnxConfig {
         // INT8-quantized model. ~278 MB.
         (
             "model_quantized.onnx",
-            "77bb202c542bcd3f835992cde3cafb3df868a8a6fc14ca9d1b028452be6b5787",
+            "286c628349c0145fdfbfc773cd44a6e22680abb42b00730d6ec78d366aac610b",
         ),
         // SentencePiece tokenizer (HF fast format). ~17 MB.
         (
             "tokenizer.json",
-            "14c7e8bf7d9b58ca061fcda93bc8d0eedd1a51ffc3af01a1ba1ef54e2154887e",
+            "d0091a328b3441d754e481db5a390d7f3b8dabc6016869fd13ba350d23ddc4cd",
         ),
         // id2label + model config. ~2 KB.
         (
             "config.json",
-            "e9a8a3dda702b9efa2b9b5960567a560bf410e92e619184081dd3c9e9990b35d",
+            "61dc24e4e4816d723143974268ef0b7a303d4b1f208bdd96db4d38a3359036f2",
         ),
     ];
 

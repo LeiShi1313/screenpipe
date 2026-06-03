@@ -9108,6 +9108,75 @@ LIMIT ? OFFSET ?
         Ok(inserted)
     }
 
+    /// Give live meeting-transcript segments the SAME global `speaker_id` that the
+    /// engine-agnostic backfill (`backfill_missing_speakers`) resolved on
+    /// `audio_transcriptions` — so the Meeting view shows the cross-meeting, nameable
+    /// identity instead of Deepgram's per-stream "speaker N" label.
+    ///
+    /// For each segment still missing a speaker (and `captured_at >= since`), take the
+    /// `speaker_id` of the nearest already-identified `audio_transcriptions` row within
+    /// `coverage_window_secs`. The mirrored live row shares the segment's exact
+    /// timestamp, so once the chunk backfill stamps it, it matches first. Idempotent —
+    /// only fills NULLs, and the `EXISTS` guard avoids no-op NULL writes. Returns rows
+    /// updated. Cheap: runs on the reconciliation sweep, never the hot path.
+    pub async fn backfill_meeting_segment_speakers(
+        &self,
+        since: DateTime<Utc>,
+        coverage_window_secs: f64,
+    ) -> Result<u64, SqlxError> {
+        // SQLite can't correlate the UPDATE target table inside a SET subquery, so
+        // do it as fetch-candidates → per-row nearest-lookup → update-by-id (the
+        // same shape as the mirror). Capped per pass; resolved segments drop out of
+        // the candidate set, so steady-state work is just newly-mirrored segments.
+        const PER_PASS_LIMIT: i64 = 500;
+        let window_days = coverage_window_secs / 86_400.0;
+
+        let segs = sqlx::query(
+            "SELECT id, captured_at FROM meeting_transcript_segments \
+             WHERE speaker_id IS NULL AND julianday(captured_at) >= julianday(?1) \
+             ORDER BY captured_at DESC LIMIT ?2",
+        )
+        .bind(since)
+        .bind(PER_PASS_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        if segs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let mut updated: u64 = 0;
+        for seg in &segs {
+            let seg_id: i64 = seg.get("id");
+            let captured_at: DateTime<Utc> = seg.get("captured_at");
+            // The global speaker_id of the nearest already-identified audio row
+            // (the mirrored live row shares this exact timestamp, so it wins).
+            let speaker_id: Option<i64> = sqlx::query_scalar(
+                "SELECT at.speaker_id FROM audio_transcriptions at \
+                 WHERE at.speaker_id IS NOT NULL \
+                   AND ABS(julianday(at.timestamp) - julianday(?1)) <= ?2 \
+                 ORDER BY ABS(julianday(at.timestamp) - julianday(?1)) ASC LIMIT 1",
+            )
+            .bind(captured_at)
+            .bind(window_days)
+            .fetch_optional(&mut **tx.conn())
+            .await?;
+            if let Some(sid) = speaker_id {
+                let r = sqlx::query(
+                    "UPDATE meeting_transcript_segments SET speaker_id = ?1 \
+                     WHERE id = ?2 AND speaker_id IS NULL",
+                )
+                .bind(sid)
+                .bind(seg_id)
+                .execute(&mut **tx.conn())
+                .await?;
+                updated += r.rows_affected();
+            }
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     pub async fn list_meeting_transcript_segments(
         &self,
         meeting_id: i64,
@@ -9127,24 +9196,28 @@ LIMIT ? OFFSET ?
             ),
             live_segments AS (
                 SELECT
-                    id,
-                    meeting_id,
+                    mts.id,
+                    mts.meeting_id,
                     'live' AS source,
-                    provider,
-                    model,
-                    item_id,
-                    device_name,
-                    device_type,
+                    mts.provider,
+                    mts.model,
+                    mts.item_id,
+                    mts.device_name,
+                    mts.device_type,
                     NULL AS audio_transcription_id,
                     NULL AS audio_chunk_id,
                     NULL AS audio_file_path,
-                    NULL AS speaker_id,
-                    speaker_name,
-                    transcript,
-                    captured_at,
-                    created_at
-                FROM meeting_transcript_segments
-                WHERE meeting_id = ?1
+                    mts.speaker_id AS speaker_id,
+                    -- Prefer the resolved global speaker's name; fall back to the
+                    -- free-text Deepgram label until backfilled / if the speaker is
+                    -- unnamed (NULLIF treats '' as "no name yet").
+                    COALESCE(NULLIF(s.name, ''), mts.speaker_name) AS speaker_name,
+                    mts.transcript,
+                    mts.captured_at,
+                    mts.created_at
+                FROM meeting_transcript_segments mts
+                LEFT JOIN speakers s ON s.id = mts.speaker_id
+                WHERE mts.meeting_id = ?1
             ),
             background_segments AS (
                 SELECT

@@ -333,4 +333,130 @@ mod timeline_live_meeting_tests {
             "mirrored segment must appear on the timeline exactly once (mirror shown, live row deduped)"
         );
     }
+
+    /// Once the engine-agnostic backfill has resolved a global `speaker_id` on the
+    /// covering audio (here pre-seeded), `backfill_meeting_segment_speakers` maps the
+    /// live segment onto it, and the Meeting view shows the global speaker's NAME
+    /// instead of Deepgram's free-text "speaker N".
+    #[tokio::test]
+    async fn test_meeting_segment_speaker_backfill_resolves_global_id() {
+        let db = setup_test_db().await;
+        let base = Utc::now();
+
+        // A named global speaker (as the embedding backfill would have created/named).
+        let speaker = db.create_speaker_with_name("Chris Ng").await.unwrap();
+
+        // The meeting's covering audio, already identified with that speaker.
+        let chunk_id = db
+            .insert_audio_chunk("meeting.mp4", Some(base))
+            .await
+            .unwrap();
+        db.insert_audio_transcription(
+            chunk_id,
+            "identified background line",
+            0,
+            "",
+            &AudioDevice {
+                name: "System Audio".to_string(),
+                device_type: DeviceType::Output,
+            },
+            Some(speaker.id),
+            None,
+            None,
+            Some(base),
+        )
+        .await
+        .unwrap();
+
+        // A live segment at the same time, still on Deepgram's free-text label.
+        let meeting_id = db
+            .insert_meeting("zoom.us", "ui_scan", None, None)
+            .await
+            .unwrap();
+        db.insert_meeting_transcript_segment(
+            meeting_id,
+            "screenpipe-cloud",
+            Some("nova-3"),
+            "deepgram:0:0",
+            "System Audio",
+            "output",
+            Some("speaker 1"),
+            "audience question",
+            base + Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+
+        let mapped = db
+            .backfill_meeting_segment_speakers(base - Duration::hours(1), 15.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            mapped, 1,
+            "the live segment should map to the global speaker"
+        );
+
+        let segs = db
+            .list_meeting_transcript_segments(meeting_id)
+            .await
+            .unwrap();
+        let live = segs
+            .iter()
+            .find(|s| s.source == "live")
+            .expect("live segment present");
+        assert_eq!(live.speaker_id, Some(speaker.id));
+        assert_eq!(
+            live.speaker_name.as_deref(),
+            Some("Chris Ng"),
+            "Meeting view shows the resolved global name, not the Deepgram label"
+        );
+    }
+
+    /// Until a segment is resolved, the Meeting view falls back to Deepgram's
+    /// free-text `speaker_name`, and the backfill maps nothing.
+    #[tokio::test]
+    async fn test_meeting_segment_falls_back_to_freetext_speaker() {
+        let db = setup_test_db().await;
+        let base = Utc::now();
+
+        let meeting_id = db
+            .insert_meeting("zoom.us", "ui_scan", None, None)
+            .await
+            .unwrap();
+        db.insert_meeting_transcript_segment(
+            meeting_id,
+            "screenpipe-cloud",
+            None,
+            "deepgram:0:0",
+            "System Audio",
+            "output",
+            Some("speaker 2"),
+            "unresolved line",
+            base,
+        )
+        .await
+        .unwrap();
+
+        // No identified audio → nothing to map.
+        let mapped = db
+            .backfill_meeting_segment_speakers(base - Duration::hours(1), 15.0)
+            .await
+            .unwrap();
+        assert_eq!(mapped, 0);
+
+        let segs = db
+            .list_meeting_transcript_segments(meeting_id)
+            .await
+            .unwrap();
+        let live = segs
+            .iter()
+            .find(|s| s.source == "live")
+            .expect("live segment present");
+        assert_eq!(live.speaker_id, None);
+        assert_eq!(
+            live.speaker_name.as_deref(),
+            Some("speaker 2"),
+            "falls back to the free-text Deepgram label when unresolved"
+        );
+    }
 }

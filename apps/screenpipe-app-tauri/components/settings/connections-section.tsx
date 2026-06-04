@@ -122,6 +122,29 @@ async function findCursorExeOnWindows(): Promise<string | null> {
   return null;
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    return await exists(path);
+  } catch {
+    return false;
+  }
+}
+
+async function macAppExists(...bundleNames: string[]): Promise<boolean> {
+  try {
+    const home = await homeDir();
+    const candidates: string[] = [];
+    for (const bundleName of bundleNames) {
+      candidates.push(`/Applications/${bundleName}.app`);
+      candidates.push(await join(home, "Applications", `${bundleName}.app`));
+    }
+    const matches = await Promise.all(candidates.map(pathExists));
+    return matches.some(Boolean);
+  } catch {
+    return false;
+  }
+}
+
 async function openWindowsShellTarget(target: string): Promise<void> {
   await commands.openWindowsShellTarget(target);
 }
@@ -136,6 +159,51 @@ import {
 } from "@/lib/hooks/use-hardcoded-tiles";
 
 type McpCommand = { command: string; args: string[]; env?: Record<string, string> };
+
+async function detectInstalledConnectionIds(): Promise<Set<string>> {
+  const detected = new Set<string>();
+  const os = typeof window !== "undefined" ? platform() : "";
+  const addIf = async (id: string, probe: Promise<boolean>) => {
+    try {
+      if (await probe) detected.add(id);
+    } catch {
+      /* best-effort ranking hint only */
+    }
+  };
+
+  if (os === "macos") {
+    await Promise.all([
+      addIf("claude", macAppExists("Claude")),
+      addIf("cursor", macAppExists("Cursor")),
+      addIf("chatgpt", macAppExists("ChatGPT")),
+      addIf("warp", macAppExists("Warp")),
+      addIf("whatsapp", macAppExists("WhatsApp")),
+      addIf("anythingllm", macAppExists("AnythingLLM")),
+      addIf("ollama", macAppExists("Ollama")),
+      addIf("lmstudio", macAppExists("LM Studio")),
+      addIf("msty", macAppExists("Msty", "Msty Studio")),
+      addIf("obsidian", macAppExists("Obsidian").then(async (app) => app || !!(await getObsidianConfigPath()))),
+      addIf("notion", macAppExists("Notion")),
+      addIf("linear", macAppExists("Linear")),
+      addIf("perplexity", macAppExists("Perplexity")),
+      addIf("krisp", macAppExists("Krisp")),
+      addIf("codex", getCodexConfigPath().then(pathExists)),
+      addIf("claude-code", getClaudeConfigPath().then(path => !!path && pathExists(path))),
+    ]);
+    return detected;
+  }
+
+  if (os === "windows") {
+    await Promise.all([
+      addIf("claude", findClaudeExeOnWindows().then(Boolean)),
+      addIf("cursor", findCursorExeOnWindows().then(Boolean)),
+      addIf("codex", getCodexConfigPath().then(pathExists)),
+      addIf("obsidian", getObsidianConfigPath().then(path => !!path && pathExists(path))),
+    ]);
+  }
+
+  return detected;
+}
 
 /**
  * MCP install config for screenpipe.
@@ -517,18 +585,18 @@ interface ConnectionTile {
   name: string;
   icon: string;
   connected: boolean;
+  detected?: boolean;
   category?: string;
 }
 
-type ConnectionSort = "default" | "alphabetical";
+type ConnectionSort = "suggested" | "alphabetical";
 
 const ALL_CONNECTION_CATEGORIES = "All";
 
-// Curated row shown above the search bar. Order is editorial — high-activation
-// AI surfaces first, then communication, then write-back knowledge tools. We
-// hide this row whenever the user is searching/filtering so the result set
-// stays the obvious answer to their query.
+// High-activation defaults fill the suggested row when there are not enough
+// detected or already-connected apps on the device.
 const FEATURED_CONNECTION_IDS = [
+  "custom-mcp",
   "claude",
   "cursor",
   "codex",
@@ -540,8 +608,33 @@ const FEATURED_CONNECTION_IDS = [
 ];
 
 const CONNECTION_SORT_OPTIONS: { value: ConnectionSort; label: string }[] = [
-  { value: "default", label: "Default" },
+  { value: "suggested", label: "Suggested" },
   { value: "alphabetical", label: "Alphabetical" },
+];
+
+const DEVICE_CONNECTION_ORDER = [
+  "custom-mcp",
+  "claude",
+  "cursor",
+  "codex",
+  "claude-code",
+  "chatgpt",
+  "browser-url",
+  "input-monitoring",
+  "obsidian",
+  "notion",
+  "linear",
+  "slack",
+  "gmail",
+  "google-calendar",
+  "google-docs",
+  "google-sheets",
+  "warp",
+  "ollama",
+  "lmstudio",
+  "msty",
+  "krisp",
+  "whatsapp",
 ];
 
 function normalizeConnectionCategory(category: string | null | undefined): string {
@@ -554,16 +647,38 @@ function normalizeConnectionCategory(category: string | null | undefined): strin
     .join(" ");
 }
 
+function connectionPriority(tile: ConnectionTile): number {
+  if (tile.connected) return 0;
+  if (tile.detected) return 1;
+  if (FEATURED_CONNECTION_IDS.includes(tile.id)) return 2;
+  return 3;
+}
+
+function connectionOrder(tile: ConnectionTile): number {
+  const index = DEVICE_CONNECTION_ORDER.indexOf(tile.id);
+  return index === -1 ? DEVICE_CONNECTION_ORDER.length : index;
+}
+
+function compareConnectionTiles(a: ConnectionTile, b: ConnectionTile): number {
+  const priority = connectionPriority(a) - connectionPriority(b);
+  if (priority !== 0) return priority;
+  const order = connectionOrder(a) - connectionOrder(b);
+  if (order !== 0) return order;
+  return a.name.localeCompare(b.name);
+}
+
 function Tile({ tile, selected, onClick }: {
   tile: ConnectionTile;
   selected: boolean;
   onClick: () => void;
 }) {
+  const status = tile.connected ? "connected" : tile.detected ? "detected" : "";
+
   return (
     <button
       onClick={onClick}
       className={`
-        relative flex flex-col items-center gap-1.5 p-3 rounded-xl border transition-all text-center
+        relative flex min-h-[92px] flex-col items-center justify-center gap-1.5 p-3 rounded-xl border transition-all text-center
         ${selected
           ? "border-foreground bg-accent"
           : "border-border bg-card hover:border-muted-foreground/50 hover:bg-accent/50"
@@ -575,7 +690,65 @@ function Tile({ tile, selected, onClick }: {
       )}
       <IntegrationIcon icon={tile.icon} />
       <span className="text-xs font-medium text-foreground leading-tight">{tile.name}</span>
+      <span className="h-3 text-[10px] leading-none text-muted-foreground">{status}</span>
     </button>
+  );
+}
+
+function McpSpotlight({
+  enabledCount,
+  totalCount,
+  selected,
+  onClick,
+}: {
+  enabledCount: number;
+  totalCount: number;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  const summary = totalCount === 0
+    ? "No servers yet"
+    : `${enabledCount}/${totalCount} enabled`;
+
+  return (
+    <div
+      className={`
+        rounded-xl border bg-card p-3 transition-colors
+        ${selected ? "border-foreground bg-accent" : "border-border"}
+      `}
+    >
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={onClick}
+          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+        >
+          <IntegrationIcon
+            icon="custom-mcp"
+            className="flex h-10 w-10 items-center justify-center rounded-lg bg-muted"
+          />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-medium text-foreground">MCP servers</h3>
+              {enabledCount > 0 && (
+                <span className="h-2 w-2 rounded-full bg-foreground" />
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">{summary}</p>
+          </div>
+        </button>
+        <Button
+          type="button"
+          size="sm"
+          variant={totalCount === 0 ? "default" : "outline"}
+          onClick={onClick}
+          className="h-8 gap-1.5 text-xs normal-case font-sans tracking-normal"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {totalCount === 0 ? "Add" : "Manage"}
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -2615,10 +2788,11 @@ export function ConnectionsSection({
 }: ConnectionsSectionProps = {}) {
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState(ALL_CONNECTION_CATEGORIES);
-  const [sortBy, setSortBy] = useState<ConnectionSort>("default");
+  const [sortBy, setSortBy] = useState<ConnectionSort>("suggested");
   const [selected, setSelected] = useState<string | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
   const [integrationsLoaded, setIntegrationsLoaded] = useState(false);
+  const [detectedConnectionIds, setDetectedConnectionIds] = useState<Set<string>>(() => new Set());
 
   const os = typeof window !== "undefined" ? platform() : "";
 
@@ -2638,7 +2812,7 @@ export function ConnectionsSection({
         : ALL_CONNECTION_CATEGORIES,
     );
     setSearch("");
-    setSortBy("default");
+    setSortBy("suggested");
     onFocusRequestConsumed?.();
   }, [focusCategory, focusConnectionId, focusRequestId, onFocusRequestConsumed]);
 
@@ -2647,16 +2821,22 @@ export function ConnectionsSection({
   const [cursorInstalled, setCursorInstalled] = useState(false);
   const [codexInstalled, setCodexInstalled] = useState(false);
   const [chatgptConnected, setChatgptConnected] = useState(false);
+  const [browserUrlDetected, setBrowserUrlDetected] = useState(false);
   const [browserUrlConnected, setBrowserUrlConnected] = useState(false);
   const [googleCalendarConnected, setGoogleCalendarConnected] = useState(false);
   const [googleDocsConnected, setGoogleDocsConnected] = useState(false);
   const [googleSheetsConnected, setGoogleSheetsConnected] = useState(false);
   const [gmailConnected, setGmailConnected] = useState(false);
   const [customMcpConnected, setCustomMcpConnected] = useState(false);
+  const [customMcpServerCount, setCustomMcpServerCount] = useState(0);
+  const [customMcpEnabledCount, setCustomMcpEnabledCount] = useState(0);
   const [krispConnected, setKrispConnected] = useState(false);
   const [inputMonitoringGranted, setInputMonitoringGranted] = useState(false);
 
   const refreshStatus = useCallback(() => {
+    detectInstalledConnectionIds()
+      .then(setDetectedConnectionIds)
+      .catch(() => setDetectedConnectionIds(new Set()));
     getInstalledMcpVersion().then(v => {
       const installed = !!v || localStorage.getItem("screenpipe_claude_connected") === "true";
       setClaudeInstalled(installed);
@@ -2681,18 +2861,36 @@ export function ConnectionsSection({
       setGmailConnected(res.status === "ok" && res.data.connected);
     }).catch(() => {});
     localFetch("/mcp-servers").then(async r => {
-      if (!r.ok) { setCustomMcpConnected(false); setKrispConnected(false); return; }
+      if (!r.ok) {
+        setCustomMcpConnected(false);
+        setCustomMcpServerCount(0);
+        setCustomMcpEnabledCount(0);
+        setKrispConnected(false);
+        return;
+      }
       const body = await r.json();
       const list = (body?.data ?? []) as { enabled: boolean; url?: string }[];
-      setCustomMcpConnected(list.some(s => s.enabled));
+      const enabled = list.filter(s => s.enabled);
+      setCustomMcpServerCount(list.length);
+      setCustomMcpEnabledCount(enabled.length);
+      setCustomMcpConnected(enabled.length > 0);
       setKrispConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === KRISP_MCP_URL));
-    }).catch(() => { setCustomMcpConnected(false); setKrispConnected(false); });
+    }).catch(() => {
+      setCustomMcpConnected(false);
+      setCustomMcpServerCount(0);
+      setCustomMcpEnabledCount(0);
+      setKrispConnected(false);
+    });
     if (typeof window !== "undefined" && platform() === "macos") {
       commands.getBrowsersAutomationStatus().then(statuses => {
+        setBrowserUrlDetected(statuses.length > 0);
         setBrowserUrlConnected(
           statuses.length > 0 && statuses.every(b => b.status === "granted")
         );
-      }).catch(() => setBrowserUrlConnected(false));
+      }).catch(() => {
+        setBrowserUrlDetected(false);
+        setBrowserUrlConnected(false);
+      });
       commands.checkInputMonitoringPermissionCmd()
         .then(r => setInputMonitoringGranted(r === "granted"))
         .catch(() => setInputMonitoringGranted(false));
@@ -2747,14 +2945,14 @@ export function ConnectionsSection({
   // Build unified tile list
   const allTiles: ConnectionTile[] = useMemo(() => {
     const hardcoded: ConnectionTile[] = [
-      { id: "claude", name: "Claude Desktop", icon: "claude", connected: claudeInstalled },
-      { id: "cursor", name: "Cursor", icon: "cursor", connected: cursorInstalled },
-      { id: "codex", name: "Codex", icon: "codex", connected: codexInstalled },
-      { id: "claude-code", name: "Claude Code", icon: "claude-code", connected: false },
-      { id: "warp", name: "Warp", icon: "warp", connected: false },
-      { id: "chatgpt", name: "ChatGPT", icon: "chatgpt", connected: chatgptConnected },
+      { id: "claude", name: "Claude Desktop", icon: "claude", connected: claudeInstalled, detected: detectedConnectionIds.has("claude") },
+      { id: "cursor", name: "Cursor", icon: "cursor", connected: cursorInstalled, detected: detectedConnectionIds.has("cursor") },
+      { id: "codex", name: "Codex", icon: "codex", connected: codexInstalled, detected: detectedConnectionIds.has("codex") },
+      { id: "claude-code", name: "Claude Code", icon: "claude-code", connected: false, detected: detectedConnectionIds.has("claude-code") },
+      { id: "warp", name: "Warp", icon: "warp", connected: false, detected: detectedConnectionIds.has("warp") },
+      { id: "chatgpt", name: "ChatGPT", icon: "chatgpt", connected: chatgptConnected, detected: detectedConnectionIds.has("chatgpt") },
       ...(os === "macos" ? [
-        { id: "browser-url", name: "Browser URL Capture", icon: "browser-url", connected: browserUrlConnected },
+        { id: "browser-url", name: "Browser URL Capture", icon: "browser-url", connected: browserUrlConnected, detected: browserUrlDetected },
         { id: "voice-memos", name: "Voice Memos", icon: "voice-memos", connected: false },
       ] : []),
       ...(os === "macos" ? [{ id: "apple-intelligence", name: "Apple Intelligence", icon: "apple-intelligence", connected: false }] : []),
@@ -2765,17 +2963,17 @@ export function ConnectionsSection({
       { id: "ics-calendar", name: "ICS Calendar", icon: "ics-calendar", connected: false },
       { id: "openclaw", name: "OpenClaw", icon: "openclaw", connected: false },
       { id: "hermes", name: "Hermes", icon: "hermes", connected: false },
-      { id: "whatsapp", name: "WhatsApp", icon: "whatsapp", connected: false },
-      { id: "anythingllm", name: "AnythingLLM", icon: "anythingllm", connected: false },
-      { id: "ollama", name: "Ollama", icon: "ollama", connected: false },
-      { id: "lmstudio", name: "LM Studio", icon: "lmstudio", connected: false },
-      { id: "msty", name: "Msty", icon: "msty", connected: false },
-      { id: "obsidian", name: "Obsidian", icon: "obsidian", connected: false },
-      { id: "notion", name: "Notion", icon: "notion", connected: false },
-      { id: "linear", name: "Linear", icon: "linear", connected: false },
-      { id: "perplexity", name: "Perplexity", icon: "perplexity", connected: false },
-      { id: "krisp", name: "Krisp", icon: "krisp", connected: krispConnected },
-      { id: "custom-mcp", name: "Custom MCP", icon: "custom-mcp", connected: false },
+      { id: "whatsapp", name: "WhatsApp", icon: "whatsapp", connected: false, detected: detectedConnectionIds.has("whatsapp") },
+      { id: "anythingllm", name: "AnythingLLM", icon: "anythingllm", connected: false, detected: detectedConnectionIds.has("anythingllm") },
+      { id: "ollama", name: "Ollama", icon: "ollama", connected: false, detected: detectedConnectionIds.has("ollama") },
+      { id: "lmstudio", name: "LM Studio", icon: "lmstudio", connected: false, detected: detectedConnectionIds.has("lmstudio") },
+      { id: "msty", name: "Msty", icon: "msty", connected: false, detected: detectedConnectionIds.has("msty") },
+      { id: "obsidian", name: "Obsidian", icon: "obsidian", connected: false, detected: detectedConnectionIds.has("obsidian") },
+      { id: "notion", name: "Notion", icon: "notion", connected: false, detected: detectedConnectionIds.has("notion") },
+      { id: "linear", name: "Linear", icon: "linear", connected: false, detected: detectedConnectionIds.has("linear") },
+      { id: "perplexity", name: "Perplexity", icon: "perplexity", connected: false, detected: detectedConnectionIds.has("perplexity") },
+      { id: "krisp", name: "Krisp", icon: "krisp", connected: krispConnected, detected: detectedConnectionIds.has("krisp") },
+      { id: "custom-mcp", name: "Custom MCP", icon: "custom-mcp", connected: false, detected: customMcpServerCount > 0 },
     ];
     // Merge API tiles, skipping duplicates already in hardcoded.
     // owned-default is hidden from settings — the agent drives it via the
@@ -2807,12 +3005,15 @@ export function ConnectionsSection({
     if (gmailTile) gmailTile.connected = gmailConnected;
     // Custom MCP tile shows the dot when any user-registered MCP server is enabled.
     const customMcpTile = hardcoded.find(h => h.id === "custom-mcp");
-    if (customMcpTile) customMcpTile.connected = customMcpConnected;
+    if (customMcpTile) {
+      customMcpTile.connected = customMcpConnected;
+      customMcpTile.detected = customMcpServerCount > 0;
+    }
     return [...hardcoded, ...apiTiles].map((tile) => ({
       ...tile,
       category: tile.category ?? CONNECTION_CATEGORY_BY_ID[tile.id] ?? "Other",
     }));
-  }, [os, claudeInstalled, cursorInstalled, codexInstalled, chatgptConnected, browserUrlConnected, integrations, googleCalendarConnected, googleDocsConnected, googleSheetsConnected, gmailConnected, customMcpConnected, krispConnected, inputMonitoringGranted]);
+  }, [os, claudeInstalled, cursorInstalled, codexInstalled, chatgptConnected, browserUrlConnected, browserUrlDetected, integrations, googleCalendarConnected, googleDocsConnected, googleSheetsConnected, gmailConnected, customMcpConnected, customMcpServerCount, krispConnected, inputMonitoringGranted, detectedConnectionIds]);
 
   const categoryOptions = useMemo(() => {
     const categories = Array.from(
@@ -2824,13 +3025,18 @@ export function ConnectionsSection({
   const isDefaultView =
     !search.trim() &&
     categoryFilter === ALL_CONNECTION_CATEGORIES &&
-    sortBy === "default";
+    sortBy === "suggested";
 
-  const featured = useMemo(() => {
+  const suggested = useMemo(() => {
     if (!isDefaultView) return [];
-    return FEATURED_CONNECTION_IDS
-      .map((id) => allTiles.find((t) => t.id === id))
-      .filter((t): t is ConnectionTile => !!t);
+    return [...allTiles]
+      .filter((tile) => (
+        tile.connected ||
+        tile.detected ||
+        FEATURED_CONNECTION_IDS.includes(tile.id)
+      ))
+      .sort(compareConnectionTiles)
+      .slice(0, 8);
   }, [allTiles, isDefaultView]);
 
   const filtered = useMemo(() => {
@@ -2845,14 +3051,15 @@ export function ConnectionsSection({
     if (sortBy === "alphabetical") {
       return [...tiles].sort((a, b) => a.name.localeCompare(b.name));
     }
-    // In default view, the featured row already surfaces these — drop them
+    tiles = [...tiles].sort(compareConnectionTiles);
+    // In default view, the suggested row already surfaces these — drop them
     // from the grid below to avoid duplication.
     if (isDefaultView) {
-      const featuredIds = new Set(FEATURED_CONNECTION_IDS);
-      tiles = tiles.filter((t) => !featuredIds.has(t.id));
+      const suggestedIds = new Set(suggested.map((tile) => tile.id));
+      tiles = tiles.filter((t) => !suggestedIds.has(t.id));
     }
     return tiles;
-  }, [allTiles, categoryFilter, search, sortBy, isDefaultView]);
+  }, [allTiles, categoryFilter, search, sortBy, isDefaultView, suggested]);
 
   const selectedIntegration = integrations.find(i => i.id === selected);
 
@@ -2960,12 +3167,19 @@ export function ConnectionsSection({
     <div className="space-y-5">
       <p className="text-muted-foreground text-sm mb-4">Give AI access to your memory, and connect to the apps you use every day</p>
 
-      {/* Featured — curated high-activation connections, default view only. */}
-      {featured.length > 0 && (
+      <McpSpotlight
+        enabledCount={customMcpEnabledCount}
+        totalCount={customMcpServerCount}
+        selected={selected === "custom-mcp"}
+        onClick={() => setSelected(selected === "custom-mcp" ? null : "custom-mcp")}
+      />
+
+      {/* Suggested — device-aware high-activation connections, default view only. */}
+      {suggested.length > 0 && (
         <div className="space-y-2">
-          <h3 className="text-xs font-medium text-muted-foreground">Featured</h3>
+          <h3 className="text-xs font-medium text-muted-foreground">Suggested for this device</h3>
           <div className="grid grid-cols-4 gap-2">
-            {featured.map((tile) => (
+            {suggested.map((tile) => (
               <Tile
                 key={tile.id}
                 tile={tile}

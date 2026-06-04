@@ -222,10 +222,8 @@ fn force_tray_rebuild(app: &AppHandle) -> Result<()> {
     let data = prefetch_tray_menu_data(app);
     let menu = create_dynamic_menu(app, &new_state, update_item.as_ref(), &data)?;
     if let Some(tray) = app.tray_by_id("screenpipe_main") {
-        if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
-            *guard = Some(menu.clone());
-        }
-        tray.set_menu(Some(menu))?;
+        install_tray_menu(&tray, menu)?;
+        clear_pending_tray_menu();
     }
     // Update last state so the poller doesn't immediately rebuild again
     {
@@ -277,23 +275,65 @@ fn get_effective_recording_status() -> RecordingStatus {
     real
 }
 
-/// Keep the most recent tray menu alive to prevent a use-after-free crash.
+/// Keep the active tray menu alive and defer macOS menu replacement safely.
 ///
-/// muda 0.17.1 stores raw `*const MenuChild` pointers as NSMenuItem instance
-/// variables (mod.rs:947 — there is even a FIXME about this). When
-/// `tray.set_menu(new_menu)` is called while the old menu is still displayed,
-/// the old `MenuChild` items are freed but their NSMenuItems survive (retained
-/// by the visible NSMenu). If the user clicks an item in the stale menu,
-/// `fire_menu_item_click` dereferences the freed pointer → use-after-free →
-/// reads garbage as an Icon with width=0 → `to_png()` panics with ZeroWidth
-/// inside an `extern "C"` callback → abort (catch_unwind can't help).
+/// muda's macOS backend stores raw `*const MenuChild` pointers as NSMenuItem
+/// instance variables. When `tray.set_menu(new_menu)` is called while the old
+/// menu is still displayed, the old `MenuChild` items can be freed while their
+/// NSMenuItems survive. Clicking an item in that stale menu makes
+/// `fire_menu_item_click` dereference freed memory inside an `extern "C"`
+/// callback, so catch_unwind cannot keep the process alive.
 ///
-/// Storing a clone of the `Menu<Wry>` keeps the `Arc<MenuInner>` alive, which
-/// keeps the inner `muda::Menu` `Rc` alive, which keeps the `MenuChild` items
-/// alive. On the next update (≥5 s), the old clone is replaced and dropped —
-/// by then the stale NSMenu is long gone.
-static PREVIOUS_TRAY_MENU: Lazy<Mutex<Option<tauri::menu::Menu<Wry>>>> =
+/// We avoid background `set_menu` on macOS. The poller caches the latest menu
+/// inputs, then the tray mouse-down handler installs that menu before AppKit
+/// opens the native menu.
+static ACTIVE_TRAY_MENU: Lazy<Mutex<Option<tauri::menu::Menu<Wry>>>> =
     Lazy::new(|| Mutex::new(None));
+
+static PENDING_TRAY_MENU: Lazy<Mutex<Option<(MenuState, TrayMenuData)>>> =
+    Lazy::new(|| Mutex::new(None));
+
+fn install_tray_menu(tray: &TrayIcon, menu: tauri::menu::Menu<Wry>) -> Result<()> {
+    {
+        let mut active = ACTIVE_TRAY_MENU.lock().unwrap_or_else(|e| e.into_inner());
+        *active = Some(menu.clone());
+    }
+    tray.set_menu(Some(menu))?;
+    Ok(())
+}
+
+fn clear_pending_tray_menu() {
+    let mut pending = PENDING_TRAY_MENU.lock().unwrap_or_else(|e| e.into_inner());
+    *pending = None;
+}
+
+#[cfg(target_os = "macos")]
+fn queue_pending_tray_menu(state: MenuState, data: TrayMenuData) {
+    let mut pending = PENDING_TRAY_MENU.lock().unwrap_or_else(|e| e.into_inner());
+    *pending = Some((state, data));
+}
+
+#[cfg(target_os = "macos")]
+fn apply_pending_tray_menu(app: &AppHandle) -> Result<()> {
+    let pending = {
+        let mut pending = PENDING_TRAY_MENU.lock().unwrap_or_else(|e| e.into_inner());
+        pending.take()
+    };
+
+    let Some((state, data)) = pending else {
+        return Ok(());
+    };
+
+    let update_item = UPDATE_MENU_ITEM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let menu = create_dynamic_menu(app, &state, update_item.as_ref(), &data)?;
+    if let Some(tray) = app.tray_by_id("screenpipe_main") {
+        install_tray_menu(&tray, menu)?;
+    }
+    Ok(())
+}
 
 #[derive(Default, PartialEq, Clone)]
 struct MenuState {
@@ -317,11 +357,8 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
         // Initial menu setup with empty state
         let data = prefetch_tray_menu_data(app);
         let menu = create_dynamic_menu(app, &MenuState::default(), update_item, &data)?;
-        // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
-        if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
-            *guard = Some(menu.clone());
-        }
-        main_tray.set_menu(Some(menu))?;
+        install_tray_menu(&main_tray, menu)?;
+        clear_pending_tray_menu();
 
         // Setup click handlers
         setup_tray_click_handlers(&main_tray)?;
@@ -432,11 +469,8 @@ pub fn recreate_tray(app: &AppHandle) {
                             update_item.as_ref(),
                             &data,
                         ) {
-                            // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
-                            if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
-                                *guard = Some(menu.clone());
-                            }
-                            let _ = new_tray.set_menu(Some(menu));
+                            let _ = install_tray_menu(&new_tray, menu);
+                            clear_pending_tray_menu();
                         }
                         // NOTE: do NOT re-register click handlers here.
                         // The handler from setup_tray() is keyed by tray ID and persists
@@ -788,6 +822,29 @@ fn setup_tray_click_handlers(main_tray: &TrayIcon) -> Result<()> {
             error!("panic in tray menu event handler: {:?}", e);
         }
     });
+
+    #[cfg(target_os = "macos")]
+    {
+        main_tray.on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button_state: tauri::tray::MouseButtonState::Down,
+                ..
+            } = event
+            {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let app = tray.app_handle().clone();
+                    if let Err(e) = apply_pending_tray_menu(&app) {
+                        error!("failed to refresh tray menu before open: {}", e);
+                    }
+                })) {
+                    error!(
+                        "panic caught while refreshing tray menu before open: {:?}",
+                        e
+                    );
+                }
+            }
+        });
+    }
 
     // Windows: left-click opens the app (like macOS dock click), right-click shows menu
     #[cfg(target_os = "windows")]
@@ -1291,6 +1348,9 @@ async fn update_menu_if_needed(
     app: &AppHandle,
     update_item: &tauri::menu::MenuItem<Wry>,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let _ = update_item;
+
     // Pre-fetch all data on the tokio thread (off main thread) so the
     // main-thread closure only does lightweight menu-item construction.
     let data = prefetch_tray_menu_data(app);
@@ -1349,40 +1409,48 @@ async fn update_menu_if_needed(
     });
 
     if should_update {
-        // IMPORTANT: All NSStatusItem/TrayIcon operations must happen on the main thread.
-        // If the TrayIcon is dropped on a tokio thread (e.g., after recreate_tray removed
-        // the old one from the manager), NSStatusBar _removeStatusItem fires on the wrong
-        // thread and crashes.
-        let app_for_thread = app.clone();
-        let update_item = update_item.clone();
-        let _ = app.run_on_main_thread(move || {
-            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(tray) = app_for_thread.tray_by_id("screenpipe_main") {
-                    debug!("tray_menu_update: setting menu");
-                    if let Ok(menu) =
-                        create_dynamic_menu(&app_for_thread, &new_state, Some(&update_item), &data)
-                    {
-                        // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
-                        if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
-                            *guard = Some(menu.clone());
+        #[cfg(target_os = "macos")]
+        {
+            queue_pending_tray_menu(new_state, data);
+            debug!("tray_menu_update: queued menu refresh for next open");
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // IMPORTANT: All NSStatusItem/TrayIcon operations must happen on the main thread.
+            // If the TrayIcon is dropped on a tokio thread (e.g., after recreate_tray removed
+            // the old one from the manager), NSStatusBar _removeStatusItem fires on the wrong
+            // thread and crashes.
+            let app_for_thread = app.clone();
+            let update_item = update_item.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(tray) = app_for_thread.tray_by_id("screenpipe_main") {
+                        debug!("tray_menu_update: setting menu");
+                        if let Ok(menu) = create_dynamic_menu(
+                            &app_for_thread,
+                            &new_state,
+                            Some(&update_item),
+                            &data,
+                        ) {
+                            let _ = install_tray_menu(&tray, menu);
                         }
-                        let _ = tray.set_menu(Some(menu));
                     }
+                })) {
+                    let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        format!("{:?}", e)
+                    };
+                    error!(
+                        "panic caught in tray menu update (ObjC exception?): {}",
+                        panic_msg
+                    );
                 }
-            })) {
-                let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    format!("{:?}", e)
-                };
-                error!(
-                    "panic caught in tray menu update (ObjC exception?): {}",
-                    panic_msg
-                );
-            }
-        });
+            });
+        }
     }
 
     Ok(())

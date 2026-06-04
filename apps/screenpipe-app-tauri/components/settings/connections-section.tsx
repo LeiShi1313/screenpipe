@@ -122,7 +122,8 @@ async function findCursorExeOnWindows(): Promise<string | null> {
   return null;
 }
 
-async function pathExists(path: string): Promise<boolean> {
+async function pathExists(path: string | null | undefined): Promise<boolean> {
+  if (!path) return false;
   try {
     return await exists(path);
   } catch {
@@ -130,16 +131,37 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+type PathCandidate = string | null | undefined | Promise<string | null | undefined>;
+
+async function anyPathExists(candidates: PathCandidate[]): Promise<boolean> {
+  const paths = (await Promise.all(candidates)).filter((path): path is string => !!path);
+  const matches = await Promise.all(paths.map(pathExists));
+  return matches.some(Boolean);
+}
+
+async function joinMaybe(base: string | null, ...parts: string[]): Promise<string | null> {
+  if (!base) return null;
+  return join(base, ...parts);
+}
+
 async function macAppExists(...bundleNames: string[]): Promise<boolean> {
   try {
     const home = await homeDir();
-    const candidates: string[] = [];
+    const candidates: PathCandidate[] = [];
     for (const bundleName of bundleNames) {
       candidates.push(`/Applications/${bundleName}.app`);
       candidates.push(await join(home, "Applications", `${bundleName}.app`));
     }
-    const matches = await Promise.all(candidates.map(pathExists));
-    return matches.some(Boolean);
+    return anyPathExists(candidates);
+  } catch {
+    return false;
+  }
+}
+
+async function dotfileExists(...names: string[]): Promise<boolean> {
+  try {
+    const home = await homeDir();
+    return anyPathExists(names.map((name) => join(home, name)));
   } catch {
     return false;
   }
@@ -171,6 +193,8 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
     }
   };
 
+  const hasClaudeCode = dotfileExists(".claude", ".claude.json");
+
   if (os === "macos") {
     await Promise.all([
       addIf("claude", macAppExists("Claude")),
@@ -188,18 +212,163 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
       addIf("perplexity", macAppExists("Perplexity")),
       addIf("krisp", macAppExists("Krisp")),
       addIf("codex", getCodexConfigPath().then(pathExists)),
-      addIf("claude-code", getClaudeConfigPath().then(path => !!path && pathExists(path))),
+      addIf("claude-code", hasClaudeCode),
     ]);
     return detected;
   }
 
   if (os === "windows") {
+    const home = await homeDir().catch(() => null);
+    const localAppData = home ? await join(home, "AppData", "Local").catch(() => null) : null;
+    const roamingAppData = home ? await join(home, "AppData", "Roaming").catch(() => null) : null;
+    const programDirs = ["C:\\Program Files", "C:\\Program Files (x86)"];
+    const local = (...parts: string[]) => joinMaybe(localAppData, ...parts);
+    const roaming = (...parts: string[]) => joinMaybe(roamingAppData, ...parts);
+    const program = (...parts: string[]) => programDirs.map((base) => join(base, ...parts));
+    const windowsApps = (...exeNames: string[]) => exeNames.map((exe) => local("Microsoft", "WindowsApps", exe));
+
     await Promise.all([
       addIf("claude", findClaudeExeOnWindows().then(Boolean)),
       addIf("cursor", findCursorExeOnWindows().then(Boolean)),
+      addIf("chatgpt", anyPathExists([
+        local("Programs", "ChatGPT", "ChatGPT.exe"),
+        local("OpenAI", "ChatGPT", "ChatGPT.exe"),
+        ...windowsApps("ChatGPT.exe"),
+      ])),
+      addIf("warp", anyPathExists([
+        local("Programs", "Warp", "Warp.exe"),
+        ...program("Warp", "Warp.exe"),
+        ...windowsApps("Warp.exe"),
+      ])),
+      addIf("whatsapp", anyPathExists([
+        local("WhatsApp", "WhatsApp.exe"),
+        local("Programs", "WhatsApp", "WhatsApp.exe"),
+        ...windowsApps("WhatsApp.exe"),
+      ])),
+      addIf("anythingllm", anyPathExists([
+        local("Programs", "AnythingLLM", "AnythingLLM.exe"),
+        ...program("AnythingLLM", "AnythingLLM.exe"),
+      ])),
+      addIf("ollama", anyPathExists([
+        local("Programs", "Ollama", "ollama.exe"),
+        local("Programs", "Ollama", "Ollama.exe"),
+        ...program("Ollama", "ollama.exe"),
+      ])),
+      addIf("lmstudio", anyPathExists([
+        local("Programs", "LM Studio", "LM Studio.exe"),
+        ...program("LM Studio", "LM Studio.exe"),
+      ])),
+      addIf("msty", anyPathExists([
+        local("Programs", "Msty", "Msty.exe"),
+        local("Programs", "Msty Studio", "Msty Studio.exe"),
+        ...program("Msty", "Msty.exe"),
+        ...program("Msty Studio", "Msty Studio.exe"),
+      ])),
+      addIf("notion", anyPathExists([
+        local("Programs", "Notion", "Notion.exe"),
+        roaming("Notion", "notion.db"),
+      ])),
+      addIf("linear", anyPathExists([
+        local("Programs", "Linear", "Linear.exe"),
+        roaming("Linear", "config.json"),
+      ])),
+      addIf("perplexity", anyPathExists([
+        local("Programs", "Perplexity", "Perplexity.exe"),
+        ...windowsApps("Perplexity.exe"),
+      ])),
+      addIf("krisp", anyPathExists([
+        local("Programs", "Krisp", "Krisp.exe"),
+        ...program("Krisp", "Krisp.exe"),
+      ])),
       addIf("codex", getCodexConfigPath().then(pathExists)),
       addIf("obsidian", getObsidianConfigPath().then(path => !!path && pathExists(path))),
+      addIf("claude-code", hasClaudeCode),
     ]);
+    return detected;
+  }
+
+  if (os === "linux") {
+    const home = await homeDir().catch(() => null);
+    const homeConfig = (...parts: string[]) => joinMaybe(home, ".config", ...parts);
+    const localShareApp = (name: string) => joinMaybe(home, ".local", "share", "applications", name);
+    const localBin = (name: string) => joinMaybe(home, ".local", "bin", name);
+    const desktop = (...names: string[]) => names.flatMap((name) => [
+      localShareApp(name),
+      `/usr/share/applications/${name}`,
+      `/var/lib/flatpak/exports/share/applications/${name}`,
+    ]);
+    const bin = (...names: string[]) => names.flatMap((name) => [
+      localBin(name),
+      `/usr/local/bin/${name}`,
+      `/usr/bin/${name}`,
+      `/snap/bin/${name}`,
+    ]);
+
+    await Promise.all([
+      addIf("claude", anyPathExists([
+        homeConfig("Claude"),
+        ...desktop("claude.desktop", "claude-desktop.desktop", "com.anthropic.Claude.desktop"),
+      ])),
+      addIf("cursor", anyPathExists([
+        homeConfig("Cursor"),
+        ...desktop("cursor.desktop", "Cursor.desktop", "cursor-cursor.desktop"),
+        ...bin("cursor"),
+      ])),
+      addIf("chatgpt", anyPathExists([
+        homeConfig("ChatGPT"),
+        ...desktop("chatgpt.desktop", "com.openai.ChatGPT.desktop"),
+      ])),
+      addIf("warp", anyPathExists([
+        homeConfig("warp-terminal"),
+        ...desktop("dev.warp.Warp.desktop", "warp-terminal.desktop", "warp.desktop"),
+        ...bin("warp-terminal", "warp"),
+      ])),
+      addIf("whatsapp", anyPathExists([
+        homeConfig("WhatsApp"),
+        ...desktop("whatsapp.desktop", "io.github.mimbrero.WhatsAppDesktop.desktop"),
+      ])),
+      addIf("anythingllm", anyPathExists([
+        homeConfig("AnythingLLM"),
+        ...desktop("anythingllm.desktop", "AnythingLLM.desktop"),
+      ])),
+      addIf("ollama", anyPathExists([
+        home ? join(home, ".ollama") : null,
+        ...desktop("ollama.desktop", "Ollama.desktop"),
+        ...bin("ollama"),
+      ])),
+      addIf("lmstudio", anyPathExists([
+        homeConfig("LM Studio"),
+        ...desktop("lm-studio.desktop", "LM Studio.desktop", "lmstudio.desktop"),
+      ])),
+      addIf("msty", anyPathExists([
+        homeConfig("Msty"),
+        homeConfig("Msty Studio"),
+        ...desktop("msty.desktop", "Msty.desktop", "msty-studio.desktop"),
+      ])),
+      addIf("obsidian", anyPathExists([
+        getObsidianConfigPath(),
+        ...desktop("obsidian.desktop", "md.obsidian.Obsidian.desktop"),
+      ])),
+      addIf("notion", anyPathExists([
+        homeConfig("Notion"),
+        ...desktop("notion.desktop", "notion-app.desktop"),
+      ])),
+      addIf("linear", anyPathExists([
+        homeConfig("Linear"),
+        ...desktop("linear.desktop", "Linear.desktop"),
+      ])),
+      addIf("perplexity", anyPathExists([
+        homeConfig("Perplexity"),
+        ...desktop("perplexity.desktop", "Perplexity.desktop"),
+      ])),
+      addIf("krisp", anyPathExists([
+        homeConfig("Krisp"),
+        ...desktop("krisp.desktop", "Krisp.desktop"),
+      ])),
+      addIf("codex", getCodexConfigPath().then(pathExists)),
+      addIf("claude-code", hasClaudeCode),
+    ]);
+    return detected;
   }
 
   return detected;

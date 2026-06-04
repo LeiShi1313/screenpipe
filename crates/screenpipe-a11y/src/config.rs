@@ -24,7 +24,8 @@ pub struct UiCaptureConfig {
     /// Capture aggregated text input
     pub capture_text: bool,
 
-    /// Capture individual keystrokes (privacy risk - disabled by default)
+    /// Emit individual key events. The engine decides whether those events
+    /// are persisted or used only as capture triggers.
     pub capture_keystrokes: bool,
 
     /// Capture app switches

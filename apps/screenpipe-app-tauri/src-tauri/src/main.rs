@@ -1079,6 +1079,16 @@ async fn main() {
                 store.recording.disable_audio = true;
                 info!("E2E seed: audio disabled");
             }
+            if e2e_flags.iter().any(|f| f == "event-trigger-capture") {
+                store.recording.capture_on_keystroke = Some(true);
+                store.recording.min_capture_interval_ms = Some(50);
+                store.recording.disable_keyboard_capture = true;
+                info!("E2E seed: event-trigger capture enabled with keyboard DB rows disabled");
+            }
+            if e2e_flags.iter().any(|f| f == "keyboard-db-capture") {
+                store.recording.disable_keyboard_capture = false;
+                info!("E2E seed: keyboard DB capture enabled");
+            }
             if e2e_flags.iter().any(|f| f == "cloud-audio-fallback") {
                 store.recording.disable_audio = false;
                 store.recording.disable_vision = true;

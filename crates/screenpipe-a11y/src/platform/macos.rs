@@ -903,21 +903,23 @@ extern "C" fn tap_callback(
 
             // Record key events for shortcuts
             if mods.any_modifier() {
-                let event = UiEvent {
-                    id: None,
-                    timestamp,
-                    relative_ms: t,
-                    data: EventData::Key {
-                        key_code: keycode,
-                        modifiers: mods.0,
-                    },
-                    app_name,
-                    window_title,
-                    browser_url: None,
-                    element: None,
-                    frame_id: None,
-                };
-                let _ = state.tx.try_send(event);
+                if state.config.capture_keystrokes {
+                    let event = UiEvent {
+                        id: None,
+                        timestamp,
+                        relative_ms: t,
+                        data: EventData::Key {
+                            key_code: keycode,
+                            modifiers: mods.0,
+                        },
+                        app_name,
+                        window_title,
+                        browser_url: None,
+                        element: None,
+                        frame_id: None,
+                    };
+                    let _ = state.tx.try_send(event);
+                }
             } else if state.config.capture_text {
                 // Aggregate into text buffer
                 if let Some(c) = keycode_to_char(keycode, mods) {
@@ -940,6 +942,22 @@ extern "C" fn tap_callback(
                     };
                     let _ = state.tx.try_send(event);
                 }
+            } else if state.config.capture_keystrokes {
+                let event = UiEvent {
+                    id: None,
+                    timestamp,
+                    relative_ms: t,
+                    data: EventData::Key {
+                        key_code: keycode,
+                        modifiers: mods.0,
+                    },
+                    app_name,
+                    window_title,
+                    browser_url: None,
+                    element: None,
+                    frame_id: None,
+                };
+                let _ = state.tx.try_send(event);
             }
         }
 

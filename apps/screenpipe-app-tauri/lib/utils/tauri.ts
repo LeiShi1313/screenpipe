@@ -2396,12 +2396,9 @@ hdRecordingDefault?: string;
  */
 hdRecordingIntervalMs?: number;
 /**
- * Override `EventDrivenCaptureConfig::capture_on_keystroke`.
- * None = engine default (false). When true, non-printable key events
- * (Arrow / Enter / Tab / Esc, modifier combos like Ctrl+S) fire a paired
- * capture so `ui_events.frame_id` is populated for the originating row.
- * Off by default — fast typing can generate a storm of captures even
- * with the 200ms `min_capture_interval_ms` debounce.
+ * Legacy key-trigger override retained for settings compatibility.
+ * Recording sessions keep keyboard-triggered capture on; raw key/text DB
+ * rows are controlled separately by `disableKeyboardCapture`.
  */
 captureOnKeystroke?: boolean | null;
 /**
@@ -2470,12 +2467,11 @@ pauseOnDrmContent?: boolean;
  */
 disableClipboardCapture?: boolean;
 /**
- * Skip keyboard / typed-text capture in the UI recorder
- * (`UiCaptureConfig::capture_text`). Defaults to `true` (keyboard
- * capture OFF) — the raw keystroke stream is the highest-risk,
- * most-redundant signal (secrets get typed), and the accessibility
- * tree + OCR still capture on-screen text so Rewind/Ask keep working.
- * Opt-in via the "Capture keyboard" toggle.
+ * Skip persisting keyboard / typed-text rows in the UI recorder.
+ * Defaults to `true` (keyboard DB capture OFF). Keyboard events still
+ * wake event-driven capture, and the accessibility tree + OCR still
+ * capture on-screen text so Rewind/Ask keep working.
+ * Opt in to keyboard DB rows via the "Capture keyboard" toggle.
  */
 disableKeyboardCapture?: boolean;
 /**

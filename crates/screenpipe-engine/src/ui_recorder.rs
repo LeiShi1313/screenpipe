@@ -119,6 +119,10 @@ pub struct UiRecorderConfig {
     pub tree_walk_interval_ms: u64,
     /// Record input events to DB (false = still capture for wake signal but don't write)
     pub record_input_events: bool,
+    /// Persist keyboard-derived rows (`text` / `key`) to DB. When false,
+    /// keyboard events can still wake event-driven capture, but private input
+    /// payloads are not written.
+    pub record_keyboard_events: bool,
     /// Prioritize input latency over event metadata completeness.
     /// Maps to `UiCaptureConfig.prioritize_input_latency`. See that field for details.
     pub prioritize_input_latency: bool,
@@ -155,6 +159,7 @@ impl Default for UiRecorderConfig {
             enable_tree_walker: true,
             tree_walk_interval_ms: 3000,
             record_input_events: true,
+            record_keyboard_events: true,
             prioritize_input_latency: false,
             extraction_thread_priority: ExtractionThreadPriority::BelowNormal,
             pause_extraction_on_input_ms: 150,
@@ -506,6 +511,7 @@ pub async fn start_ui_recording(
     let batch_size = config.batch_size;
     let batch_timeout = Duration::from_millis(config.batch_timeout_ms);
     let record_input_events = config.record_input_events;
+    let record_keyboard_events = config.record_keyboard_events;
     let trigger_gates = TriggerGates {
         capture_on_keystroke: config.capture_on_keystroke,
         capture_on_clipboard: config.capture_on_clipboard,
@@ -562,6 +568,21 @@ pub async fn start_ui_recording(
             match handle.recv_timeout(Duration::from_millis(100)) {
                 Some(event) => {
                     let db_event = event.to_db_insert(Some(session_id.clone()));
+                    let app_lower = db_event
+                        .app_name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    let title_lower = db_event
+                        .window_title
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    let is_ignored =
+                        window_pattern::matches_any(&ignored_patterns, &app_lower, &title_lower);
+                    let should_record_event = record_input_events
+                        && !is_ignored
+                        && should_record_input_event(&db_event, record_keyboard_events);
 
                     // Decide whether this event warrants a capture and, if so,
                     // mint a correlation id that travels with the trigger AND
@@ -590,7 +611,8 @@ pub async fn start_ui_recording(
                         .as_ref()
                         .map(|tx| tx.receiver_count() > 0)
                         .unwrap_or(false);
-                    let want_corr_id = (trigger_kind.is_some() || is_scroll)
+                    let want_corr_id = should_record_event
+                        && (trigger_kind.is_some() || is_scroll)
                         && has_trigger_receivers
                         && linker_tx.is_some();
                     let mut correlation_id = if want_corr_id {
@@ -603,43 +625,25 @@ pub async fn start_ui_recording(
                         if let Some(corr_id) = correlation_id {
                             scroll_burst.record(corr_id);
                         }
-                    } else if let (Some(ref trigger_tx), Some(trigger), Some(corr_id)) =
-                        (&capture_trigger_tx, trigger_kind, correlation_id)
+                    } else if let (Some(ref trigger_tx), Some(trigger)) =
+                        (&capture_trigger_tx, trigger_kind)
                     {
                         use crate::event_driven_capture::CaptureTriggerMsg;
                         // If `send` returns Err the broadcast lost its
                         // receivers between the count check above and now —
                         // blank the corr_id so the batch flush doesn't
                         // notify the linker about a doomed event.
-                        if trigger_tx
-                            .send(CaptureTriggerMsg::with_correlation(trigger, corr_id))
-                            .is_err()
-                        {
+                        let msg = match correlation_id {
+                            Some(corr_id) => CaptureTriggerMsg::with_correlation(trigger, corr_id),
+                            None => CaptureTriggerMsg::new(trigger),
+                        };
+                        if trigger_tx.send(msg).is_err() {
                             correlation_id = None;
                         }
                     }
 
-                    if record_input_events {
-                        // Don't store input events from ignored windows/apps.
-                        // Supports both legacy and scoped `App::Title` patterns.
-                        let app_lower = db_event
-                            .app_name
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_lowercase();
-                        let title_lower = db_event
-                            .window_title
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_lowercase();
-                        let is_ignored = window_pattern::matches_any(
-                            &ignored_patterns,
-                            &app_lower,
-                            &title_lower,
-                        );
-                        if !is_ignored {
-                            batch.push(db_event, correlation_id);
-                        }
+                    if should_record_event {
+                        batch.push(db_event, correlation_id);
                     }
 
                     // Flush if batch is full
@@ -760,6 +764,14 @@ pub async fn start_ui_recording(
 // Dead code below removed: TreeWalkerMetrics, run_tree_walker, constants.
 // Tree walker is disabled — paired_capture.rs handles accessibility capture.
 // Keeping this comment as a tombstone for git blame.
+
+fn should_record_input_event(db_event: &InsertUiEvent, record_keyboard_events: bool) -> bool {
+    record_keyboard_events
+        || !matches!(
+            db_event.event_type,
+            screenpipe_db::UiEventType::Key | screenpipe_db::UiEventType::Text
+        )
+}
 
 async fn flush_batch(
     db: &Arc<DatabaseManager>,
@@ -1075,6 +1087,19 @@ mod capture_trigger_kind_tests {
     fn key_event_fires_when_keystroke_gate_on() {
         let result = capture_trigger_kind(&evt(UiEventType::Key), &[], gates(true, true));
         assert!(matches!(result, Some(CaptureTrigger::KeyPress)));
+    }
+
+    #[test]
+    fn keyboard_rows_follow_record_keyboard_events_gate() {
+        assert!(!should_record_input_event(&evt(UiEventType::Key), false));
+        assert!(!should_record_input_event(&evt(UiEventType::Text), false));
+        assert!(should_record_input_event(&evt(UiEventType::Key), true));
+        assert!(should_record_input_event(&evt(UiEventType::Text), true));
+        assert!(should_record_input_event(
+            &evt(UiEventType::WindowFocus),
+            false
+        ));
+        assert!(should_record_input_event(&evt(UiEventType::Click), false));
     }
 
     #[test]

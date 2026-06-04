@@ -237,10 +237,8 @@ pub struct RecordingSettings {
 
     /// Override `EventDrivenCaptureConfig::capture_on_clipboard`.
     /// None = engine default (false). When true, clipboard changes fire a
-    /// paired capture so `ui_events.frame_id` is populated for the
-    /// clipboard row. Off by default — adds 50-150ms of blocking work per
-    /// Ctrl+C/X/V (more with OCR fallback) which can cause visible HID lag
-    /// on some USB devices.
+    /// paired capture. Clipboard DB rows are still controlled separately by
+    /// `disableClipboardCapture`.
     #[serde(rename = "captureOnClipboard", default)]
     pub capture_on_clipboard: Option<bool>,
 
@@ -300,10 +298,10 @@ pub struct RecordingSettings {
     #[serde(rename = "pauseOnDrmContent", default)]
     pub pause_on_drm_content: bool,
 
-    /// Skip clipboard capture in the UI recorder. Defaults to `true`
-    /// (clipboard capture OFF) — passwords / API keys / private keys
-    /// frequently pass through the clipboard, so it's opt-in via the
-    /// "Capture clipboard" toggle.
+    /// Skip persisting clipboard rows/content in the UI recorder. Defaults to
+    /// `true` (clipboard DB capture OFF) — passwords / API keys / private keys
+    /// frequently pass through the clipboard. Clipboard operations can still
+    /// wake event-driven capture when `captureOnClipboard` is enabled.
     #[serde(rename = "disableClipboardCapture", default = "default_true")]
     pub disable_clipboard_capture: bool,
 

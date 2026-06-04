@@ -88,18 +88,13 @@ pub struct UiRecorderConfig {
     pub capture_scroll: bool,
     /// Capture element context via accessibility
     pub capture_context: bool,
-    /// Mirror of `EventDrivenCaptureConfig::capture_on_keystroke`. The
-    /// recorder reads this to skip minting a correlation_id for `Key`
-    /// events when the gate is off — otherwise every keystroke would
-    /// stash a `pending_event` in the frame linker that can only ever
-    /// TTL-evict (the capture loop drops the trigger at the same gate).
-    /// Default false to match the capture-loop default.
+    /// Mirror of `EventDrivenCaptureConfig::capture_on_keystroke`. When on,
+    /// keyboard activity may send trigger-only capture messages even if
+    /// keyboard rows are not persisted.
     pub capture_on_keystroke: bool,
-    /// Mirror of `EventDrivenCaptureConfig::capture_on_clipboard`. Same
-    /// rationale as `capture_on_keystroke` — when the capture loop is
-    /// configured to skip Clipboard triggers, the recorder must also
-    /// skip minting the corr_id so the linker doesn't accumulate
-    /// pending_events that never pair.
+    /// Mirror of `EventDrivenCaptureConfig::capture_on_clipboard`. When on,
+    /// clipboard activity may send trigger-only capture messages even if
+    /// clipboard rows are not persisted.
     pub capture_on_clipboard: bool,
     /// Additional apps to exclude
     pub excluded_apps: Vec<String>,
@@ -123,6 +118,10 @@ pub struct UiRecorderConfig {
     /// keyboard events can still wake event-driven capture, but private input
     /// payloads are not written.
     pub record_keyboard_events: bool,
+    /// Persist clipboard rows to DB. When false, clipboard operations can
+    /// still wake event-driven capture, but clipboard payloads/operation rows
+    /// are not written.
+    pub record_clipboard_events: bool,
     /// Prioritize input latency over event metadata completeness.
     /// Maps to `UiCaptureConfig.prioritize_input_latency`. See that field for details.
     pub prioritize_input_latency: bool,
@@ -160,6 +159,7 @@ impl Default for UiRecorderConfig {
             tree_walk_interval_ms: 3000,
             record_input_events: true,
             record_keyboard_events: true,
+            record_clipboard_events: true,
             prioritize_input_latency: false,
             extraction_thread_priority: ExtractionThreadPriority::BelowNormal,
             pause_extraction_on_input_ms: 150,
@@ -512,6 +512,7 @@ pub async fn start_ui_recording(
     let batch_timeout = Duration::from_millis(config.batch_timeout_ms);
     let record_input_events = config.record_input_events;
     let record_keyboard_events = config.record_keyboard_events;
+    let record_clipboard_events = config.record_clipboard_events;
     let trigger_gates = TriggerGates {
         capture_on_keystroke: config.capture_on_keystroke,
         capture_on_clipboard: config.capture_on_clipboard,
@@ -582,7 +583,11 @@ pub async fn start_ui_recording(
                         window_pattern::matches_any(&ignored_patterns, &app_lower, &title_lower);
                     let should_record_event = record_input_events
                         && !is_ignored
-                        && should_record_input_event(&db_event, record_keyboard_events);
+                        && should_record_input_event(
+                            &db_event,
+                            record_keyboard_events,
+                            record_clipboard_events,
+                        );
 
                     // Decide whether this event warrants a capture and, if so,
                     // mint a correlation id that travels with the trigger AND
@@ -765,12 +770,18 @@ pub async fn start_ui_recording(
 // Tree walker is disabled — paired_capture.rs handles accessibility capture.
 // Keeping this comment as a tombstone for git blame.
 
-fn should_record_input_event(db_event: &InsertUiEvent, record_keyboard_events: bool) -> bool {
-    record_keyboard_events
-        || !matches!(
-            db_event.event_type,
-            screenpipe_db::UiEventType::Key | screenpipe_db::UiEventType::Text
-        )
+fn should_record_input_event(
+    db_event: &InsertUiEvent,
+    record_keyboard_events: bool,
+    record_clipboard_events: bool,
+) -> bool {
+    match db_event.event_type {
+        screenpipe_db::UiEventType::Key | screenpipe_db::UiEventType::Text => {
+            record_keyboard_events
+        }
+        screenpipe_db::UiEventType::Clipboard => record_clipboard_events,
+        _ => true,
+    }
 }
 
 async fn flush_batch(
@@ -885,10 +896,9 @@ fn capture_trigger_kind(
             }
         }
         screenpipe_db::UiEventType::Click => Some(CaptureTrigger::Click),
-        // Clipboard rows are always written to the DB when clipboard
-        // capture is enabled. The frame linkage is gated separately:
-        // when `capture_on_clipboard` is off the capture loop drops the
-        // trigger, so we skip minting a corr_id here too.
+        // Clipboard operations can be trigger-only when DB persistence is
+        // disabled. The capture-loop gate is still separate: when
+        // `capture_on_clipboard` is off we skip the trigger entirely.
         screenpipe_db::UiEventType::Clipboard if gates.capture_on_clipboard => {
             Some(CaptureTrigger::Clipboard)
         }
@@ -1090,16 +1100,47 @@ mod capture_trigger_kind_tests {
     }
 
     #[test]
-    fn keyboard_rows_follow_record_keyboard_events_gate() {
-        assert!(!should_record_input_event(&evt(UiEventType::Key), false));
-        assert!(!should_record_input_event(&evt(UiEventType::Text), false));
-        assert!(should_record_input_event(&evt(UiEventType::Key), true));
-        assert!(should_record_input_event(&evt(UiEventType::Text), true));
-        assert!(should_record_input_event(
-            &evt(UiEventType::WindowFocus),
+    fn sensitive_rows_follow_recording_gates() {
+        assert!(!should_record_input_event(
+            &evt(UiEventType::Key),
+            false,
+            true
+        ));
+        assert!(!should_record_input_event(
+            &evt(UiEventType::Text),
+            false,
+            true
+        ));
+        assert!(!should_record_input_event(
+            &evt(UiEventType::Clipboard),
+            true,
             false
         ));
-        assert!(should_record_input_event(&evt(UiEventType::Click), false));
+        assert!(should_record_input_event(
+            &evt(UiEventType::Key),
+            true,
+            false
+        ));
+        assert!(should_record_input_event(
+            &evt(UiEventType::Text),
+            true,
+            false
+        ));
+        assert!(should_record_input_event(
+            &evt(UiEventType::Clipboard),
+            false,
+            true
+        ));
+        assert!(should_record_input_event(
+            &evt(UiEventType::WindowFocus),
+            false,
+            false
+        ));
+        assert!(should_record_input_event(
+            &evt(UiEventType::Click),
+            false,
+            false
+        ));
     }
 
     #[test]

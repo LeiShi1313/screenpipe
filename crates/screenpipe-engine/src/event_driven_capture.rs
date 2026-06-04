@@ -223,12 +223,9 @@ pub struct EventDrivenCaptureConfig {
     pub capture_on_keystroke: bool,
     /// Whether to capture on clipboard changes. **Off by default**:
     /// taking a full paired capture (screenshot + tree walk + OCR) on
-    /// every Ctrl+C/X/V costs 250–800ms of blocking work and tends to
-    /// saturate the thread pool, causing visible input lag on USB HID
-    /// devices. The clipboard text is already stored in `ui_events`
-    /// via the input event batch — only the frame would be missing.
-    /// When this is false, Clipboard rows leave `frame_id` as NULL.
-    /// Flip to true to opt into linkage and accept the latency.
+    /// every Ctrl+C/X/V costs 250-800ms of blocking work and can cause
+    /// visible input lag on USB HID devices. Clipboard row persistence
+    /// is controlled separately by the UI recorder.
     pub capture_on_clipboard: bool,
     /// Interval (ms) between visual-change checks (screenshot + frame diff).
     /// Set to 0 to disable visual change detection.

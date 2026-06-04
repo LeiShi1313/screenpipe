@@ -84,10 +84,9 @@ pub struct RecordingConfig {
     pub ignore_incognito_windows: bool,
     /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
     pub pause_on_drm_content: bool,
-    /// Skip clipboard capture in the UI recorder (events + content). Useful
-    /// when piping ~/.screenpipe data into a remote LLM or shipping it off
-    /// the box — passwords / api keys / private keys frequently flow
-    /// through the clipboard.
+    /// Skip persisting clipboard rows/content in the UI recorder. Clipboard
+    /// operations can still wake event-driven capture when clipboard-triggered
+    /// capture is enabled.
     pub disable_clipboard_capture: bool,
     /// Skip persisting keyboard / typed-text rows in the UI recorder
     /// (`UiRecorderConfig::record_keyboard_events`). Keyboard events still
@@ -368,10 +367,10 @@ impl RecordingConfig {
 
     /// Build a `UiRecorderConfig` from this recording config.
     pub fn to_ui_recorder_config(&self) -> crate::ui_recorder::UiRecorderConfig {
-        // Keystroke-triggered capture stays on for recording sessions.
-        // Clipboard remains mirrored so the recorder doesn't mint
-        // correlation_ids for triggers the capture loop will drop.
         let defaults = crate::ui_recorder::UiRecorderConfig::default();
+        let capture_on_clipboard = self
+            .capture_on_clipboard
+            .unwrap_or(defaults.capture_on_clipboard);
         crate::ui_recorder::UiRecorderConfig {
             enabled: true,
             enable_tree_walker: true,
@@ -379,7 +378,7 @@ impl RecordingConfig {
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
-            capture_clipboard: !self.disable_clipboard_capture,
+            capture_clipboard: !self.disable_clipboard_capture || capture_on_clipboard,
             capture_clipboard_content: !self.disable_clipboard_capture,
             // Keyboard events always reach the recorder so they can wake
             // event-driven capture. Persisting text/key rows remains the
@@ -387,6 +386,7 @@ impl RecordingConfig {
             capture_text: !self.disable_keyboard_capture,
             capture_keystrokes: true,
             record_keyboard_events: !self.disable_keyboard_capture,
+            record_clipboard_events: !self.disable_clipboard_capture,
             // Event-driven capture relies on same-app title changes reaching
             // the trigger mapper. The lower-level a11y default keeps this off
             // for libraries, but recording sessions need it on.
@@ -397,9 +397,7 @@ impl RecordingConfig {
             extraction_thread_priority: self.extraction_thread_priority.parse().unwrap_or_default(),
             pause_extraction_on_input_ms: self.pause_extraction_on_input_ms,
             capture_on_keystroke: true,
-            capture_on_clipboard: self
-                .capture_on_clipboard
-                .unwrap_or(defaults.capture_on_clipboard),
+            capture_on_clipboard,
             capture_scroll: self.capture_scroll.unwrap_or(defaults.capture_scroll),
             ..defaults
         }
@@ -556,6 +554,7 @@ mod tests {
         assert!(!ui.capture_text);
         assert!(ui.capture_keystrokes);
         assert!(!ui.record_keyboard_events);
+        assert!(!ui.record_clipboard_events);
         assert!(ui.capture_window_focus);
         assert_eq!(ui.ignored_windows, settings.ignored_windows);
         assert_eq!(ui.excluded_windows, settings.ignored_windows);
@@ -569,6 +568,22 @@ mod tests {
             screenpipe_a11y::ExtractionThreadPriority::Lowest
         );
         assert_eq!(ui.pause_extraction_on_input_ms, 400);
+    }
+
+    #[test]
+    fn clipboard_trigger_can_run_without_clipboard_db_rows() {
+        let settings = screenpipe_config::RecordingSettings {
+            disable_clipboard_capture: true,
+            capture_on_clipboard: Some(true),
+            ..Default::default()
+        };
+
+        let ui = build(&settings).to_ui_recorder_config();
+
+        assert!(ui.capture_clipboard);
+        assert!(ui.capture_on_clipboard);
+        assert!(!ui.capture_clipboard_content);
+        assert!(!ui.record_clipboard_events);
     }
 
     #[test]

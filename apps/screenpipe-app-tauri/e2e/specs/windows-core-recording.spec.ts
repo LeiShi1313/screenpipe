@@ -261,6 +261,65 @@ $timer.Start()
   return spawnDetachedPowerShell(script);
 }
 
+function spawnWindowsClipboardProbe(marker: string): () => void {
+  const title = `${marker} clipboard window`;
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class ScreenpipeE2EForeground {
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+"@
+$form = New-Object System.Windows.Forms.Form
+$form.Text = ${psString(title)}
+$form.StartPosition = 'CenterScreen'
+$form.Width = 820
+$form.Height = 320
+$form.TopMost = $true
+$label = New-Object System.Windows.Forms.Label
+$label.Dock = 'Top'
+$label.Height = 110
+$label.Font = New-Object System.Drawing.Font('Arial', 22, [System.Drawing.FontStyle]::Bold)
+$label.TextAlign = 'MiddleCenter'
+$label.Text = ${psString(`${marker} waiting`)}
+$textbox = New-Object System.Windows.Forms.TextBox
+$textbox.Dock = 'Fill'
+$textbox.Multiline = $true
+$textbox.Font = New-Object System.Drawing.Font('Consolas', 18)
+$textbox.Text = ${psString(`${marker} clipboard payload`)}
+$form.Controls.Add($textbox)
+$form.Controls.Add($label)
+
+$script:step = -4
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 750
+$timer.Add_Tick({
+  [void][ScreenpipeE2EForeground]::SetForegroundWindow($form.Handle)
+  $form.Activate()
+  $textbox.Focus()
+  if ($script:step -lt 0) {
+    $label.Text = ${psString(`${marker} ready`)}
+  } elseif ($script:step -eq 0) {
+    $label.Text = ${psString(`${marker} copy`)}
+    $textbox.SelectAll()
+    [System.Windows.Forms.SendKeys]::SendWait('^c')
+  } else {
+    $timer.Stop()
+  }
+  $script:step += 1
+})
+$form.Show()
+$timer.Start()
+[System.Windows.Forms.Application]::Run($form)
+`;
+
+  return spawnDetachedPowerShell(script);
+}
+
 async function getHealth(port: number): Promise<HealthBody> {
   const res = await fetchJson(`http://127.0.0.1:${port}/health`);
   if (!res.ok || typeof res.body !== "object" || res.body == null) {
@@ -360,6 +419,7 @@ function framesDbWritten(health: HealthBody): number {
 async function waitForFrameWriteAfter(
   cfg: LocalApiConfig,
   beforeFrames: number,
+  label = "event trigger",
   timeoutMs = t(75_000),
 ): Promise<HealthBody> {
   let latestHealth = await getHealth(cfg.port);
@@ -372,7 +432,7 @@ async function waitForFrameWriteAfter(
     {
       timeout: timeoutMs,
       interval: 1_500,
-      timeoutMsg: "keystroke trigger did not produce a newly written frame",
+      timeoutMsg: `${label} did not produce a newly written frame`,
     },
   );
 
@@ -642,6 +702,32 @@ describe("Windows core recording pipeline", function () {
     );
 
     expect(keyRows.length).toBe(0);
+  });
+
+  it("uses clipboard operations as capture triggers without storing clipboard rows by default", async function () {
+    if (!canRunEventTriggerCapture || !cfg) this.skip();
+
+    const health = await tryWaitForFrameCapture(cfg, t(45_000));
+    if (health.frame_status !== "ok") this.skip();
+
+    const marker = `SCREENPIPE CLIPBOARD TRIGGER ${Date.now()}`;
+    const sinceIso = new Date(Date.now() - 1_000).toISOString();
+    cleanupMarkerWindow = spawnWindowsClipboardProbe(marker);
+    await browser.pause(t(1_500));
+    const beforeFrames = framesDbWritten(await getHealth(cfg.port));
+
+    const afterHealth = await waitForFrameWriteAfter(cfg, beforeFrames, "clipboard trigger");
+    expect(framesDbWritten(afterHealth)).toBeGreaterThan(beforeFrames);
+
+    await browser.pause(t(2_500));
+    const clipboardRows = (await inputRowsSince(cfg, sinceIso, marker)).filter(
+      (row) =>
+        row.event_type === "clipboard" &&
+        ((row.window_title ?? "").toLowerCase().includes(marker.toLowerCase()) ||
+          (row.text_content ?? "").toLowerCase().includes(marker.toLowerCase())),
+    );
+
+    expect(clipboardRows.length).toBe(0);
   });
 
   it("links opt-in raw key rows to captured frames", async function () {

@@ -18,7 +18,6 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { buildConversationHistoryPrompt, DEFAULT_MAX_CONTEXT_CHARS } from "@/lib/chat-context-budget";
 import { Loader2, Send, Square, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Calendar, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Sparkles, Plug, CornerDownRight } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { PipeContextBanner } from "@/components/chat/pipe-context-banner";
@@ -6043,11 +6042,34 @@ export function StandaloneChat({
     // was still in-flight, follow-ups routed here got the bare user
     // message, and any Pi state divergence in between manifested as
     // "chat suddenly forgot what we were talking about."
-    const queuedPrompt = buildConversationHistoryPrompt(
-      messages,
-      userMessage,
-      activePreset?.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
-    );
+    let queuedPrompt = userMessage;
+    if (messages.length > 0) {
+      const historyLines = messages
+        .slice(-40)
+        .map((m) => {
+          let text = m.content || "";
+          if (m.contentBlocks?.length) {
+            const blockTexts = m.contentBlocks
+              .map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              })
+              .filter(Boolean)
+              .join("\n");
+            if (blockTexts && !text) text = blockTexts;
+            else if (blockTexts) text += "\n" + blockTexts;
+          }
+          return `${m.role}: ${text}`;
+        })
+        .join("\n");
+      queuedPrompt = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
+    }
 
     // E2E test hook — capture queued prompts for context-loss assertions
     {
@@ -6399,11 +6421,32 @@ export function StandaloneChat({
       // `piSessionSyncedRef` is kept around because other code paths
       // (preset change, reauth, the conversation-load handler) still
       // toggle it for diagnostics, but it no longer gates injection.
-      const promptMessage = buildConversationHistoryPrompt(
-        messages,
-        userMessage,
-        activePreset?.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
-      );
+      let promptMessage = userMessage;
+      if (messages.length > 0) {
+        const historyLines = messages
+          .slice(-40)
+          .map(m => {
+            let text = m.content || "";
+            // Include contentBlocks info (tool calls, results) for richer context
+            if (m.contentBlocks?.length) {
+              const blockTexts = m.contentBlocks.map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              }).filter(Boolean).join("\n");
+              if (blockTexts && !text) text = blockTexts;
+              else if (blockTexts) text += "\n" + blockTexts;
+            }
+            return `${m.role}: ${text}`;
+          })
+          .join("\n");
+        promptMessage = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
+      }
       piSessionSyncedRef.current = true;
 
       // E2E test hook — write to __e2ePiPromptCaptures when the recorder is installed

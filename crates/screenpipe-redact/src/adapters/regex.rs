@@ -811,4 +811,100 @@ mod tests {
             "redact_one regressed: pii-free {free_ns:.0} ns, mixed {mixed_ns:.0} ns"
         );
     }
+
+    /// Deterministic fuzz: throw adversarial input (unicode, control chars,
+    /// ID-like garbage, huge strings) at `redact_one` and every validator
+    /// and assert the safety invariants. No external fuzzer needed; the
+    /// xorshift seed makes failures reproducible.
+    #[test]
+    fn fuzz_invariants_hold() {
+        use crate::adapters::national_id as nid;
+
+        // Tokens chosen to actually exercise the detectors + context paths
+        // and the UTF-8 boundary logic (multibyte, emoji, control chars).
+        let tok = [
+            "0", "1", "2", "5", "8", "9", "4", "a", "B", "X", "Z", "f", "-", " ", ":", ".", "/",
+            "\t", "\n", "sk-", "AKIA", "DE", "GB", "iban", "sin", "imei", "aadhaar", "cpf", "dni",
+            "routing", "swift", "ein", "é", "中", "🔒", "\u{0}", "@", "#", "*",
+        ];
+
+        let mut seed = 0xDEADBEEF_CAFEF00Du64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let validators: [fn(&str) -> bool; 14] = [
+            nid::luhn,
+            nid::iban,
+            nid::spain_dni,
+            nid::spain_nie,
+            nid::cpf,
+            nid::aadhaar,
+            nid::credit_card,
+            nid::isin,
+            nid::cusip,
+            nid::sedol,
+            nid::vin,
+            nid::us_npi,
+            nid::us_dea,
+            nid::netherlands_bsn,
+        ];
+
+        for i in 0..200_000u64 {
+            // Mostly short; occasionally a few-KB monster.
+            let len = if i % 5000 == 0 {
+                (rng() % 4000) as usize
+            } else {
+                (rng() % 40) as usize
+            };
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(tok[(rng() as usize) % tok.len()]);
+            }
+
+            // 1. redact_one must not panic and must return well-formed spans.
+            let out = redact_one(&s);
+            let mut prev_end = 0usize;
+            for sp in &out.spans {
+                assert!(sp.start <= sp.end, "span start>end on {s:?}");
+                assert!(sp.end <= s.len(), "span past end on {s:?}");
+                assert!(s.is_char_boundary(sp.start), "start not on boundary: {s:?}");
+                assert!(s.is_char_boundary(sp.end), "end not on boundary: {s:?}");
+                assert_eq!(&s[sp.start..sp.end], sp.text, "span text mismatch");
+                assert!(sp.start >= prev_end, "spans overlap/unsorted on {s:?}");
+                prev_end = sp.end;
+            }
+
+            // 2. Determinism.
+            assert_eq!(
+                out.spans,
+                redact_one(&s).spans,
+                "non-deterministic on {s:?}"
+            );
+
+            // 3. Validators must never panic on arbitrary input (they are
+            //    normally fed regex matches, but defense in depth).
+            for v in validators {
+                let _ = v(&s);
+            }
+        }
+
+        // Explicit nasty edges.
+        for s in [
+            "",
+            "\u{0}",
+            "🔒🔒🔒",
+            &"9".repeat(100_000),
+            &"é".repeat(1000),
+            "sin imei aadhaar dni cpf",
+        ] {
+            let _ = redact_one(s);
+            for v in validators {
+                let _ = v(s);
+            }
+        }
+    }
 }

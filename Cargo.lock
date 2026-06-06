@@ -8470,6 +8470,7 @@ dependencies = [
 name = "screenpipe-redact"
 version = "0.4.7"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "base64 0.22.1",

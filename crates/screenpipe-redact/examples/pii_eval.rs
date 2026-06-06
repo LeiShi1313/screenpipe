@@ -234,6 +234,43 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
                 (0..58).map(|_| r.upper()).collect::<String>()
             )
         }
+        "github_fine_grained_pat" => {
+            format!(
+                "github_pat_{}",
+                (0..82).map(|_| r.hex()).collect::<String>()
+            )
+        }
+        "sentry_dsn" => format!(
+            "https://{}@o123456.ingest.us.sentry.io/4509",
+            (0..32).map(|_| r.hex()).collect::<String>()
+        ),
+        "atlassian_api_token" => {
+            format!("ATATT3{}", (0..180).map(|_| r.hex()).collect::<String>())
+        }
+        "hashicorp_vault_token" => {
+            format!("hvs.{}", (0..90).map(|_| r.hex()).collect::<String>())
+        }
+        "figma_pat" => format!("figd_{}", (0..40).map(|_| r.hex()).collect::<String>()),
+        "new_relic_api_key" => format!("NRAK-{}", (0..27).map(|_| r.upper()).collect::<String>()),
+        "razorpay_key" => format!("rzp_live_{}", (0..14).map(|_| r.hex()).collect::<String>()),
+        "planetscale_token" => {
+            format!(
+                "pscale_tkn_{}",
+                (0..32).map(|_| r.hex()).collect::<String>()
+            )
+        }
+        "supabase_token" => format!("sbp_{}", (0..40).map(|_| r.hex()).collect::<String>()),
+        "tailscale_authkey" => format!(
+            "tskey-auth-{}-{}",
+            (0..8).map(|_| r.hex()).collect::<String>(),
+            (0..24).map(|_| r.hex()).collect::<String>()
+        ),
+        "flutterwave_secret" => {
+            format!("FLWSECK-{}", (0..20).map(|_| r.hex()).collect::<String>())
+        }
+        "fly_io_token" => format!("fo1_{}", (0..43).map(|_| r.hex()).collect::<String>()),
+        "notion_token" => format!("ntn_{}", (0..43).map(|_| r.hex()).collect::<String>()),
+        "pulumi_token" => format!("pul-{}", (0..40).map(|_| r.hex()).collect::<String>()),
         "imsi" => r.digits(15),
         "us_passport" => format!("{}{}", r.upper(), r.digits(8)),
         "icd10" => {
@@ -529,6 +566,20 @@ const CASES: &[(&str, &str)] = &[
     ("square_oauth_token", ""),
     ("databricks_token", ""),
     ("age_secret_key", ""),
+    ("github_fine_grained_pat", ""),
+    ("sentry_dsn", ""),
+    ("atlassian_api_token", ""),
+    ("hashicorp_vault_token", ""),
+    ("figma_pat", ""),
+    ("new_relic_api_key", ""),
+    ("razorpay_key", ""),
+    ("planetscale_token", ""),
+    ("supabase_token", ""),
+    ("tailscale_authkey", ""),
+    ("flutterwave_secret", ""),
+    ("fly_io_token", ""),
+    ("notion_token", ""),
+    ("pulumi_token", ""),
     ("imsi", "IMSI"),
     ("us_passport", "passport"),
     ("icd10", "diagnosis"),

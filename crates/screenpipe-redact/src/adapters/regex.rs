@@ -1396,6 +1396,118 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &[],
             None,
         ),
+        // GitHub fine-grained PAT: github_pat_ + 82.
+        (
+            r"\bgithub_pat_[0-9A-Za-z_]{82}\b",
+            SpanLabel::Secret,
+            Some("github_fine_grained_pat"),
+            &[],
+            None,
+        ),
+        // Sentry DSN (carries the project key in the URL).
+        (
+            r"https://[0-9a-f]{32}(?::[0-9a-f]{32})?@[0-9a-z.-]*sentry\.io/[0-9]+",
+            SpanLabel::Secret,
+            Some("sentry_dsn"),
+            &[],
+            None,
+        ),
+        // Atlassian API token: ATATT3 + long base64-ish body.
+        (
+            r"\bATATT3[0-9A-Za-z_=.-]{150,220}\b",
+            SpanLabel::Secret,
+            Some("atlassian_api_token"),
+            &[],
+            None,
+        ),
+        // HashiCorp Vault service/batch token: hvs./hvb. + body.
+        (
+            r"\bhv[sb]\.[0-9A-Za-z_-]{24,}\b",
+            SpanLabel::Secret,
+            Some("hashicorp_vault_token"),
+            &[],
+            None,
+        ),
+        // Figma PAT: fig[dur]_ + body.
+        (
+            r"\bfig[dur]_[0-9A-Za-z_-]{40,}\b",
+            SpanLabel::Secret,
+            Some("figma_pat"),
+            &[],
+            None,
+        ),
+        // New Relic API key: NRAK- + 27.
+        (
+            r"\bNRAK-[A-Z0-9]{27}\b",
+            SpanLabel::Secret,
+            Some("new_relic_api_key"),
+            &[],
+            None,
+        ),
+        // Razorpay key id: rzp_(live|test)_ + body.
+        (
+            r"\brzp_(?:live|test)_[0-9A-Za-z]{14,}\b",
+            SpanLabel::Secret,
+            Some("razorpay_key"),
+            &[],
+            None,
+        ),
+        // PlanetScale token: pscale_(tkn|pw|oauth)_ + body.
+        (
+            r"\bpscale_(?:tkn|pw|oauth)_[0-9A-Za-z_=.-]{32,}\b",
+            SpanLabel::Secret,
+            Some("planetscale_token"),
+            &[],
+            None,
+        ),
+        // Supabase access token: sbp_ (optionally oauth_) + 40 hex.
+        (
+            r"\bsbp_(?:oauth_)?[0-9a-f]{40}\b",
+            SpanLabel::Secret,
+            Some("supabase_token"),
+            &[],
+            None,
+        ),
+        // Tailscale auth/client/api key: tskey-<kind>-<id>-<secret>.
+        (
+            r"\btskey-(?:auth|client|api)-[0-9A-Za-z]+-[0-9A-Za-z]{20,}\b",
+            SpanLabel::Secret,
+            Some("tailscale_authkey"),
+            &[],
+            None,
+        ),
+        // Flutterwave secret key: FLWSECK[-_] + body.
+        (
+            r"\bFLWSECK[_-][0-9A-Za-z_-]{12,}\b",
+            SpanLabel::Secret,
+            Some("flutterwave_secret"),
+            &[],
+            None,
+        ),
+        // Fly.io token: fo1_ + body.
+        (
+            r"\bfo1_[0-9A-Za-z_-]{40,}\b",
+            SpanLabel::Secret,
+            Some("fly_io_token"),
+            &[],
+            None,
+        ),
+        // Notion integration token: ntn_ + body.
+        (
+            r"\bntn_[0-9A-Za-z]{40,}\b",
+            SpanLabel::Secret,
+            Some("notion_token"),
+            &[],
+            None,
+        ),
+        // Pulumi access token: pul- + 40 hex.
+        (
+            r"\bpul-[0-9a-f]{40}\b",
+            SpanLabel::Secret,
+            Some("pulumi_token"),
+            &[],
+            None,
+        ),
         // IMSI — 15 digits, context-gated (shares the shape with IMEI).
         (r"\b\d{15}\b", SpanLabel::Id, Some("imsi"), &["imsi"], None),
         // US passport — 1 alnum + 8 digits, context-gated.
@@ -1552,8 +1664,13 @@ pub fn redact_one(text: &str) -> RedactionOutput {
             spans: Vec::new(),
         };
     }
-    // Restore PATTERNS order so overlap suppression keeps its priority.
-    cand.sort_unstable();
+    // Order candidates for overlap suppression. Secrets first, then by
+    // PATTERNS index. Processing secret patterns ahead of the rest means a
+    // credential never loses an overlap to a non-secret (e.g. a Sentry DSN
+    // whose key looks like the local part of an email): the non-secret would
+    // be filtered out under the default secrets-only policy and the secret
+    // would leak. Within each tier, the original PATTERNS priority holds.
+    cand.sort_unstable_by_key(|&i| (PATTERNS[i].label != SpanLabel::Secret, i));
 
     let mut spans: Vec<RedactedSpan> = Vec::new();
 
@@ -1769,6 +1886,80 @@ mod tests {
                 "false secret on {neg}"
             );
         }
+    }
+
+    #[test]
+    fn cloud_credentials_batch2_caught() {
+        let cases: [(String, &str); 14] = [
+            (
+                format!("github_pat_{}", "a".repeat(82)),
+                "github_fine_grained_pat",
+            ),
+            (
+                format!(
+                    "https://{}@o123456.ingest.us.sentry.io/4509",
+                    "a".repeat(32)
+                ),
+                "sentry_dsn",
+            ),
+            (format!("ATATT3{}", "a".repeat(180)), "atlassian_api_token"),
+            (format!("hvs.{}", "a".repeat(90)), "hashicorp_vault_token"),
+            (format!("figd_{}", "a".repeat(40)), "figma_pat"),
+            (format!("NRAK-{}", "A".repeat(27)), "new_relic_api_key"),
+            (format!("rzp_live_{}", "a".repeat(14)), "razorpay_key"),
+            (
+                format!("pscale_tkn_{}", "a".repeat(32)),
+                "planetscale_token",
+            ),
+            (format!("sbp_{}", "a".repeat(40)), "supabase_token"),
+            (
+                format!("tskey-auth-{}-{}", "a".repeat(8), "a".repeat(24)),
+                "tailscale_authkey",
+            ),
+            (format!("FLWSECK-{}", "a".repeat(20)), "flutterwave_secret"),
+            (format!("fo1_{}", "a".repeat(43)), "fly_io_token"),
+            (format!("ntn_{}", "a".repeat(43)), "notion_token"),
+            (format!("pul-{}", "a".repeat(40)), "pulumi_token"),
+        ];
+        for (tok, sub) in &cases {
+            let out = run(&format!("cred={tok} end"));
+            assert!(
+                out.spans
+                    .iter()
+                    .any(|s| s.label == SpanLabel::Secret && s.subtype.as_deref() == Some(*sub)),
+                "missed {sub} in {tok}"
+            );
+        }
+        for neg in [
+            format!("github_pat_{}", "a".repeat(20)),
+            format!("sbp_{}", "a".repeat(20)),
+            "ntn_short".to_string(),
+            format!("NRAK-{}", "A".repeat(10)),
+        ] {
+            let out = run(&format!("x {neg} y"));
+            assert!(
+                out.spans.iter().all(|s| s.label != SpanLabel::Secret),
+                "false secret on {neg}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_wins_overlap_over_email() {
+        // A Sentry DSN's key looks like an email local part. The Secret span
+        // must win the overlap, else under the default secrets-only policy
+        // the email span is dropped and the DSN leaks.
+        let dsn = format!("DSN https://{}@o1.ingest.sentry.io/42", "a".repeat(32));
+        let out = run(&dsn);
+        assert!(
+            out.spans
+                .iter()
+                .any(|s| s.label == SpanLabel::Secret && s.subtype.as_deref() == Some("sentry_dsn")),
+            "sentry_dsn must win the overlap: {:?}",
+            out.spans
+        );
+        // And it must be the ONLY span over that region (email suppressed).
+        assert!(out.spans.iter().all(|s| s.label != SpanLabel::Email));
     }
 
     #[test]

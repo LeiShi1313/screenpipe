@@ -1398,6 +1398,36 @@ pub enum PipeCommand {
         #[arg(required = true, num_args = 1..)]
         preset: Vec<String>,
     },
+    /// Optimize a pipe's prompt against a private eval set.
+    ///
+    /// Replays the current prompt over a sealed, synthetic (zero-PII) eval set,
+    /// scores it deterministically, then proposes improved variants and keeps
+    /// the best. The eval set is fetched from a private, owner-only store; the
+    /// optimization runs on a LOCAL model — nothing is sent to screenpipe cloud
+    /// for inference.
+    ///
+    /// PREVIEW: the eval backend (private fetch + local proposer loop) is not
+    /// wired yet. This prints the planned flow and output layout so you can see
+    /// the shape.
+    Optimize {
+        /// Pipe name
+        name: String,
+        /// Proposer rounds (greedy/beam iterations over the eval)
+        #[arg(long, default_value_t = 2)]
+        rounds: u32,
+        /// Candidate prompt variants generated per round
+        #[arg(long, default_value_t = 4)]
+        candidates: u32,
+        /// Pin a specific eval slice (default: auto-route by task type)
+        #[arg(long)]
+        eval: Option<String>,
+        /// Write the winning prompt back to pipe.md (frontmatter preserved, .bak kept)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Output as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

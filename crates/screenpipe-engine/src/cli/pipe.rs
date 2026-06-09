@@ -147,6 +147,24 @@ pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
         PipeCommand::SetPreset { name, preset } => {
             handle_set_preset_command(&manager, name, preset).await?;
         }
+        PipeCommand::Optimize {
+            name,
+            rounds,
+            candidates,
+            eval,
+            apply,
+            json,
+        } => {
+            handle_optimize_command(
+                &pipes_dir,
+                name,
+                *rounds,
+                *candidates,
+                eval.as_deref(),
+                *apply,
+                *json,
+            )?;
+        }
     }
 
     Ok(())
@@ -792,6 +810,160 @@ async fn handle_set_preset_command(
             preset_ids.join(" → ")
         );
     }
+    Ok(())
+}
+
+/// Optimize a pipe's prompt against a private eval set.
+///
+/// PREVIEW: the eval backend (private eval fetch + local proposer loop) is not
+/// wired yet. This resolves the pipe, shows its current prompt, the planned
+/// optimization config, and a clearly-labeled mock of the report so the UX is
+/// visible. No network calls, no model runs — everything below the "preview
+/// report" header is placeholder data illustrating the shape.
+///
+/// The wired flow (next PR): fetch a sealed, synthetic, owner-only eval slice
+/// from a private store → replay the current prompt → score deterministically →
+/// a LOCAL model proposes improved variants → keep the best → optional
+/// write-back. No AI ever runs in screenpipe cloud.
+#[allow(clippy::too_many_arguments)]
+fn handle_optimize_command(
+    pipes_dir: &std::path::Path,
+    name: &str,
+    rounds: u32,
+    candidates: u32,
+    eval: Option<&str>,
+    apply: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let pipe_md_path = pipes_dir.join(name).join("pipe.md");
+    if !pipe_md_path.exists() {
+        anyhow::bail!(
+            "pipe.md not found at {}\nhint: make sure the pipe '{}' exists in ~/.screenpipe/pipes/",
+            pipe_md_path.display(),
+            name
+        );
+    }
+
+    // Split frontmatter from the body — the body is the prompt we'd optimize.
+    let source_md = std::fs::read_to_string(&pipe_md_path)?;
+    let body = match screenpipe_core::pipes::parse_frontmatter(&source_md) {
+        Ok((_cfg, body)) => body,
+        Err(_) => source_md.clone(),
+    };
+    let prompt_lines = body.lines().count();
+    let prompt_chars = body.chars().count();
+    let eval_source = eval.unwrap_or("auto");
+
+    if json {
+        // The shape the real command will return once the eval fetch + local
+        // proposer land. Result fields are null in preview.
+        let out = json!({
+            "command": "optimize",
+            "preview": true,
+            "backend_wired": false,
+            "pipe": {
+                "name": name,
+                "path": pipe_md_path.to_string_lossy(),
+                "prompt_lines": prompt_lines,
+                "prompt_chars": prompt_chars,
+            },
+            "config": {
+                "rounds": rounds,
+                "candidates": candidates,
+                "eval": eval_source,
+                "apply": apply,
+            },
+            "report_schema": {
+                "baseline_score": null,
+                "winner": { "round": null, "candidate": null, "score": null, "delta": null },
+                "rounds": [],
+                "suggestions": [],
+                "per_case": [],
+                "diff": null,
+            },
+            "note": "eval backend not wired yet; the private eval set is fetched from an owner-only store and the prompt is optimized by a local model — no AI runs in screenpipe cloud.",
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("optimize: {}", name);
+    println!("the eval backend isn't wired yet — this is a preview of the flow and output.\n");
+
+    // Current prompt (real) — first lines of the pipe body.
+    println!("current prompt ({} lines, {} chars)", prompt_lines, prompt_chars);
+    println!("  source: {}", pipe_md_path.display());
+    for (i, line) in body.lines().take(6).enumerate() {
+        let shown: String = if line.chars().count() > 72 {
+            let mut t: String = line.chars().take(72).collect();
+            t.push('…');
+            t
+        } else {
+            line.to_string()
+        };
+        println!("  {} {}", if i == 0 { "┌" } else { "│" }, shown);
+    }
+    if prompt_lines > 6 {
+        println!("  └ … {} more line(s)", prompt_lines - 6);
+    } else {
+        println!("  └");
+    }
+    println!();
+
+    // Plan (reflects the flags the user passed).
+    println!("plan");
+    let route = if eval_source == "auto" {
+        "private holdout (owner-only)  [auto-route by task type]".to_string()
+    } else {
+        format!("private holdout (owner-only)  [eval slice: {}]", eval_source)
+    };
+    println!("  eval source:  {}", route);
+    println!("  rounds:       {}", rounds);
+    println!("  candidates:   {} per round", candidates);
+    println!("  scorer:       deterministic (contract, format, privacy, keyword) — runs local");
+    println!("  proposer:     local ai — no AI runs in screenpipe cloud");
+    if apply {
+        println!("  apply:        yes — winner written back to pipe.md (.bak kept)");
+    } else {
+        println!("  apply:        no (report only) — pass --apply to write the winner back");
+    }
+    println!();
+
+    // Mock report — placeholder numbers to show the layout only.
+    println!("── preview report ──────────────────────────────────────────────");
+    println!("the numbers below are placeholders to show the layout.\n");
+    println!("  baseline                       score 0.62   (12 cases)");
+    println!("  round 1  best candidate #3     score 0.74   ▲ +0.12   gate: pass");
+    println!("  round 2  best candidate #1     score 0.81   ▲ +0.07   gate: pass");
+    println!();
+    println!("  winner: round 2 / candidate #1   0.62 → 0.81  (+0.19)");
+    println!();
+    println!("  what changed (proposer rationale)");
+    println!("    - pin output to the exact section contract; drop free-form preamble");
+    println!("    - require a timestamp on every item (grounding +)");
+    println!("    - cap length; the verbose variant lost on the latency gate");
+    println!();
+    println!("  per-case movers");
+    println!("    case            baseline  →  winner");
+    println!("    sop_handoff       0.40        0.80   ▲");
+    println!("    meeting_recap     0.55        0.85   ▲");
+    println!("    idle_day          0.70        0.65   ▼  (regressed — review before apply)");
+    println!();
+    println!("  diff (pipe.md body)");
+    println!("    @@ prompt @@");
+    println!("    - Analyze my screen and audio recordings from today (last 16 hours only).");
+    println!("    + Analyze my screen and audio from today (last 16h). Output ONLY the");
+    println!("    +   sections below. Every item MUST carry a timestamp.");
+    println!();
+
+    if apply {
+        println!("--apply: nothing to write yet — the eval backend isn't wired, so there is");
+        println!("no winning prompt. once wired, this writes pipe.md and keeps a .bak.");
+    } else {
+        println!("next: run with --apply to write the winner back (a .bak is kept), or");
+        println!("      --json for the machine-readable report.");
+    }
+
     Ok(())
 }
 

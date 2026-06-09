@@ -3419,7 +3419,10 @@ impl DatabaseManager {
         // tag filter can never match them — short-circuit to empty. Screen
         // (OCR), audio, and memories all carry tags and are filtered below.
         if !tags.is_empty()
-            && matches!(content_type, ContentType::Input | ContentType::Accessibility)
+            && matches!(
+                content_type,
+                ContentType::Input | ContentType::Accessibility
+            )
         {
             return Ok(results);
         }
@@ -4662,7 +4665,10 @@ impl DatabaseManager {
         // table, so their tag-filtered count is zero. Memory is counted with
         // its own tag filter below.
         if !tags.is_empty()
-            && matches!(content_type, ContentType::Input | ContentType::Accessibility)
+            && matches!(
+                content_type,
+                ContentType::Input | ContentType::Accessibility
+            )
         {
             return Ok(0);
         }

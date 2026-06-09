@@ -155,13 +155,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.add_tags(
-            b,
-            TagContentType::Vision,
-            vec!["project:atlas".to_string()],
-        )
-        .await
-        .unwrap();
+        db.add_tags(b, TagContentType::Vision, vec!["project:atlas".to_string()])
+            .await
+            .unwrap();
 
         // Single tag → only the frame carrying it.
         let only_ada = run(&db, &["person:ada".to_string()]).await;
@@ -943,14 +939,40 @@ mod tests {
 
         // After inserting both audio transcriptions, let's check all audio entries
         let all_audio = db
-            .search_audio("", 100, 0, None, None, None, None, None, None, None, None, &[])
+            .search_audio(
+                "",
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .await
             .unwrap();
         println!("All audio entries: {:?}", all_audio);
 
         // Then try specific search
         let audio_results = db
-            .search_audio("2", 100, 0, None, None, None, None, None, None, None, None, &[])
+            .search_audio(
+                "2",
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .await
             .unwrap();
         println!("Audio results for '2': {:?}", audio_results);

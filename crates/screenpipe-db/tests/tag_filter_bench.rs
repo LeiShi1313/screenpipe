@@ -230,8 +230,25 @@ async fn bench_tag_filter_scaling() {
             // warm-up
             let _ = db
                 .search_with_tags(
-                    "", ct.clone(), 20, 0, None, None, None, None, None, None, None, None, None,
-                    None, None, None, None, None, &tags,
+                    "",
+                    ct.clone(),
+                    20,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &tags,
                 )
                 .await
                 .unwrap();
@@ -241,8 +258,25 @@ async fn bench_tag_filter_scaling() {
                 let t = Instant::now();
                 let r = db
                     .search_with_tags(
-                        "", ct.clone(), 20, 0, None, None, None, None, None, None, None, None,
-                        None, None, None, None, None, None, &tags,
+                        "",
+                        ct.clone(),
+                        20,
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &tags,
                     )
                     .await
                     .unwrap();
@@ -274,6 +308,9 @@ async fn bench_tag_filter_scaling() {
             )
             .await
             .unwrap();
-        println!("count  {label:<6} tags=person:ada -> total {total}, {:?}", t.elapsed());
+        println!(
+            "count  {label:<6} tags=person:ada -> total {total}, {:?}",
+            t.elapsed()
+        );
     }
 }

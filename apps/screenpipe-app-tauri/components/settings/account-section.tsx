@@ -218,14 +218,15 @@ export function AccountSection() {
 
   return (
     <div className="space-y-6">
-      {/* Header + login status */}
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-muted-foreground" data-testid="account-login-status">
+      {/* Header + login status. Wrap + truncate so the email never pushes the
+          manage/logout buttons off-screen in narrow/adaptive layouts (#3587). */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="min-w-0 truncate text-sm text-muted-foreground" data-testid="account-login-status">
           {settings.user?.token
             ? `logged in as ${settings.user.email}`
             : "not logged in"}
         </p>
-        <div className="flex gap-2">
+        <div className="flex shrink-0 gap-2">
           {settings.user?.token ? (
             <>
               <Button

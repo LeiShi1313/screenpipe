@@ -8,6 +8,7 @@ import React, {
   useEffect,
   useImperativeHandle,
   useRef,
+  useState,
 } from "react";
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -87,6 +88,11 @@ function NoteEditor(
   useEffect(() => {
     onChangeRef.current = onChange;
   }, [onChange]);
+
+  // Bumped on blur so the external-value sync re-runs once the user stops
+  // typing, letting updates we deferred while focused (AI summary, server
+  // merge) apply then instead of yanking the caret mid-edit.
+  const [syncTick, setSyncTick] = useState(0);
 
   const insertImages = useCallback(
     (dataUrls: string[], at?: { clientX: number; clientY: number }) => {
@@ -203,6 +209,11 @@ function NoteEditor(
       // changes don't always flag scrollIntoView, so nudge it ourselves.
       editor.commands.scrollIntoView();
     },
+    onBlur() {
+      // The user stopped editing; re-run the external-value sync (it is a no-op
+      // unless something genuinely changed while they were typing).
+      setSyncTick((tick) => tick + 1);
+    },
   });
 
   useEffect(() => {
@@ -213,8 +224,18 @@ function NoteEditor(
   }, [editor]);
 
   // Sync external value → editor without clobbering the user's caret.
+  //
+  // While the editor is focused we never re-parse. An incoming `value` is almost
+  // always an echo of what we just emitted, but its markdown round-trip can come
+  // back byte-different (autosave normalization, a server merge), and calling
+  // setContent then resets the caret/scroll mid-edit. That is the "cursor moving
+  // around" report (#3772). Anything that genuinely changes while the user is
+  // typing is applied on blur, when moving the caret can't interrupt them
+  // (onBlur bumps syncTick, re-running this effect with the latest value).
   useEffect(() => {
     if (!editor) return;
+    if (editor.isFocused) return;
+
     const current = getMarkdown(editor);
     if (value === current) return;
 
@@ -227,7 +248,7 @@ function NoteEditor(
     } else {
       editor.commands.focus("end");
     }
-  }, [value, editor]);
+  }, [value, editor, syncTick]);
 
   const handleShellClick = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {

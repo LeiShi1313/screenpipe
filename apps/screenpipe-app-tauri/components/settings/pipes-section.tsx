@@ -58,6 +58,23 @@ import {
   formatPipeElapsed,
 } from "@/components/pipe-activity-indicator";
 import { getApiBaseUrl, localFetch } from "@/lib/api";
+import { useTeam } from "@/lib/hooks/use-team";
+import {
+  writeTextFile,
+  readTextFile,
+  mkdir,
+  exists,
+} from "@tauri-apps/plugin-fs";
+import { homeDir, join } from "@tauri-apps/api/path";
+import {
+  parseTeamVersion,
+  stripTeamMarker,
+  setEnabledFlag,
+  planTeamPipeSync,
+  nextShareVersion,
+  isSafePipeName,
+  type TeamPipePayload,
+} from "@/lib/team-pipes";
 import {
   isNotificationsDenied,
   toggleNotificationInContent,
@@ -926,6 +943,245 @@ export function PipesSection() {
     fetchPipes();
   };
 
+  // ── Team pipe sharing ─────────────────────────────────────────────────
+  // Peer-to-peer, driven from the desktop app: any team member shares one of
+  // their own pipes through the E2E-encrypted team configs channel
+  // (use-team). Teammates get a local copy marked `# team-shared:vN` — OFF by
+  // default and read-only (fork to edit). Re-sharing bumps the version and
+  // recipients' copies auto-update, preserving their own on/off choice;
+  // unsharing disables (never deletes) the copies. See lib/team-pipes.ts.
+  const team = useTeam();
+  const myUserId = settings.user?.id ?? null;
+  const [sharingPipe, setSharingPipe] = useState<string | null>(null);
+
+  const teamPipeConfigs = React.useMemo(
+    () => team.configs.filter((c) => c.config_type === "pipe"),
+    [team.configs]
+  );
+  // Config keys are plaintext on the server row, so this set stays valid even
+  // when values can't be decrypted — it drives the unshare sweep.
+  const teamPipeKeys = React.useMemo(
+    () => new Set(teamPipeConfigs.map((c) => c.key)),
+    [teamPipeConfigs]
+  );
+  const sharedByMe = React.useMemo(
+    () =>
+      new Map(
+        teamPipeConfigs
+          .filter((c) => c.updated_by === myUserId)
+          .map((c) => [c.key, c])
+      ),
+    [teamPipeConfigs, myUserId]
+  );
+  const receivedConfigs = React.useMemo(
+    () => teamPipeConfigs.filter((c) => c.updated_by !== myUserId && !!c.value),
+    [teamPipeConfigs, myUserId]
+  );
+  // Managed = the local copy carries the team marker. Matching by name alone
+  // would wrongly lock a user's own pipe that happens to collide with a
+  // teammate's share.
+  const isReceivedTeamPipe = (pipe: PipeStatus) =>
+    parseTeamVersion(pipe.raw_content) !== null;
+  const isUnsharedLeftover = (pipe: PipeStatus) =>
+    isReceivedTeamPipe(pipe) &&
+    team.configsFetched &&
+    !teamPipeKeys.has(pipe.config.name);
+  const sharerNameForPipe = (name: string): string | null => {
+    const cfg = receivedConfigs.find((c) => c.key === name);
+    if (!cfg) return null;
+    const m = team.members.find((mm) => mm.user_id === cfg.updated_by);
+    return m?.name || m?.email || null;
+  };
+  const sharedContentDiffers = (pipe: PipeStatus) => {
+    const v = sharedByMe.get(pipe.config.name)?.value as
+      | Partial<TeamPipePayload>
+      | undefined;
+    if (!v?.raw_content) return false; // shared copy unreadable — don't offer
+    return v.raw_content !== stripTeamMarker(pipe.raw_content);
+  };
+
+  const sharePipeToTeam = async (pipe: PipeStatus) => {
+    const name = pipe.config.name;
+    setSharingPipe(name);
+    try {
+      const existing = sharedByMe.get(name);
+      const version = nextShareVersion(existing?.value);
+      // raw_content only — the parsed config object is never pushed (it can
+      // hold secrets); teammates bring their own connections and presets.
+      await team.pushConfig("pipe", name, {
+        name,
+        raw_content: stripTeamMarker(pipe.raw_content),
+        version,
+        shared_at: new Date().toISOString(),
+      });
+      posthog.capture(
+        existing ? "team_pipe_update_pushed" : "team_pipe_shared",
+        { pipe: name, version }
+      );
+      toast({
+        title: existing ? `update pushed (v${version})` : "shared with team",
+        description: existing
+          ? "teammates' copies will update automatically"
+          : "teammates can turn it on from their pipes page",
+      });
+    } catch (err: any) {
+      toast({
+        title: "failed to share",
+        description: err?.message,
+        variant: "destructive",
+      });
+    } finally {
+      setSharingPipe(null);
+    }
+  };
+
+  const unsharePipeFromTeam = async (name: string) => {
+    const id = sharedByMe.get(name)?.id;
+    if (!id) return;
+    try {
+      await team.deleteConfig(id);
+      posthog.capture("team_pipe_unshared", { pipe: name });
+      toast({
+        title: "unshared from team",
+        description: "teammates' copies will be disabled",
+      });
+    } catch (err: any) {
+      toast({
+        title: "failed to unshare",
+        description: err?.message,
+        variant: "destructive",
+      });
+    }
+  };
+
+  const forkTeamPipe = async (pipe: PipeStatus) => {
+    const base = pipe.config.name.replace(/-fork(-\d+)?$/, "");
+    let forkName = `${base}-fork`;
+    try {
+      const home = await homeDir();
+      const pipesDir = await join(home, ".screenpipe", "pipes");
+      let i = 1;
+      while (await exists(await join(pipesDir, forkName))) {
+        i += 1;
+        forkName = `${base}-fork-${i}`;
+      }
+      const dir = await join(pipesDir, forkName);
+      await mkdir(dir, { recursive: true });
+      // Drop the marker — the fork is the user's own pipe from here on and
+      // stops auto-updating.
+      let content = setEnabledFlag(stripTeamMarker(pipe.raw_content), false);
+      if (/^name:\s*/m.test(content)) {
+        content = content.replace(/^name:\s*.*$/m, `name: ${forkName}`);
+      }
+      await writeTextFile(await join(dir, "pipe.md"), content);
+      posthog.capture("team_pipe_forked", {
+        source: pipe.config.name,
+        fork: forkName,
+      });
+      toast({
+        title: `forked to "${forkName}"`,
+        description: "your editable copy — off by default",
+      });
+      fetchPipes();
+    } catch (err: any) {
+      toast({
+        title: "failed to fork",
+        description: err?.message,
+        variant: "destructive",
+      });
+    }
+  };
+
+  // Recipient sync: install new shares (OFF by default), apply version bumps
+  // (preserving each member's own on/off choice), and disable local copies
+  // whose share disappeared. Local machine only — never against a remote
+  // device. Gated on configsFetched so a failed /configs fetch can never look
+  // like "everything was unshared".
+  const teamSyncRunning = useRef(false);
+  useEffect(() => {
+    if (!team.team || team.missingKey || !team.configsFetched || isRemote)
+      return;
+    if (teamSyncRunning.current) return;
+    teamSyncRunning.current = true;
+    (async () => {
+      let changed = false;
+      const updatedPipes: string[] = [];
+      try {
+        const home = await homeDir();
+        const pipesDir = await join(home, ".screenpipe", "pipes");
+        for (const c of receivedConfigs) {
+          const v = c.value as Partial<TeamPipePayload> | undefined;
+          if (!c.key || !isSafePipeName(c.key)) continue;
+          try {
+            const dir = await join(pipesDir, c.key);
+            const md = await join(dir, "pipe.md");
+            const local = (await exists(md)) ? await readTextFile(md) : null;
+            const plan = planTeamPipeSync(
+              { name: c.key, raw_content: v?.raw_content, version: v?.version },
+              local
+            );
+            if (plan.action === "install" || plan.action === "update") {
+              if (local == null) await mkdir(dir, { recursive: true });
+              await writeTextFile(md, plan.content);
+              changed = true;
+              if (plan.action === "update") updatedPipes.push(c.key);
+              console.log(`[team-pipes] ${c.key}: ${plan.action} v${v?.version}`);
+            }
+          } catch (e) {
+            console.warn(`[team-pipes] failed to sync ${c.key}:`, e);
+          }
+        }
+        // Unshare sweep — only marked copies whose share key disappeared.
+        for (const p of pipes) {
+          if (!p.config.enabled) continue;
+          if (parseTeamVersion(p.raw_content) === null) continue;
+          if (teamPipeKeys.has(p.config.name)) continue;
+          try {
+            await localFetch(`/pipes/${p.config.name}/config`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ enabled: false }),
+            });
+            changed = true;
+            posthog.capture("team_pipe_disabled_unshared", {
+              pipe: p.config.name,
+            });
+            console.log(`[team-pipes] ${p.config.name}: disabled (unshared)`);
+          } catch (e) {
+            console.warn(`[team-pipes] failed to disable ${p.config.name}:`, e);
+          }
+        }
+      } finally {
+        teamSyncRunning.current = false;
+      }
+      if (updatedPipes.length > 0) {
+        posthog.capture("team_pipe_auto_updated", { pipes: updatedPipes });
+        toast({
+          title: "team pipes updated",
+          description: updatedPipes.join(", "),
+        });
+      }
+      if (changed) fetchPipes();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    team.team?.id,
+    team.missingKey,
+    team.configsFetched,
+    receivedConfigs,
+    pipes,
+    isRemote,
+  ]);
+
+  // Poll team configs so re-shares and unshares propagate while the app is
+  // open (the hook otherwise only fetches on mount).
+  useEffect(() => {
+    if (!team.team || isRemote) return;
+    const id = setInterval(() => team.fetchConfigs(), 5 * 60_000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [team.team?.id, isRemote]);
+
   const trackedPipesView = useRef(false);
   const autoUpdateRan = useRef(false);
   useEffect(() => {
@@ -1581,6 +1837,40 @@ export function PipesSection() {
                   {pipe.config.name}
                 </button>
 
+                {/* Team sharing badges */}
+                {sharedByMe.has(pipe.config.name) && (
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] h-5 shrink-0 gap-1"
+                    title={`shared with your team (v${
+                      (sharedByMe.get(pipe.config.name)?.value as Partial<TeamPipePayload>)
+                        ?.version ?? "?"
+                    })`}
+                  >
+                    <Share2 className="h-2.5 w-2.5" /> shared
+                  </Badge>
+                )}
+                {isReceivedTeamPipe(pipe) && !isUnsharedLeftover(pipe) && (
+                  <Badge
+                    variant="secondary"
+                    className="text-[10px] h-5 shrink-0"
+                    title={`team pipe v${parseTeamVersion(pipe.raw_content)} — read-only, updates automatically when the author re-shares`}
+                  >
+                    {sharerNameForPipe(pipe.config.name)
+                      ? `team v${parseTeamVersion(pipe.raw_content)} · ${sharerNameForPipe(pipe.config.name)}`
+                      : `team v${parseTeamVersion(pipe.raw_content)}`}
+                  </Badge>
+                )}
+                {isUnsharedLeftover(pipe) && (
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] h-5 shrink-0 text-muted-foreground"
+                    title="no longer shared with the team — auto-run was disabled; fork to keep it or delete it"
+                  >
+                    no longer shared
+                  </Badge>
+                )}
+
                 {/* Update badge */}
                 {availableUpdates[pipe.config.name] && (
                   <Badge
@@ -1705,16 +1995,19 @@ export function PipesSection() {
                     </Button>
                   )}
 
-                  {/* Publish button */}
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7"
-                    onClick={() => setPublishPipeName(pipe.config.name)}
-                    title="publish to store"
-                  >
-                    <Upload className="h-3.5 w-3.5" />
-                  </Button>
+                  {/* Publish button — not for received team pipes (someone
+                      else's work; fork first) */}
+                  {!isReceivedTeamPipe(pipe) && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7"
+                      onClick={() => setPublishPipeName(pipe.config.name)}
+                      title="publish to store"
+                    >
+                      <Upload className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
 
                   {/* Overflow menu */}
                   <DropdownMenu>
@@ -1724,30 +2017,83 @@ export function PipesSection() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem
-                        onClick={() => {
-                          navigateHomeAndPrefill({
-                            context: "the user wants to optimize their pipe",
-                            prompt: buildOptimizePrompt(pipe.config.name),
-                            displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
-                            autoSend: true,
-                          });
-                        }}
-                      >
-                        <Sparkles className="h-3.5 w-3.5 mr-2" />
-                        optimize with ai
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        disabled={sharingPublic === pipe.config.name}
-                        onClick={() => sharePipePublic(pipe)}
-                      >
-                        {sharingPublic === pipe.config.name ? (
-                          <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                      {!isReceivedTeamPipe(pipe) && (
+                        <DropdownMenuItem
+                          onClick={() => {
+                            navigateHomeAndPrefill({
+                              context: "the user wants to optimize their pipe",
+                              prompt: buildOptimizePrompt(pipe.config.name),
+                              displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
+                              autoSend: true,
+                            });
+                          }}
+                        >
+                          <Sparkles className="h-3.5 w-3.5 mr-2" />
+                          optimize with ai
+                        </DropdownMenuItem>
+                      )}
+
+                      {/* Team sharing — own pipes can be shared, updated,
+                          unshared; received team pipes are read-only and can
+                          be forked instead. */}
+                      {team.team && !team.missingKey && !isReceivedTeamPipe(pipe) && (
+                        sharedByMe.has(pipe.config.name) ? (
+                          <>
+                            {sharedContentDiffers(pipe) && (
+                              <DropdownMenuItem
+                                disabled={sharingPipe === pipe.config.name}
+                                onClick={() => sharePipeToTeam(pipe)}
+                              >
+                                {sharingPipe === pipe.config.name ? (
+                                  <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                                ) : (
+                                  <ArrowUpCircle className="h-3.5 w-3.5 mr-2" />
+                                )}
+                                push update to team (v
+                                {nextShareVersion(sharedByMe.get(pipe.config.name)?.value)})
+                              </DropdownMenuItem>
+                            )}
+                            <DropdownMenuItem
+                              onClick={() => unsharePipeFromTeam(pipe.config.name)}
+                            >
+                              <Share2 className="h-3.5 w-3.5 mr-2" />
+                              unshare from team
+                            </DropdownMenuItem>
+                          </>
                         ) : (
-                          <Link className="h-3.5 w-3.5 mr-2" />
-                        )}
-                        copy share link
-                      </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={sharingPipe === pipe.config.name}
+                            onClick={() => sharePipeToTeam(pipe)}
+                          >
+                            {sharingPipe === pipe.config.name ? (
+                              <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                            ) : (
+                              <Share2 className="h-3.5 w-3.5 mr-2" />
+                            )}
+                            share with team
+                          </DropdownMenuItem>
+                        )
+                      )}
+                      {isReceivedTeamPipe(pipe) && (
+                        <DropdownMenuItem onClick={() => forkTeamPipe(pipe)}>
+                          <Copy className="h-3.5 w-3.5 mr-2" />
+                          fork to edit
+                        </DropdownMenuItem>
+                      )}
+
+                      {!isReceivedTeamPipe(pipe) && (
+                        <DropdownMenuItem
+                          disabled={sharingPublic === pipe.config.name}
+                          onClick={() => sharePipePublic(pipe)}
+                        >
+                          {sharingPublic === pipe.config.name ? (
+                            <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                          ) : (
+                            <Link className="h-3.5 w-3.5 mr-2" />
+                          )}
+                          copy share link
+                        </DropdownMenuItem>
+                      )}
                       {(pipe.source_slug || (pipe.config as any).config?.source_slug) && (
                         <DropdownMenuItem
                           onClick={() => {
@@ -1759,20 +2105,28 @@ export function PipesSection() {
                           check for updates
                         </DropdownMenuItem>
                       )}
-                      <DropdownMenuItem
-                        onClick={() => setPublishPipeName(pipe.config.name)}
-                      >
-                        <Upload className="h-3.5 w-3.5 mr-2" />
-                        publish to store
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        className="text-destructive"
-                        onClick={() => deletePipe(pipe.config.name)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5 mr-2" />
-                        delete
-                      </DropdownMenuItem>
+                      {!isReceivedTeamPipe(pipe) && (
+                        <DropdownMenuItem
+                          onClick={() => setPublishPipeName(pipe.config.name)}
+                        >
+                          <Upload className="h-3.5 w-3.5 mr-2" />
+                          publish to store
+                        </DropdownMenuItem>
+                      )}
+                      {/* Delete is hidden while a team share is active (the
+                          sync would reinstall it) but allowed once unshared. */}
+                      {(!isReceivedTeamPipe(pipe) || isUnsharedLeftover(pipe)) && (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="text-destructive"
+                            onClick={() => deletePipe(pipe.config.name)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5 mr-2" />
+                            delete
+                          </DropdownMenuItem>
+                        </>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
@@ -2481,10 +2835,19 @@ export function PipesSection() {
                           <span className="text-[11px] text-muted-foreground">unsaved</span>
                         )}
                       </div>
+                      {isReceivedTeamPipe(pipe) && (
+                        <p className="text-[11px] text-muted-foreground mt-1">
+                          shared by your team (read-only, updates automatically) — fork it to make an editable copy
+                        </p>
+                      )}
                       <Textarea
                         value={promptDrafts[pipe.config.name] ?? pipe.raw_content}
                         onChange={(e) => handlePipeEdit(pipe.config.name, e.target.value)}
-                        className="text-xs font-mono h-64 mt-1"
+                        readOnly={isReceivedTeamPipe(pipe)}
+                        className={cn(
+                          "text-xs font-mono h-64 mt-1",
+                          isReceivedTeamPipe(pipe) && "opacity-70 cursor-not-allowed"
+                        )}
                         autoCorrect="off"
                         autoCapitalize="off"
                         spellCheck={false}

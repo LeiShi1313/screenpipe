@@ -58,6 +58,11 @@ interface TeamState {
   invitePassphrase: string | null;
   /** True when user is in a team but encryption key is not on this device */
   missingKey: boolean;
+  /** True once /configs has been fetched successfully at least once.
+   * Consumers that react to a config DISAPPEARING (e.g. disabling
+   * unshared team pipes) must gate on this — an empty `configs` from a
+   * failed fetch must never look like "everything was unshared". */
+  configsFetched: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -109,6 +114,7 @@ export function useTeam() {
     inviteLink: null,
     invitePassphrase: null,
     missingKey: false,
+    configsFetched: false,
     loading: true,
     error: null,
   });
@@ -253,7 +259,7 @@ export function useTeam() {
           }
         }
 
-        setState((s) => ({ ...s, configs }));
+        setState((s) => ({ ...s, configs, configsFetched: true }));
       } catch {}
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -427,6 +433,7 @@ export function useTeam() {
       inviteLink: null,
       invitePassphrase: null,
       missingKey: false,
+      configsFetched: false,
       loading: false,
       error: null,
     });
@@ -457,6 +464,7 @@ export function useTeam() {
       inviteLink: null,
       invitePassphrase: null,
       missingKey: false,
+      configsFetched: false,
       loading: false,
       error: null,
     });
@@ -577,6 +585,7 @@ export function useTeam() {
   return {
     ...state,
     fetchTeam,
+    fetchConfigs,
     createTeam,
     initializeTeamKey,
     joinTeam,

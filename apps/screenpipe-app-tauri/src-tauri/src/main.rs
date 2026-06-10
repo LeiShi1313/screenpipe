@@ -37,6 +37,7 @@ mod agent_event_emitter;
 mod audio_exclusions;
 mod calendar;
 mod capture_session;
+mod auth_token;
 mod chatgpt_oauth;
 #[allow(deprecated)]
 mod commands;
@@ -926,6 +927,19 @@ async fn main() {
                 app.deep_link().register_all()?;
             }
             let app_handle = app.handle();
+
+            // #3943: migrate the cloud auth token out of the plaintext
+            // store.bin / auth.json (and the .last-good snapshot) into the
+            // encrypted secret store, seed the in-process cache, and scrub the
+            // plaintext copies. Runs synchronously here — BEFORE init_store and
+            // the engine spawn read the token — so the cache is ready for the
+            // sync hot path (`to_recording_settings`).
+            {
+                let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+                let _ = tauri::async_runtime::block_on(
+                    crate::auth_token::migrate_plaintext_token(&data_dir),
+                );
+            }
 
             // Create macOS app menu with Settings
             #[cfg(target_os = "macos")]

@@ -767,6 +767,13 @@ pub fn get_enterprise_team_api_token() -> Option<String> {
 #[tauri::command]
 #[specta::specta]
 pub fn get_cloud_token() -> Option<String> {
+    // #3943: the authoritative token now lives in the encrypted secret store and
+    // is mirrored into an in-process cache at startup + on every `set_cloud_token`.
+    // Prefer that; fall back to the legacy `auth.json` for installs that haven't
+    // migrated yet (and for the pi-agent config flow that still writes it).
+    if let Some(token) = crate::auth_token::cached_cloud_token() {
+        return Some(token);
+    }
     let path = screenpipe_core::paths::default_screenpipe_data_dir().join("auth.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -801,7 +808,18 @@ pub async fn set_cloud_token(
     state: tauri::State<'_, crate::recording::RecordingState>,
 ) -> Result<(), String> {
     let normalized = token.filter(|t| !t.is_empty());
-    state.cloud_token.store(std::sync::Arc::new(normalized));
+    // Unblock cloud calls for THIS session first — the ArcSwap + cache are the
+    // runtime source of truth, so a failed durable write below never breaks an
+    // active sign-in.
+    state.cloud_token.store(std::sync::Arc::new(normalized.clone()));
+    // #3943: persist to the encrypted secret store (authoritative at-rest copy)
+    // and refresh the in-process cache. We surface a persistence failure as an
+    // Err so the frontend won't strip the last plaintext copy of a token it
+    // couldn't durably save (the caller ignores the Result for session purposes;
+    // only the save-and-strip path checks it).
+    crate::auth_token::store_cloud_token(normalized.as_deref())
+        .await
+        .map_err(|e| format!("failed to persist cloud token to secret store: {e}"))?;
     Ok(())
 }
 

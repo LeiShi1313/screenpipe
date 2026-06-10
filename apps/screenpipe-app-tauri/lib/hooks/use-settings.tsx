@@ -661,6 +661,41 @@ export const saveAndEncrypt = async (store: Store) => {
 	await commands.reencryptStore().catch(() => {});
 };
 
+/**
+ * #3943: persist settings WITHOUT the cloud auth token in plaintext.
+ *
+ * The Clerk JWT must never land in store.bin (or its .last-good snapshot). When
+ * the settings being saved carry a token, mirror it to the authoritative
+ * encrypted secret store FIRST (so it's never lost), then write a stripped copy
+ * to disk. A token-less save never clears the secret store — only explicit
+ * logout (`setCloudToken(null)`) does — so a save during a transient
+ * pre-hydration state can't sign the user out.
+ */
+async function setSettingsStripped(store: Store, settings: Settings) {
+	const token = settings?.user?.token;
+	// Default to "safe to write as-is" when there's no token to protect.
+	let persisted = !token;
+	if (token) {
+		try {
+			const res = await commands.setCloudToken(token);
+			persisted = res.status === "ok";
+			if (!persisted) {
+				console.warn("cloud token not persisted to secret store:", res.error);
+			}
+		} catch (e) {
+			console.warn("failed to mirror cloud token to secret store:", e);
+		}
+	}
+	// Only strip the plaintext token from store.bin once it's safely in the
+	// encrypted secret store. If persistence failed, keep it on disk so the user
+	// isn't silently signed out on the next restart (#3943).
+	const toPersist =
+		token && persisted
+			? { ...settings, user: { ...settings.user, token: undefined } }
+			: settings;
+	await store.set("settings", toPersist);
+}
+
 // Store utilities similar to Cap's implementation
 function createSettingsStore() {
 	const get = async (): Promise<Settings> => {
@@ -668,6 +703,19 @@ function createSettingsStore() {
 		const settings = await store.get<Settings>("settings");
 		if (!settings) {
 			return createDefaultSettingsObject();
+		}
+
+		// #3943: the cloud auth token no longer persists in store.bin (it now
+		// lives in the encrypted secret store). Hydrate it back into the
+		// in-memory settings so every existing reader of settings.user.token
+		// keeps working unchanged — only persistence moved.
+		if (settings.user && !settings.user.token) {
+			try {
+				const token = await commands.getCloudToken();
+				if (token) settings.user.token = token;
+			} catch (e) {
+				console.warn("failed to hydrate cloud token from secret store:", e);
+			}
 		}
 
 		// Migration: Ensure existing users have deviceId for free tier tracking
@@ -877,7 +925,7 @@ function createSettingsStore() {
 
 		// Save migrations if needed
 		if (needsUpdate) {
-			await store.set("settings", settings);
+			await setSettingsStripped(store, settings);
 			await saveAndEncrypt(store);
 		}
 
@@ -896,7 +944,7 @@ function createSettingsStore() {
 			}
 			newSettings = applyProCloudAudioDefaults(newSettings);
 		}
-		await store.set("settings", newSettings);
+		await setSettingsStripped(store, newSettings);
 		await saveAndEncrypt(store);
 	};
 

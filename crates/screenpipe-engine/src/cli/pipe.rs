@@ -891,7 +891,10 @@ fn handle_optimize_command(
     println!("the eval backend isn't wired yet — this is a preview of the flow and output.\n");
 
     // Current prompt (real) — first lines of the pipe body.
-    println!("current prompt ({} lines, {} chars)", prompt_lines, prompt_chars);
+    println!(
+        "current prompt ({} lines, {} chars)",
+        prompt_lines, prompt_chars
+    );
     println!("  source: {}", pipe_md_path.display());
     for (i, line) in body.lines().take(6).enumerate() {
         let shown: String = if line.chars().count() > 72 {
@@ -915,7 +918,10 @@ fn handle_optimize_command(
     let route = if eval_source == "auto" {
         "private holdout (owner-only)  [auto-route by task type]".to_string()
     } else {
-        format!("private holdout (owner-only)  [eval slice: {}]", eval_source)
+        format!(
+            "private holdout (owner-only)  [eval slice: {}]",
+            eval_source
+        )
     };
     println!("  eval source:  {}", route);
     println!("  rounds:       {}", rounds);

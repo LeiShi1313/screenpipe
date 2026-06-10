@@ -944,14 +944,17 @@ export function PipesSection() {
   };
 
   // ── Team pipe sharing ─────────────────────────────────────────────────
-  // Peer-to-peer, driven from the desktop app: any team member shares one of
-  // their own pipes through the E2E-encrypted team configs channel
-  // (use-team). Teammates get a local copy marked `# team-shared:vN` — OFF by
-  // default and read-only (fork to edit). Re-sharing bumps the version and
+  // Driven from the desktop app: a team admin shares one of their own pipes
+  // through the team configs channel (PLAINTEXT envelope — no team key
+  // ceremony; pipes are prompts, not credentials; see team-pipes.ts).
+  // Teammates get a local copy marked `# team-shared:vN` — OFF by default
+  // and read-only (fork to edit). Re-sharing bumps the version and
   // recipients' copies auto-update, preserving their own on/off choice;
-  // unsharing disables (never deletes) the copies. See lib/team-pipes.ts.
+  // unsharing disables (never deletes) the copies. Sharing is admin-only for
+  // now because the backend gates team-scope config writes to admins.
   const team = useTeam();
   const myUserId = settings.user?.id ?? null;
+  const canShareToTeam = !!team.team && team.role === "admin";
   const [sharingPipe, setSharingPipe] = useState<string | null>(null);
 
   const teamPipeConfigs = React.useMemo(
@@ -1007,8 +1010,9 @@ export function PipesSection() {
       const existing = sharedByMe.get(name);
       const version = nextShareVersion(existing?.value);
       // raw_content only — the parsed config object is never pushed (it can
-      // hold secrets); teammates bring their own connections and presets.
-      await team.pushConfig("pipe", name, {
+      // hold secrets, and shares are stored plaintext server-side); teammates
+      // bring their own connections and presets.
+      await team.pushConfigPlain("pipe", name, {
         name,
         raw_content: stripTeamMarker(pipe.raw_content),
         version,
@@ -1096,11 +1100,11 @@ export function PipesSection() {
   // (preserving each member's own on/off choice), and disable local copies
   // whose share disappeared. Local machine only — never against a remote
   // device. Gated on configsFetched so a failed /configs fetch can never look
-  // like "everything was unshared".
+  // like "everything was unshared". No team key needed: pipe shares are
+  // plaintext rows, so members in key-limbo still receive them.
   const teamSyncRunning = useRef(false);
   useEffect(() => {
-    if (!team.team || team.missingKey || !team.configsFetched || isRemote)
-      return;
+    if (!team.team || !team.configsFetched || isRemote) return;
     if (teamSyncRunning.current) return;
     teamSyncRunning.current = true;
     (async () => {
@@ -2036,7 +2040,7 @@ export function PipesSection() {
                       {/* Team sharing — own pipes can be shared, updated,
                           unshared; received team pipes are read-only and can
                           be forked instead. */}
-                      {team.team && !team.missingKey && !isReceivedTeamPipe(pipe) && (
+                      {canShareToTeam && !isReceivedTeamPipe(pipe) && (
                         sharedByMe.has(pipe.config.name) ? (
                           <>
                             {sharedContentDiffers(pipe) && (

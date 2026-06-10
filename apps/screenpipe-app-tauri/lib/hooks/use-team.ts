@@ -12,6 +12,7 @@ import {
   decryptConfig,
   unwrapKeyWithPassphrase,
 } from "../team-crypto";
+import { encodePlainConfig, parsePlainConfigValue } from "../team-pipes";
 
 const API = "https://screenpi.pe/api/team";
 
@@ -243,19 +244,24 @@ export function useTeam() {
         const data = await res.json();
         const configs: TeamConfig[] = data.configs || [];
 
-        // decrypt configs locally if we have the key
+        // plaintext rows (sentinel nonce, e.g. pipe shares) parse without a
+        // key; encrypted rows decrypt locally when we have the team key
         const cryptoKey = key ?? teamKeyRef.current;
-        if (cryptoKey) {
-          for (const c of configs) {
-            try {
-              c.value = (await decryptConfig(
-                c.value_encrypted,
-                c.nonce,
-                cryptoKey
-              )) as object;
-            } catch {
-              // decryption failed — possibly wrong key
-            }
+        for (const c of configs) {
+          const plain = parsePlainConfigValue(c);
+          if (plain !== undefined) {
+            c.value = plain;
+            continue;
+          }
+          if (!cryptoKey) continue;
+          try {
+            c.value = (await decryptConfig(
+              c.value_encrypted,
+              c.nonce,
+              cryptoKey
+            )) as object;
+          } catch {
+            // decryption failed — possibly wrong key
           }
         }
 
@@ -521,6 +527,36 @@ export function useTeam() {
     [token, fetchConfigs]
   );
 
+  // push a PLAINTEXT config to team (no team key needed). Used for pipe
+  // shares: pipes are workflow prompts, not credentials, and the E2E key
+  // ceremony (invite-link fragments, keys that don't follow accounts,
+  // unrecoverable data) was killing the sharing UX. The server stores the
+  // JSON as-is under a sentinel nonce — see team-pipes.ts.
+  const pushConfigPlain = useCallback(
+    async (configType: string, key: string, value: object) => {
+      if (!token) throw new Error("not logged in");
+
+      const res = await fetch(`${API}/configs`, {
+        method: "PUT",
+        headers: headers(),
+        body: JSON.stringify({
+          scope: "team",
+          config_type: configType,
+          key,
+          ...encodePlainConfig(value),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "failed to push config");
+      }
+
+      await fetchConfigs();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [token, fetchConfigs]
+  );
+
   // delete a config
   const deleteConfig = useCallback(
     async (configId: string) => {
@@ -593,6 +629,7 @@ export function useTeam() {
     deleteTeam,
     removeMember,
     pushConfig,
+    pushConfigPlain,
     deleteConfig,
     refreshInviteLink,
     generateInviteToken,

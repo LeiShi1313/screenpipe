@@ -5,6 +5,9 @@
 import { describe, it, expect } from "bun:test";
 import {
   TEAM_MARKER_PREFIX,
+  PLAINTEXT_NONCE,
+  encodePlainConfig,
+  parsePlainConfigValue,
   isSafePipeName,
   parseTeamVersion,
   stripTeamMarker,
@@ -25,6 +28,30 @@ Summarize my day and post it to slack.
 
 const NO_FRONTMATTER_PIPE = `Summarize my day and post it to slack.
 `;
+
+describe("plaintext config envelope", () => {
+  it("round-trips a payload through encode/parse", () => {
+    const payload = { name: "daily-summary", raw_content: AUTHOR_PIPE, version: 2 };
+    const row = encodePlainConfig(payload);
+    expect(row.nonce).toBe(PLAINTEXT_NONCE);
+    expect(parsePlainConfigValue(row)).toEqual(payload);
+  });
+
+  it("returns undefined for encrypted rows (real base64 nonce)", () => {
+    expect(
+      parsePlainConfigValue({ value_encrypted: "AAAA", nonce: "q83vEjRWeJq83vEj" })
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for corrupt plaintext", () => {
+    expect(
+      parsePlainConfigValue({ value_encrypted: "not json{", nonce: PLAINTEXT_NONCE })
+    ).toBeUndefined();
+    expect(
+      parsePlainConfigValue({ value_encrypted: '"a string"', nonce: PLAINTEXT_NONCE })
+    ).toBeUndefined();
+  });
+});
 
 describe("isSafePipeName", () => {
   it("accepts normal pipe names", () => {

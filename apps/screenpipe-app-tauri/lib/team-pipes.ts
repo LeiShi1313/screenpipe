@@ -5,9 +5,9 @@
 /**
  * Team pipe sharing — pure helpers (no React, no Tauri).
  *
- * A team member shares one of their pipes through the E2E-encrypted team
- * configs channel (use-team `pushConfig("pipe", name, payload)`). Teammates'
- * apps install a local copy marked with `# team-shared:vN` (mirrors the
+ * A team admin shares one of their pipes through the team configs channel
+ * (use-team `pushConfigPlain("pipe", name, payload)`). Teammates' apps
+ * install a local copy marked with `# team-shared:vN` (mirrors the
  * `# enterprise-managed:vN` marker in use-enterprise-pipes.ts) so the app can
  * tell managed copies apart from the user's own pipes:
  *
@@ -21,9 +21,46 @@
  *
  * Only `raw_content` travels. The author's parsed config object is never
  * pushed (it can hold secrets that don't belong on every teammate's machine).
+ *
+ * Pipe shares are stored PLAINTEXT on the server (decision 2026-06-10: the
+ * E2E team key ceremony killed the UX — keys don't follow accounts, invite
+ * links lose the fragment, data is unrecoverable). Pipes are workflow
+ * prompts, not credentials, and the enterprise managed-pipes path is already
+ * server-readable. TLS + at-rest encryption still apply. E2E stays for
+ * config types that carry real secrets (AI presets). The plaintext envelope
+ * reuses the same /api/team/configs columns with a sentinel nonce, so no
+ * backend change is needed and members without a team key receive shares.
  */
 
 export const TEAM_MARKER_PREFIX = "# team-shared:v";
+
+/** Sentinel nonce marking a team_configs row whose value_encrypted column
+ * holds plaintext JSON. Real AES-GCM nonces are 16 base64 chars, so this can
+ * never collide. */
+export const PLAINTEXT_NONCE = "plaintext";
+
+/** Build the {value_encrypted, nonce} envelope for a plaintext config row. */
+export function encodePlainConfig(value: object): {
+  value_encrypted: string;
+  nonce: string;
+} {
+  return { value_encrypted: JSON.stringify(value), nonce: PLAINTEXT_NONCE };
+}
+
+/** Parse a plaintext config row's value. Returns undefined when the row is
+ * not plaintext (encrypted rows are handled by team-crypto) or unparseable. */
+export function parsePlainConfigValue(row: {
+  value_encrypted: string;
+  nonce: string;
+}): object | undefined {
+  if (row.nonce !== PLAINTEXT_NONCE) return undefined;
+  try {
+    const v = JSON.parse(row.value_encrypted);
+    return typeof v === "object" && v !== null ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const TEAM_MARKER_RE = /^# team-shared:v(\d+)\s*$/m;
 // Frontmatter block at the very start of the file: ---\n ... \n---

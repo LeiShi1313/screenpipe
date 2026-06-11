@@ -13,15 +13,9 @@ import {
   Gift,
   HelpCircle,
   UserPlus,
-  Monitor,
-  Mic,
-  MicOff,
-  Volume2,
-  VolumeX,
   PanelLeftClose,
   PanelLeftOpen,
   Search,
-  Phone,
   Plug,
   NotebookPen,
 } from "lucide-react";
@@ -35,7 +29,6 @@ import {
   conversationMetaFromJson,
   loadConversationFile,
 } from "@/lib/chat-storage";
-import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
 import { AppSidebar, SidebarProvider, useSidebarContext } from "@/components/app-sidebar";
 import { UpdateBanner } from "@/components/update-banner";
@@ -56,6 +49,7 @@ import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
 import { NotificationBell } from "@/components/notification-bell";
+import { RecordingStatus, type RecordingDevice } from "@/components/recording-status";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
@@ -471,21 +465,8 @@ function HomeContent() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [setActiveSection, startNewChat]);
-  const overlayData = useOverlayData({
-    includeDeviceLevels: false,
-    includeOcrPulse: false,
-    minIntervalMs: 1000,
-    quantize: true,
-  });
-
   // Fetch actual recording devices. Audio comes from /audio/device/status so
   // user-paused devices stay visible and can be resumed from the same control.
-  interface RecordingDevice {
-    name: string;
-    fullName: string;
-    kind: "monitor" | "input" | "output";
-    active: boolean;
-  }
   interface AudioDeviceStatus {
     name: string;
     is_running: boolean;
@@ -925,24 +906,31 @@ function HomeContent() {
       <div className="h-screen flex min-h-0">
           {/* Sidebar */}
           <TooltipProvider delayDuration={0}>
-          {/* Top-left action buttons — pinned next to the macOS traffic
-              lights when the sidebar is EXPANDED. When collapsed these
-              live as the first two rows of the icon column instead (see
-              below), so the title bar stays clean and the column has a
-              single icon per line. Fixed positioning anchors them to the
-              viewport so they aren't clipped by AppSidebar's overflow. */}
+          {/* Top-left chrome row — pinned next to the macOS traffic lights
+              when the sidebar is EXPANDED: collapse, search, then the
+              recording-status dot and notification bell. No wordmark, no
+              header row — the whole corner is this one strip (Claude /
+              Codex style). When collapsed, collapse + search live as the
+              first two rows of the icon column instead (see below). Fixed
+              positioning anchors the strip to the viewport so it isn't
+              clipped by AppSidebar's overflow. */}
           {!sidebarCollapsed && (
-            <>
+            <div
+              className={cn(
+                // top-0.5 + items-center puts each icon's center at y≈15px,
+                // matching the vertical center of the macOS traffic lights
+                // (which sit at y≈14).
+                "fixed top-0.5 z-20 flex items-center gap-1.5",
+                reserveTrafficLights ? "left-[78px]" : "left-2"
+              )}
+            >
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
                     onClick={toggleSidebar}
                     aria-label="collapse sidebar"
                     className={cn(
-                      // top-1 + p-1 puts the 14px icon's center at y≈15px, matching the
-                      // vertical center of the macOS traffic lights (which sit at y≈14).
-                      "fixed top-1 z-20 p-1 rounded-md transition-colors",
-                      reserveTrafficLights ? "left-[78px]" : "left-2",
+                      "p-1 rounded-md transition-colors",
                       isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
                     )}
                   >
@@ -962,9 +950,7 @@ function HomeContent() {
                     }}
                     aria-label="search"
                     className={cn(
-                      "fixed top-1 z-20 p-1 rounded-md transition-colors",
-                      // 28px right of the collapse icon (icon 16 + gap 8 + small breathing).
-                      reserveTrafficLights ? "left-[110px]" : "left-9",
+                      "p-1 rounded-md transition-colors",
                       isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
                     )}
                   >
@@ -981,157 +967,21 @@ function HomeContent() {
                   ) : null}
                 </TooltipContent>
               </Tooltip>
-            </>
+
+              <RecordingStatus
+                devices={recordingDevices}
+                onDevicesChange={setRecordingDevices}
+                meetingActive={meetingState.active ?? false}
+                meetingApp={meetingState.meetingApp}
+                meetingLoading={meetingLoading}
+                onToggleMeeting={() => void toggleMeeting()}
+                isTranslucent={isTranslucent}
+              />
+              <NotificationBell />
+            </div>
           )}
 
           <AppSidebar collapsed={sidebarCollapsed} className="pl-4">
-            {!sidebarCollapsed && (
-            <div className={cn(isTranslucent ? "vibrant-sidebar-border" : "", "border-b", sidebarCollapsed ? "px-2 py-3" : "px-4 py-3")}>
-              {/* Row 1: name (collapse moved out — pinned top-left next
-                  to the traffic lights, see above). */}
-              <div className={cn("flex items-center", sidebarCollapsed ? "justify-center" : "justify-between")}>
-                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>screenpipe</h1>}
-              </div>
-              {/* Row 2: device status + action buttons */}
-              {!sidebarCollapsed && (() => {
-                const monitors = recordingDevices.filter((d) => d.kind === "monitor");
-                const inputs = recordingDevices.filter((d) => d.kind === "input");
-                const outputs = recordingDevices.filter((d) => d.kind === "output");
-                const screenOpacity = overlayData.screenActive ? 0.5 + Math.min(overlayData.captureFps / 2, 0.5) : 0.2;
-                const audioOpacity = overlayData.audioActive ? 0.5 + Math.min(overlayData.speechRatio, 0.5) : 0.2;
-
-                const groups: {
-                  key: "monitor" | "mic" | "output";
-                  icon: typeof Monitor;
-                  pausedIcon?: typeof Monitor;
-                  count: number;
-                  title: string;
-                  opacity: number;
-                  devices: RecordingDevice[];
-                }[] = [];
-                if (monitors.length > 0) groups.push({ key: "monitor", icon: Monitor, count: monitors.length, title: monitors.map((d) => d.name).join(", "), opacity: screenOpacity, devices: monitors });
-                if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, pausedIcon: MicOff, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: inputs });
-                if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, pausedIcon: VolumeX, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: outputs });
-
-                return (
-                  <div className="flex items-center gap-2 mt-1.5">
-                    {groups.map(({ key, icon: ActiveIcon, pausedIcon: PausedIcon, count, title, opacity, devices: groupDevices }) => {
-                      const activeCount = groupDevices.filter((d: RecordingDevice) => d.active).length;
-                      const allActive = groupDevices.every((d: RecordingDevice) => d.active);
-                      const isAudioGroup = key !== "monitor";
-                      const Icon = isAudioGroup && !allActive && PausedIcon ? PausedIcon : ActiveIcon;
-                      const iconOpacity = isAudioGroup && !allActive ? 0.45 : opacity;
-                      const actionLabel = key === "monitor"
-                        ? title
-                        : allActive
-                          ? `${title} — click to pause capture`
-                          : activeCount === 0
-                            ? `${title} paused — click to resume capture`
-                            : `${title} partially paused — click to resume paused devices`;
-                      return (
-                        <Tooltip key={key}>
-                          <TooltipTrigger asChild>
-                            <button
-                              type="button"
-                              aria-label={actionLabel}
-                              className={cn(
-                                "flex items-center gap-0.5 rounded px-0.5 transition-all",
-                                key === "monitor"
-                                  ? "cursor-default"
-                                  : cn(
-                                      "cursor-pointer",
-                                      isTranslucent ? "hover:bg-white/10" : "hover:bg-muted"
-                                    )
-                              )}
-                              onClick={key === "monitor" ? undefined : async () => {
-                                const endpoint = allActive
-                                  ? "/audio/device/stop"
-                                  : "/audio/device/start";
-                                const targetFullNames = new Set(
-                                  groupDevices
-                                    .filter((d) => allActive || !d.active)
-                                    .map((d) => d.fullName)
-                                );
-                                if (targetFullNames.size === 0) return;
-
-                                const previousDevices = recordingDevices;
-                                setRecordingDevices((prev) =>
-                                  prev.map((device) =>
-                                    targetFullNames.has(device.fullName)
-                                      ? {
-                                          ...device,
-                                          active: !allActive,
-                                        }
-                                      : device
-                                  )
-                                );
-
-                                const results = await Promise.allSettled(
-                                  Array.from(targetFullNames).map((deviceName) =>
-                                    localFetch(endpoint, {
-                                      method: "POST",
-                                      headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ device_name: deviceName }),
-                                    }).then((response) => {
-                                      if (!response.ok) {
-                                        throw new Error(`audio device toggle failed: ${response.status}`);
-                                      }
-                                      return response;
-                                    })
-                                  )
-                                );
-
-                                if (results.some((result) => result.status === "rejected")) {
-                                  setRecordingDevices(previousDevices);
-                                }
-                              }}
-                            >
-                              <Icon
-                                aria-hidden="true"
-                                focusable="false"
-                                className={cn("h-3 w-3 transition-colors", isTranslucent ? "vibrant-sidebar-fg" : "text-foreground")}
-                                style={{ opacity: iconOpacity }}
-                              />
-                              {count > 1 && (
-                                <span className={cn("text-[9px] font-medium leading-none", isTranslucent ? "vibrant-sidebar-fg-muted" : "text-foreground/50")}>{count}</span>
-                              )}
-                            </button>
-                          </TooltipTrigger>
-                          <TooltipContent side="bottom" className="text-xs">
-                            {actionLabel}
-                          </TooltipContent>
-                        </Tooltip>
-                      );
-                    })}
-                    <div className="w-px h-3 bg-border mx-0.5" />
-                    <NotificationBell />
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <button
-                          onClick={() => toggleMeeting()}
-                          disabled={meetingLoading}
-                          aria-label={meetingState.active ? "stop meeting" : "start meeting"}
-                          className={cn(
-                            "relative flex items-center justify-center h-5 w-5 rounded transition-colors",
-                            isTranslucent ? "vibrant-nav-item hover:bg-white/10" : "text-muted-foreground hover:text-foreground hover:bg-muted"
-                          )}
-                        >
-                          {meetingState.active && (
-                            <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
-                          )}
-                          <Phone aria-hidden="true" focusable="false" className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent side="top" className="text-xs">
-                        {meetingState.active ? "stop meeting" : "start meeting"}
-                      </TooltipContent>
-                    </Tooltip>
-                  </div>
-                );
-              })()}
-            </div>
-            )}
-
             {/* Navigation.
                 Outer flex column has no overflow — the chat-list section
                 inside owns its own scroll, otherwise the team promo +

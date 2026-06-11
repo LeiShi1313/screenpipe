@@ -585,18 +585,21 @@ pub async fn start_ui_recording(
             match handle.recv_timeout(recv_timeout) {
                 Some(event) => {
                     let db_event = event.to_db_insert(Some(session_id.clone()));
-                    let app_lower = db_event
-                        .app_name
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let title_lower = db_event
-                        .window_title
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let is_ignored =
-                        window_pattern::matches_any(&ignored_patterns, &app_lower, &title_lower);
+                    let is_ignored = if ignored_patterns.is_empty() {
+                        false
+                    } else {
+                        let app_lower = db_event
+                            .app_name
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase();
+                        let title_lower = db_event
+                            .window_title
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase();
+                        window_pattern::matches_any(&ignored_patterns, &app_lower, &title_lower)
+                    };
                     let should_record_event = record_input_events
                         && !is_ignored
                         && should_record_input_event(
@@ -618,7 +621,7 @@ pub async fn start_ui_recording(
                     let is_scroll =
                         matches!(db_event.event_type, screenpipe_db::UiEventType::Scroll);
                     let trigger_kind =
-                        capture_trigger_kind(&db_event, &ignored_patterns, trigger_gates);
+                        capture_trigger_kind_with_ignored(&db_event, is_ignored, trigger_gates);
                     // A correlation id is only useful if there's somewhere
                     // for both halves to land: a live capture-loop receiver
                     // to produce the frame AND a linker to pair them. If
@@ -863,8 +866,8 @@ async fn flush_batch(
 
 /// Marker for legacy trigger-side gates. Key and clipboard events are
 /// privacy-sensitive for storage, not for workflow checkpointing, so
-/// [`capture_trigger_kind`] intentionally lets them trigger even when older
-/// callers think these gates are off.
+/// [`capture_trigger_kind_with_ignored`] intentionally lets them trigger even
+/// when older callers think these gates are off.
 #[derive(Debug, Clone, Copy, Default)]
 struct TriggerGates;
 
@@ -877,24 +880,14 @@ fn event_target_point(db_event: &InsertUiEvent) -> Option<(i32, i32)> {
 ///
 /// Returns `None` for events that don't directly trigger a capture
 /// (Move, Idle) and for Scroll events — Scroll triggers are deferred
-/// until the burst ends, handled by [`ScrollBurstTracker`]. Also
-/// returns `None` for Key / Clipboard when their respective gate in
-/// `gates` is off, so no correlation_id is minted for triggers the
-/// capture loop will drop at the same gate.
-fn capture_trigger_kind(
+/// until the burst ends, handled by [`ScrollBurstTracker`]. App/window ignore
+/// matching is computed by the hot loop once and passed in as `is_ignored`.
+fn capture_trigger_kind_with_ignored(
     db_event: &InsertUiEvent,
-    ignored_patterns: &[WindowPattern],
+    is_ignored: bool,
     _gates: TriggerGates,
 ) -> Option<crate::event_driven_capture::CaptureTrigger> {
     use crate::event_driven_capture::CaptureTrigger;
-    // Both AppSwitch and WindowFocus events carry app_name (set by the
-    // a11y observer when the focused app or window changes), so we can pass
-    // both sides to the matcher and have scoped `App::Title` patterns work.
-    let app = db_event.app_name.clone().unwrap_or_default();
-    let title = db_event.window_title.clone().unwrap_or_default();
-    let app_lower = app.to_lowercase();
-    let title_lower = title.to_lowercase();
-    let is_ignored = window_pattern::matches_any(ignored_patterns, &app_lower, &title_lower);
     let target = event_target_point(db_event);
     match &db_event.event_type {
         screenpipe_db::UiEventType::AppSwitch => {
@@ -902,7 +895,7 @@ fn capture_trigger_kind(
                 None
             } else {
                 Some(CaptureTrigger::AppSwitch {
-                    app_name: app,
+                    app_name: db_event.app_name.clone().unwrap_or_default(),
                     target,
                 })
             }
@@ -912,7 +905,7 @@ fn capture_trigger_kind(
                 None
             } else {
                 Some(CaptureTrigger::WindowFocus {
-                    window_name: title,
+                    window_name: db_event.window_title.clone().unwrap_or_default(),
                     target,
                 })
             }
@@ -940,6 +933,30 @@ fn capture_trigger_kind(
         // Move/Idle never trigger.
         _ => None,
     }
+}
+
+#[cfg(test)]
+fn capture_trigger_kind(
+    db_event: &InsertUiEvent,
+    ignored_patterns: &[WindowPattern],
+    gates: TriggerGates,
+) -> Option<crate::event_driven_capture::CaptureTrigger> {
+    let is_ignored = if ignored_patterns.is_empty() {
+        false
+    } else {
+        let app_lower = db_event
+            .app_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        let title_lower = db_event
+            .window_title
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        window_pattern::matches_any(ignored_patterns, &app_lower, &title_lower)
+    };
+    capture_trigger_kind_with_ignored(db_event, is_ignored, gates)
 }
 
 /// Tracks the most recent Scroll event in a burst so the recorder can

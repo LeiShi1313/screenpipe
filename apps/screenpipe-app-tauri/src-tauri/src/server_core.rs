@@ -498,7 +498,11 @@ impl ServerCore {
                             // Hold the lock only to collect declarations, then drop it
                             let items = {
                                 let mgr = pm.lock().await;
-                                let all = mgr.list_artifact_declarations().await;
+                                let all = mgr
+                                    .list_artifact_declarations(
+                                        screenpipe_engine::pipes_api::ARTIFACT_FALLBACK_CAP,
+                                    )
+                                    .await;
                                 all.into_iter()
                                     .find(|(n, _)| n == &name)
                                     .map(|(_, items)| items)
@@ -680,6 +684,15 @@ impl ServerCore {
         // stored on Self for `shutdown()` to fire on app quit.
         let redact_shutdown = Arc::new(Notify::new());
 
+        // Shared slot: once the text pipeline loads it doubles as the image
+        // worker's region classifier (see screenpipe_redact::image::text_gate)
+        // so text and image redaction share ONE classifier and the user's
+        // per-category toggles mean the same thing on pixels as on text.
+        // OnceLock because the text backend loads asynchronously; until it's
+        // set the image worker runs ungated (legacy behavior).
+        let text_gate_slot: Arc<std::sync::OnceLock<Arc<dyn screenpipe_redact::Redactor>>> =
+            Arc::new(std::sync::OnceLock::new());
+
         if config.async_pii_redaction {
             use screenpipe_redact::adapters::onnx::{OnnxConfig, OnnxRedactor};
             use screenpipe_redact::adapters::opf::{OpfAdapter, OpfConfig};
@@ -704,6 +717,7 @@ impl ServerCore {
             // removal" toggle means. The 20260507 migration drops the
             // dead duplicate columns the old non-destructive mode used.
             if use_tinfoil {
+                let text_policy = TextRedactionPolicy::from_labels(&pii_labels);
                 let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::new(TinfoilConfig {
                     api_key: tinfoil_api_key.clone(),
                     labels: pii_labels.clone(),
@@ -716,12 +730,24 @@ impl ServerCore {
                     "starting async text-PII reconciliation worker (backend=tinfoil)"
                 );
                 let pipeline = Pipeline::regex_then_ai(
-                    ai,
+                    ai.clone(),
                     PipelineConfig {
-                        policy: TextRedactionPolicy::from_labels(&pii_labels),
+                        policy: text_policy.clone(),
                         ..Default::default()
                     },
                 );
+                // Same backend, ai_min_chars=0: image regions are short
+                // fragments ("Marcus Hayes", "CUS-88241") that the worker
+                // pipeline's 12-char AI floor would skip.
+                let gate = Pipeline::regex_then_ai(
+                    ai,
+                    PipelineConfig {
+                        policy: text_policy,
+                        ai_min_chars: 0,
+                        ..Default::default()
+                    },
+                );
+                let _ = text_gate_slot.set(Arc::new(gate) as Arc<dyn Redactor>);
                 let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
                 let cfg = WorkerConfig {
                     tables: ALL_TARGET_TABLES.to_vec(),
@@ -737,8 +763,18 @@ impl ServerCore {
                 let pool = db.pool.clone();
                 let shutdown = redact_shutdown.clone();
                 let labels = pii_labels.clone();
+                let gate_slot = text_gate_slot.clone();
                 tokio::spawn(async move {
                     let policy = TextRedactionPolicy::from_labels(&labels);
+                    // Gate pipeline shares the same AI adapter Arc as the
+                    // worker pipeline (no extra model in RAM); ai_min_chars=0
+                    // because image regions are short fragments the worker
+                    // pipeline's 12-char AI floor would skip.
+                    let gate_cfg = |policy: TextRedactionPolicy| PipelineConfig {
+                        policy,
+                        ai_min_chars: 0,
+                        ..Default::default()
+                    };
                     // Prefer the local ONNX text redactor (~278 MB INT8,
                     // sub-10 ms p50, gets CoreML on macOS / DirectML on
                     // Windows / CPU on Linux via the redact-onnx-* CI
@@ -753,7 +789,7 @@ impl ServerCore {
                         "fetching local ONNX text redactor (~278 MB INT8 on first run)"
                     );
                     let onnx_result = OnnxRedactor::load_or_download(onnx_cfg).await;
-                    let pipeline = match onnx_result {
+                    let (pipeline, gate) = match onnx_result {
                         Ok(adapter) => {
                             info!(
                                 model = adapter.name(),
@@ -761,12 +797,15 @@ impl ServerCore {
                                 "starting async text-PII reconciliation worker (backend=local)"
                             );
                             let ai: Arc<dyn Redactor> = Arc::new(adapter);
-                            Pipeline::regex_then_ai(
-                                ai,
-                                PipelineConfig {
-                                    policy: policy.clone(),
-                                    ..Default::default()
-                                },
+                            (
+                                Pipeline::regex_then_ai(
+                                    ai.clone(),
+                                    PipelineConfig {
+                                        policy: policy.clone(),
+                                        ..Default::default()
+                                    },
+                                ),
+                                Pipeline::regex_then_ai(ai, gate_cfg(policy.clone())),
                             )
                         }
                         Err(onnx_err) => {
@@ -783,12 +822,15 @@ impl ServerCore {
                                          (backend=local, fallback)"
                                     );
                                     let ai: Arc<dyn Redactor> = Arc::new(adapter);
-                                    Pipeline::regex_then_ai(
-                                        ai,
-                                        PipelineConfig {
-                                            policy: policy.clone(),
-                                            ..Default::default()
-                                        },
+                                    (
+                                        Pipeline::regex_then_ai(
+                                            ai.clone(),
+                                            PipelineConfig {
+                                                policy: policy.clone(),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                        Pipeline::regex_then_ai(ai, gate_cfg(policy.clone())),
                                     )
                                 }
                                 Err(e) => {
@@ -798,11 +840,15 @@ impl ServerCore {
                                          to 'tinfoil' in Settings → Privacy → AI PII removal \
                                          to use the cloud enclave instead."
                                     );
-                                    Pipeline::regex_only_with_policy(policy.clone())
+                                    (
+                                        Pipeline::regex_only_with_policy(policy.clone()),
+                                        Pipeline::regex_only_with_policy(policy.clone()),
+                                    )
                                 }
                             }
                         }
                     };
+                    let _ = gate_slot.set(Arc::new(gate) as Arc<dyn Redactor>);
                     let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
                     let cfg = WorkerConfig {
                         tables: ALL_TARGET_TABLES.to_vec(),
@@ -840,6 +886,7 @@ impl ServerCore {
                     detector,
                     ImageWorkerConfig {
                         policy: ImageRedactionPolicy::from_labels(&pii_labels),
+                        text_gate: Some(text_gate_slot.clone()),
                         ..Default::default()
                     },
                 )
@@ -852,6 +899,7 @@ impl ServerCore {
                 // loads, so they never drift on a model bump.
                 let shutdown = redact_shutdown.clone();
                 let labels = pii_labels.clone();
+                let gate_slot = text_gate_slot.clone();
                 tokio::spawn(async move {
                     match RfdetrRedactor::load_or_download(RfdetrConfig::default()).await {
                         Ok(detector) => {
@@ -866,6 +914,7 @@ impl ServerCore {
                                 detector_arc,
                                 ImageWorkerConfig {
                                     policy: ImageRedactionPolicy::from_labels(&labels),
+                                    text_gate: Some(gate_slot),
                                     ..Default::default()
                                 },
                             )

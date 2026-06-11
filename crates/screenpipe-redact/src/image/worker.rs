@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 
 use super::frame_redactor::{redact_frame, FrameRedactionOutcome};
 use super::{ImageRedactionPolicy, ImageRedactor};
+use crate::Redactor;
 
 /// Knobs for the image reconciliation worker.
 ///
@@ -51,6 +52,18 @@ pub struct ImageWorkerConfig {
     pub min_age_seconds: i64,
     /// Per-frame redaction policy (allow-list + score floor).
     pub policy: ImageRedactionPolicy,
+    /// Text pipeline used to confirm each detected region against the
+    /// frame's OCR words before blacking it out — the rfdetr detector
+    /// localizes well but classifies unreliably on real screens, so
+    /// without this gate the per-category toggles act on garbage labels
+    /// (see [`super::text_gate`]). Hand it the SAME policy-applying
+    /// pipeline the text worker runs so text and image share one
+    /// classifier and one toggle semantics.
+    ///
+    /// Behind `OnceLock` because the text pipeline loads asynchronously
+    /// (model download) after the image worker may already be running:
+    /// until it's set, frames are processed ungated (current behavior).
+    pub text_gate: Option<Arc<std::sync::OnceLock<Arc<dyn Redactor>>>>,
 }
 
 impl Default for ImageWorkerConfig {
@@ -60,6 +73,7 @@ impl Default for ImageWorkerConfig {
             idle_between_frames: Duration::from_millis(20),
             min_age_seconds: 60,
             policy: ImageRedactionPolicy::default(),
+            text_gate: None,
         }
     }
 }
@@ -257,7 +271,31 @@ impl ImageWorker {
             return Ok(Some(FrameRedactionOutcome::default()));
         }
 
-        let regions = self.redactor.detect(path).await?;
+        let mut regions = self.redactor.detect(path).await?;
+        // Cross-check every detected region against the frame's OCR words
+        // via the text pipeline (when wired and loaded) — drops detector
+        // hallucinations and makes the per-category toggles authoritative
+        // on pixels too. Fails open: any error keeps the raw detections.
+        if let Some(gate) = self.cfg.text_gate.as_ref().and_then(|slot| slot.get()) {
+            if !regions.is_empty() {
+                match image::image_dimensions(path) {
+                    Ok(dims) => {
+                        regions = super::text_gate::gate_regions(
+                            &self.pool,
+                            id,
+                            dims,
+                            regions,
+                            gate,
+                            &self.cfg.policy,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        debug!(frame = id, error = %e, "text-gate: couldn't read image dimensions — skipping gate");
+                    }
+                }
+            }
+        }
         let outcome =
             redact_frame(path, &regions, &self.cfg.policy).map_err(anyhow::Error::from)?;
 

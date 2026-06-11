@@ -969,10 +969,9 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 },
 /**
  * Open the screenpi.pe login page.
- * On Windows, opens in the system browser (WebView2 has issues with some auth
- * providers; the registered deep-link scheme handles the redirect back).
- * On macOS/Linux, uses an in-app WebView that intercepts the screenpipe://
- * deep-link redirect (Safari blocks custom-scheme redirects).
+ * Windows: system browser + registered deep-link scheme handles the redirect.
+ * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
+ * Linux: in-app WebView that intercepts the screenpipe:// redirect.
  */
 async openLoginWindow() : Promise<Result<null, string>> {
     try {

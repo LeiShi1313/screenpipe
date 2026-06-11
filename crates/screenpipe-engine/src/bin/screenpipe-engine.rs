@@ -1849,6 +1849,15 @@ async fn main() -> anyhow::Result<()> {
              Toggle via Settings → Privacy → AI PII removal."
         );
     }
+    // Shared slot: once the text pipeline loads it doubles as the image
+    // worker's region classifier (screenpipe_redact::image::text_gate), so
+    // text and image redaction share ONE classifier and the per-category
+    // toggles mean the same thing on pixels as on text. OnceLock because
+    // the text backend loads asynchronously; until set, the image worker
+    // runs ungated (legacy behavior).
+    let text_gate_slot: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<dyn screenpipe_redact::Redactor>>,
+    > = std::sync::Arc::new(std::sync::OnceLock::new());
     if config.async_pii_redaction {
         use screenpipe_redact::{
             adapters::{
@@ -1883,29 +1892,44 @@ async fn main() -> anyhow::Result<()> {
         //      regex-redacted text into the source columns).
         let pool = db.pool.clone();
         let labels = config.pii_redaction_labels.clone();
+        let gate_slot = text_gate_slot.clone();
         tokio::spawn(async move {
             // Per-label allow-list from the `piiRedactionLabels` setting
             // (default ["secret"]). Local adapters filter client-side via
             // this policy; the env-gated tinfoil fallback forwards the
             // raw labels so the enclave filters server-side.
             let policy = TextRedactionPolicy::from_labels(&labels);
+            // Gate pipeline shares the same AI adapter Arc as the worker
+            // pipeline (no extra model in RAM); ai_min_chars=0 because
+            // image regions are short fragments ("Marcus Hayes",
+            // "CUS-88241") the worker pipeline's 12-char AI floor skips.
+            let gate_cfg = |policy: TextRedactionPolicy| PipelineConfig {
+                policy,
+                ai_min_chars: 0,
+                ..Default::default()
+            };
             info!(
                 "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
                  cached at ~/.screenpipe/models/v45_phase3_onnx/)"
             );
-            let pipeline = match OnnxRedactor::load_or_download(OnnxConfig::default()).await {
+            let (pipeline, gate) = match OnnxRedactor::load_or_download(OnnxConfig::default())
+                .await
+            {
                 Ok(adapter) => {
                     info!(
                         "text-PII AI step: local v45_phase3 ONNX — same checkpoint as the \
                          desktop app + Tinfoil container, sub-10 ms p50 on CPU"
                     );
                     let ai: Arc<dyn Redactor> = Arc::new(adapter);
-                    Pipeline::regex_then_ai(
-                        ai,
-                        PipelineConfig {
-                            policy: policy.clone(),
-                            ..Default::default()
-                        },
+                    (
+                        Pipeline::regex_then_ai(
+                            ai.clone(),
+                            PipelineConfig {
+                                policy: policy.clone(),
+                                ..Default::default()
+                            },
+                        ),
+                        Pipeline::regex_then_ai(ai, gate_cfg(policy.clone())),
                     )
                 }
                 Err(onnx_err) => {
@@ -1929,12 +1953,15 @@ async fn main() -> anyhow::Result<()> {
                             let adapter = Arc::new(adapter);
                             let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
                             let ai: Arc<dyn Redactor> = adapter;
-                            Pipeline::regex_then_ai(
-                                ai,
-                                PipelineConfig {
-                                    policy: policy.clone(),
-                                    ..Default::default()
-                                },
+                            (
+                                Pipeline::regex_then_ai(
+                                    ai.clone(),
+                                    PipelineConfig {
+                                        policy: policy.clone(),
+                                        ..Default::default()
+                                    },
+                                ),
+                                Pipeline::regex_then_ai(ai, gate_cfg(policy.clone())),
                             )
                         }
                         Err(e) => {
@@ -1950,12 +1977,15 @@ async fn main() -> anyhow::Result<()> {
                                         labels: labels.clone(),
                                         ..Default::default()
                                     }));
-                                Pipeline::regex_then_ai(
-                                    ai,
-                                    PipelineConfig {
-                                        policy: policy.clone(),
-                                        ..Default::default()
-                                    },
+                                (
+                                    Pipeline::regex_then_ai(
+                                        ai.clone(),
+                                        PipelineConfig {
+                                            policy: policy.clone(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    Pipeline::regex_then_ai(ai, gate_cfg(policy.clone())),
                                 )
                             } else {
                                 tracing::warn!(
@@ -1963,12 +1993,16 @@ async fn main() -> anyhow::Result<()> {
                                      unavailable ({e}), and no TINFOIL_* env vars set. Worker \
                                      will run regex-only."
                                 );
-                                Pipeline::regex_only_with_policy(policy.clone())
+                                (
+                                    Pipeline::regex_only_with_policy(policy.clone()),
+                                    Pipeline::regex_only_with_policy(policy.clone()),
+                                )
                             }
                         }
                     }
                 }
             };
+            let _ = gate_slot.set(Arc::new(gate) as Arc<dyn Redactor>);
             let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
 
             let worker_cfg = WorkerConfig {
@@ -2070,6 +2104,7 @@ async fn main() -> anyhow::Result<()> {
             );
             let cfg = ImageWorkerConfig {
                 policy: ImageRedactionPolicy::from_labels(&config.pii_redaction_labels),
+                text_gate: Some(text_gate_slot.clone()),
                 ..Default::default()
             };
             let _img_handle = ImageWorker::new(db.pool.clone(), detector, cfg).spawn();

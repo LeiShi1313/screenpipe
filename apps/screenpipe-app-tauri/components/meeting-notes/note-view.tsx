@@ -84,6 +84,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Receipts } from "./receipts";
 import { ReplayStrip } from "./replay-strip";
+import { ListeningSticks } from "./listening-sticks";
 import { NoteEditor, type NoteEditorHandle } from "./note-editor";
 import {
   imageBytesToDataUrl,
@@ -1058,7 +1059,7 @@ export function NoteView({
             key={meeting.id}
             value={note}
             onChange={setNote}
-            placeholder="Write notes"
+            placeholder={'write notes, or type "/" for blocks'}
             className="mt-10 [&_.ProseMirror]:min-h-[50vh] [&_.ProseMirror]:text-[15px] [&_.ProseMirror]:leading-7"
           />
 
@@ -1129,23 +1130,25 @@ export function NoteView({
                     : "bg-muted text-muted-foreground",
                 )}
               >
-                <Mic2 className="h-4 w-4" />
+                {isLive && captureState?.severity !== "warning" ? (
+                  // Live waveform driven by the polled device levels — motion
+                  // (not color) carries the "listening" state. A flat line
+                  // means armed but hearing nothing yet.
+                  <ListeningSticks
+                    active={captureState?.severity !== "waiting"}
+                    level={audioLevelToMeterValue(
+                      maxAudioDeviceLevel(audioStatusDevices),
+                    )}
+                  />
+                ) : (
+                  <Mic2 className="h-4 w-4" />
+                )}
               </span>
               <div className="min-w-0">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <span>
                     {isLive ? (captureState?.label ?? "Recording") : "Meeting saved"}
                   </span>
-                  {isLive && captureState?.severity !== "warning" && (
-                    <span
-                      className={cn(
-                        "h-1.5 w-1.5 rounded-full",
-                        captureState?.severity === "waiting"
-                          ? "bg-muted-foreground"
-                          : "bg-foreground animate-pulse",
-                      )}
-                    />
-                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
                   <span>{dockDuration}</span>

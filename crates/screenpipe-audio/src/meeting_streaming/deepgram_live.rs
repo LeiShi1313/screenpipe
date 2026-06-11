@@ -34,7 +34,7 @@ use crate::{
         net::connect_websocket_with_ipv4_fallback,
         MeetingAudioFrame, MeetingStreamingConfig, MeetingStreamingProvider,
     },
-    utils::audio::resample,
+    utils::audio::StreamResampler,
 };
 
 const DEEPGRAM_PCM_SAMPLE_RATE: u32 = 16_000;
@@ -156,6 +156,7 @@ async fn run_stream(
     });
 
     let mut keep_alive = interval(KEEP_ALIVE_INTERVAL);
+    let mut resampler: Option<StreamResampler> = None;
     loop {
         tokio::select! {
             maybe_frame = rx.recv() => {
@@ -163,7 +164,7 @@ async fn run_stream(
                     break;
                 };
                 latest_audio_ms.store(frame.captured_at_unix_ms, Ordering::Relaxed);
-                let audio = encode_frame(&frame)?;
+                let audio = encode_frame(&frame, &mut resampler)?;
                 if audio.is_empty() {
                     continue;
                 }
@@ -181,6 +182,13 @@ async fn run_stream(
         }
     }
 
+    // Drain the resampler's partial chunk so the meeting tail reaches Deepgram
+    // before Finalize (best-effort, like the shutdown messages below).
+    if let Some(tail) = resampler.as_mut().and_then(|rs| rs.flush().ok()) {
+        if !tail.is_empty() {
+            let _ = write.send(Message::Binary(pcm_bytes(&tail))).await;
+        }
+    }
     let _ = write
         .send(Message::Text(json!({ "type": "Finalize" }).to_string()))
         .await;
@@ -239,7 +247,10 @@ fn auth_header(provider: &MeetingStreamingProvider, credential: &str) -> String 
     }
 }
 
-fn encode_frame(frame: &MeetingAudioFrame) -> Result<Vec<u8>> {
+fn encode_frame(
+    frame: &MeetingAudioFrame,
+    resampler: &mut Option<StreamResampler>,
+) -> Result<Vec<u8>> {
     if frame.samples.is_empty() {
         return Ok(Vec::new());
     }
@@ -248,17 +259,31 @@ fn encode_frame(frame: &MeetingAudioFrame) -> Result<Vec<u8>> {
     let samples = if frame.sample_rate == DEEPGRAM_PCM_SAMPLE_RATE {
         mono
     } else {
-        resample(&mono, frame.sample_rate, DEEPGRAM_PCM_SAMPLE_RATE)
+        // One resampler per stream, rebuilt only if the device's sample rate
+        // changes mid-meeting; constructing one per frame recomputes a 65k-tap
+        // sinc bank each call and burned more than a core during meetings.
+        let stream = match resampler {
+            Some(stream) if stream.from_sample_rate() == frame.sample_rate => stream,
+            _ => resampler.insert(
+                StreamResampler::new(frame.sample_rate, DEEPGRAM_PCM_SAMPLE_RATE)
+                    .context("failed to build resampler for Deepgram live transcription")?,
+            ),
+        };
+        stream
+            .process(&mono)
             .context("failed to resample meeting audio for Deepgram live transcription")?
     };
 
+    Ok(pcm_bytes(&samples))
+}
+
+fn pcm_bytes(samples: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
         let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
         bytes.extend_from_slice(&pcm.to_le_bytes());
     }
-
-    Ok(bytes)
+    bytes
 }
 
 fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
@@ -512,7 +537,7 @@ mod tests {
             channels: spec.channels,
             captured_at_unix_ms: 0,
         };
-        let mut pcm = encode_frame(&frame).expect("encode fixture");
+        let mut pcm = encode_frame(&frame, &mut None).expect("encode fixture");
         // 16kHz mono 16-bit => 32_000 bytes per second.
         pcm.truncate(320_000);
         pcm

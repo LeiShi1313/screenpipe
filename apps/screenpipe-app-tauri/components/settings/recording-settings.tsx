@@ -26,6 +26,7 @@ export const searchIndex: SettingsField[] = [
   { label: "Microphone echo cancellation", keywords: ["echo", "voiceprocessingio"], conditional: true },
   { label: "CoreAudio system audio capture", keywords: ["coreaudio", "system audio"], conditional: true },
   { label: "Screen recording", keywords: ["screen", "video"] },
+  { label: "Keep computer awake", keywords: ["sleep", "awake", "power"] },
   { label: "Use all monitors", keywords: ["monitor", "display"] },
   { label: "Recording quality", keywords: ["fps", "quality"] },
   // conditional: monitor picker only renders when "Use all monitors" is off.

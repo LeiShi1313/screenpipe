@@ -11,6 +11,13 @@ import { localFetch } from "@/lib/api";
 import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/utils/tauri";
+import type { SettingsField } from "./settings-search";
+
+/** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
+export const searchIndex: SettingsField[] = [
+  { label: "Power mode", keywords: ["battery", "performance", "saver"] },
+  { label: "Keep computer awake", keywords: ["sleep", "awake", "power"] },
+];
 
 interface PowerState {
   battery_pct: number | null;

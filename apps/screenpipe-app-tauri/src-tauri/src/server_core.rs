@@ -491,7 +491,7 @@ impl ServerCore {
                     }
                     analytics::capture_event_nonblocking("pipe_scheduled_run", props);
 
-                    // Auto-register pipe outputs to ~/.screenpipe/outputs/
+                    // Auto-register pipe artifacts to ~/.screenpipe/outputs/
                     if success {
                         let db = db_for_cb.clone();
                         let dir = screenpipe_dir_for_cb.clone();
@@ -503,7 +503,7 @@ impl ServerCore {
                                 let mgr = pm.lock().await;
                                 let all = mgr
                                     .list_artifact_declarations(
-                                        screenpipe_engine::pipes_api::ARTIFACT_FALLBACK_CAP,
+                                        screenpipe_engine::routes::artifacts::ARTIFACT_FALLBACK_CAP,
                                     )
                                     .await;
                                 all.into_iter()
@@ -512,7 +512,7 @@ impl ServerCore {
                                     .unwrap_or_default()
                             };
                             if !items.is_empty() {
-                                screenpipe_engine::routes::outputs::auto_register_pipe_outputs(
+                                screenpipe_engine::routes::artifacts::auto_register_pipe_artifacts(
                                     &db, items, &name, &dir,
                                 )
                                 .await;

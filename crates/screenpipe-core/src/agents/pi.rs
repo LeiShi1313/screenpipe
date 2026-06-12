@@ -627,7 +627,7 @@ impl PiExecutor {
     }
 
     /// Install the register-artifact extension so pipes can register files
-    /// as artifacts mid-execution via the local /outputs/register API.
+    /// as artifacts mid-execution via the local /artifacts/register API.
     pub fn ensure_register_artifact_extension(project_dir: &Path) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         std::fs::create_dir_all(&ext_dir)?;

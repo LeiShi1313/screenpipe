@@ -296,6 +296,14 @@ impl WatchdogState {
             }
         }
 
+        // A speaker chunk means the capture path is alive again. Clear any
+        // outstanding restart strike so a later, separate drop gets another
+        // automatic restart attempt instead of inheriting an old timestamp and
+        // jumping straight to user notification.
+        if inputs.output_chunk_recent {
+            self.restart_attempted_at = None;
+        }
+
         // Healthy again after we notified → tell subscribers to clear.
         if self.notified && !self.recovered_emitted && inputs.output_chunk_recent {
             self.recovered_emitted = true;
@@ -503,6 +511,19 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    #[test]
+    fn endpoint_name_strips_only_output_suffix() {
+        assert_eq!(
+            endpoint_name_from_device_string("Speakers (Realtek(R) Audio) (output)"),
+            Some("Speakers (Realtek(R) Audio)")
+        );
+        assert_eq!(
+            endpoint_name_from_device_string("Monitor (output) (output)"),
+            Some("Monitor (output)")
+        );
+        assert_eq!(endpoint_name_from_device_string("Remote Audio"), None);
+    }
+
     // ── follow ──────────────────────────────────────────────────────────
 
     #[test]
@@ -607,6 +628,49 @@ mod tests {
             .unwrap();
         let retried = f.decide(&samples, &none, &none, &none, later);
         assert_eq!(retried.len(), 1);
+    }
+
+    #[test]
+    fn follow_keeps_quiet_but_active_session_running() {
+        let mut f = FollowState::new();
+        let now = Instant::now();
+        let active = vec![sample("Remote Audio", true, 0.0)];
+        let none = HashSet::new();
+
+        let t0 = past(now, FOLLOW_IDLE_STOP_SECS + 10);
+        f.decide(&active, &none, &none, &none, past(t0, 2));
+        let started = f.decide(&active, &none, &none, &none, t0);
+        assert_eq!(
+            started,
+            vec![FollowAction::Start("Remote Audio (output)".to_string())]
+        );
+
+        // Long speech pause: the session is still Active even though the
+        // instantaneous meter is silent, so follow must keep capturing.
+        let actions = f.decide(&active, &none, &none, &none, now);
+        assert!(actions.is_empty(), "quiet active session was stopped");
+        assert!(f.started_by_follow.contains("Remote Audio (output)"));
+    }
+
+    #[test]
+    fn follow_stops_when_endpoint_vanishes() {
+        let mut f = FollowState::new();
+        let now = Instant::now();
+        let active = vec![sample("Remote Audio", true, 0.1)];
+        let none = HashSet::new();
+
+        let t0 = past(now, FOLLOW_IDLE_STOP_SECS + 10);
+        f.decide(&active, &none, &none, &none, past(t0, 2));
+        let started = f.decide(&active, &none, &none, &none, t0);
+        assert_eq!(started.len(), 1);
+
+        let vanished = Vec::new();
+        let actions = f.decide(&vanished, &none, &none, &none, now);
+        assert_eq!(
+            actions,
+            vec![FollowAction::Stop("Remote Audio (output)".to_string())]
+        );
+        assert!(f.started_by_follow.is_empty());
     }
 
     // ── watchdog ────────────────────────────────────────────────────────
@@ -726,6 +790,113 @@ mod tests {
                 output_chunk_recent: true,
                 any_endpoint_audible: true,
                 now: t3.checked_add(Duration::from_secs(2)).unwrap(),
+            }),
+            WatchdogAction::None
+        );
+    }
+
+    #[test]
+    fn watchdog_restarts_again_after_pre_notification_recovery() {
+        let mut w = WatchdogState::new();
+        let start = Instant::now();
+        let t = audible_for(&mut w, start, MEETING_AUDIBLE_MIN_SECS, false);
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: false,
+                any_endpoint_audible: true,
+                now: t,
+            }),
+            WatchdogAction::RestartOutputs
+        );
+
+        // Restart worked before notification: chunks resume, so the strike is cleared.
+        let recovered = t.checked_add(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: true,
+                any_endpoint_audible: true,
+                now: recovered,
+            }),
+            WatchdogAction::None
+        );
+
+        // Later in the same meeting, speaker chunks stop again. This is a new
+        // failure and must get another automatic restart before any notification.
+        let second_drop = recovered
+            .checked_add(Duration::from_secs(RESTART_TO_NOTIFY_SECS + 10))
+            .unwrap();
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: false,
+                any_endpoint_audible: true,
+                now: second_drop,
+            }),
+            WatchdogAction::RestartOutputs
+        );
+    }
+
+    #[test]
+    fn watchdog_restarts_again_after_notified_recovery_without_renotifying() {
+        let mut w = WatchdogState::new();
+        let start = Instant::now();
+        let t = audible_for(&mut w, start, MEETING_AUDIBLE_MIN_SECS, false);
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: false,
+                any_endpoint_audible: true,
+                now: t,
+            }),
+            WatchdogAction::RestartOutputs
+        );
+        let notified_at = t
+            .checked_add(Duration::from_secs(RESTART_TO_NOTIFY_SECS + 2))
+            .unwrap();
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: false,
+                any_endpoint_audible: true,
+                now: notified_at,
+            }),
+            WatchdogAction::NotifySpeakerSilent
+        );
+
+        let recovered = notified_at.checked_add(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: true,
+                any_endpoint_audible: true,
+                now: recovered,
+            }),
+            WatchdogAction::EmitRecovered
+        );
+
+        // Same meeting, still inside notification cooldown: try recovery
+        // again, but do not nag the user twice.
+        let second_drop = recovered.checked_add(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: false,
+                any_endpoint_audible: true,
+                now: second_drop,
+            }),
+            WatchdogAction::RestartOutputs
+        );
+        let still_dead = second_drop
+            .checked_add(Duration::from_secs(RESTART_TO_NOTIFY_SECS + 2))
+            .unwrap();
+        assert_eq!(
+            w.decide(WatchdogInputs {
+                in_meeting: true,
+                output_chunk_recent: false,
+                any_endpoint_audible: true,
+                now: still_dead,
             }),
             WatchdogAction::None
         );

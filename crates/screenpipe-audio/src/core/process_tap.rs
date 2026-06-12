@@ -836,8 +836,7 @@ pub fn spawn_process_tap_capture(
             // the exponential backoff (an exclusion rebuild resets it). The
             // tap-only aggregate no longer tracks default-output switches, so
             // silence and exclusions are the only rebuild triggers left.
-            let silence_only_rebuild =
-                should_rebuild_for_silence && !should_rebuild_for_exclusions;
+            let silence_only_rebuild = should_rebuild_for_silence && !should_rebuild_for_exclusions;
 
             // Drop the old capture BEFORE building the new one so its CoreAudio
             // slot and aggregate-device entry are released first.

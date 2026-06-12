@@ -199,15 +199,10 @@ impl UiRecorderConfig {
             config.excluded_apps.push(app.to_lowercase());
         }
 
-        // Add excluded window patterns
-        for pattern in &self.excluded_windows {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                config.excluded_window_patterns.push(re);
-            }
-        }
-
+        config.excluded_window_pattern_strings = self.excluded_windows.clone();
         config.ignored_windows = self.ignored_windows.clone();
         config.included_windows = self.included_windows.clone();
+        config.compile_patterns();
 
         config
     }
@@ -1449,6 +1444,21 @@ mod tests {
 
         assert!(ui_config.capture_clipboard);
         assert!(!ui_config.capture_clipboard_content);
+    }
+
+    #[test]
+    fn to_ui_config_refreshes_filter_caches() {
+        let config = UiRecorderConfig {
+            excluded_apps: vec!["SecretApp".to_string()],
+            excluded_windows: vec![r"(?i)private window".to_string()],
+            ..Default::default()
+        };
+
+        let ui_config = config.to_ui_config();
+
+        assert!(!ui_config.excluded_app_patterns.is_empty());
+        assert!(!ui_config.should_capture_app("secretapp helper"));
+        assert!(!ui_config.should_capture_window("Private Window - Browser"));
     }
 
     #[test]

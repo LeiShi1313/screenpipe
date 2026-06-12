@@ -457,12 +457,20 @@ export function useEnterprisePolicy() {
         const streams = (data.syncStreams ?? {}) as Record<string, unknown>;
         const pickBool = (key: string): boolean =>
           typeof streams[key] === "boolean" ? (streams[key] as boolean) : true;
+        // frame_images is a NEW data class (screen pixels leave the device on
+        // request) — unlike the legacy streams it defaults to FALSE when the
+        // server omits it. Fail-closed, opt-in via dashboard policy.
+        const frameImages =
+          typeof streams.frame_images === "boolean"
+            ? (streams.frame_images as boolean)
+            : false;
         await commands.setSyncStreams(
           pickBool("frames"),
           pickBool("audio"),
           pickBool("ui_events"),
           pickBool("memories"),
           pickBool("snapshots"),
+          frameImages,
         );
       } catch (e) {
         console.warn("[enterprise] failed to push sync streams to Rust:", e);

@@ -28,6 +28,13 @@ pub struct SyncStreams {
     pub ui_events: bool,
     pub memories: bool,
     pub snapshots: bool,
+    /// On-demand frame images: when the org's cloud pipes cite frame_ids
+    /// (SOP step screenshots), the device decodes those frames locally,
+    /// downscales and uploads them. Unlike the other streams this is a NEW
+    /// data class (actual screen pixels leaving the device on request), so
+    /// it defaults to FALSE — fail-closed, opt-in via dashboard policy. The
+    /// upload endpoint enforces the same gate server-side.
+    pub frame_images: bool,
 }
 
 impl Default for SyncStreams {
@@ -38,6 +45,7 @@ impl Default for SyncStreams {
             ui_events: true,
             memories: true,
             snapshots: true,
+            frame_images: false,
         }
     }
 }
@@ -167,6 +175,7 @@ pub fn set_sync_streams(
     ui_events: bool,
     memories: bool,
     snapshots: bool,
+    frame_images: bool,
 ) {
     let next = SyncStreams {
         frames,
@@ -174,16 +183,18 @@ pub fn set_sync_streams(
         ui_events,
         memories,
         snapshots,
+        frame_images,
     };
     if let Ok(mut guard) = SYNC_STREAMS.write() {
         if *guard != next {
             tracing::info!(
-                "enterprise: sync streams updated frames={} audio={} ui={} memories={} snapshots={}",
+                "enterprise: sync streams updated frames={} audio={} ui={} memories={} snapshots={} frame_images={}",
                 frames,
                 audio,
                 ui_events,
                 memories,
                 snapshots,
+                frame_images,
             );
         }
         *guard = next;
@@ -283,13 +294,13 @@ mod tests {
         // Touches the global static; reset to defaults after to avoid
         // poisoning sibling tests that read current_sync_streams.
         let _guard = sync_streams_test_lock();
-        set_sync_streams(false, true, false, true, false);
+        set_sync_streams(false, true, false, true, false, false);
         let s = current_sync_streams();
         assert!(!s.frames);
         assert!(s.audio);
         assert!(!s.ui_events);
         assert!(s.memories);
         assert!(!s.snapshots);
-        set_sync_streams(true, true, true, true, true);
+        set_sync_streams(true, true, true, true, true, false);
     }
 }

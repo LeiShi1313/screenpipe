@@ -848,9 +848,25 @@ pub struct SyncTickReport {
 // are reported back so the server can drop them from the manifest instead of
 // re-requesting them forever.
 
-/// Max frames fetched + uploaded per tick. Keeps a tick bounded even when a
-/// pipe requests the manifest cap; the rest drains on subsequent ticks.
-const FRAME_BATCH_MAX: usize = 20;
+/// Max frames fetched + uploaded per tick in "cited" mode (on-demand SOP
+/// screenshots). Keeps a tick bounded even when a pipe requests the manifest
+/// cap; the rest drains on subsequent ticks.
+const FRAME_BATCH_MAX_CITED: usize = 20;
+/// Per-tick batch in "all" mode — the org chose to centralize every frame,
+/// so the device drains its (server-auto-cited) manifest much faster:
+/// 200/tick x ~288 ticks/day far exceeds a busy device's daily frame count.
+const FRAME_BATCH_MAX_ALL: usize = 200;
+
+/// Per-tick frame batch for the org's chosen mode. Off never reaches the
+/// fetch loop (the gate returns first) but maps to 0 for totality.
+pub fn frame_batch_max(mode: crate::enterprise_policy::FrameImagesMode) -> usize {
+    use crate::enterprise_policy::FrameImagesMode as M;
+    match mode {
+        M::Off => 0,
+        M::Cited => FRAME_BATCH_MAX_CITED,
+        M::All => FRAME_BATCH_MAX_ALL,
+    }
+}
 /// Hard cap on a single encoded image. Matches the server's per-image limit.
 pub const FRAME_UPLOAD_MAX_BYTES: usize = 300_000;
 /// Width bound for uploaded frames — readable for SOP steps, not a raw dump.
@@ -964,9 +980,13 @@ pub async fn fulfill_frame_requests(
 ) -> FrameFulfillReport {
     let report = FrameFulfillReport::default();
 
-    // Fail-closed gates, cheapest first. The policy default is OFF; the
+    // Fail-closed gates, cheapest first. The policy default is Off; the
     // server enforces the same gate on the upload route (defense in depth).
-    if !crate::enterprise_policy::current_sync_streams().frame_images {
+    // The mode also sizes the per-tick batch: "cited" trickles SOP
+    // screenshots, "all" (org chose to centralize every frame) drains the
+    // server-auto-cited manifest in larger batches.
+    let mode = crate::enterprise_policy::current_sync_streams().frame_images;
+    if mode == crate::enterprise_policy::FrameImagesMode::Off {
         return report;
     }
     if !matches!(cfg.upload_mode, EnterpriseUploadMode::HostedIngest) {
@@ -1018,7 +1038,7 @@ pub async fn fulfill_frame_requests(
         .frame_ids
         .into_iter()
         .filter(|id| *id > 0)
-        .take(FRAME_BATCH_MAX)
+        .take(frame_batch_max(mode))
         .collect();
     if ids.is_empty() {
         return report;
@@ -2345,7 +2365,7 @@ mod tests {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
 
         // Disable frames, ui, snapshots. Keep audio + memories on.
-        crate::enterprise_policy::set_sync_streams(false, true, false, true, false, false);
+        crate::enterprise_policy::set_sync_streams(false, true, false, true, false, "off".to_string());
 
         // Capture the POST body so we can assert what actually crossed the
         // wire — the most direct evidence that the gate worked, not just
@@ -2432,7 +2452,7 @@ mod tests {
 
         // Reset to defaults so the binary-wide static doesn't leak into
         // other tests that may run later in the same process.
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, false);
+        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
     }
 
     // ─── On-demand frame fulfillment (P3) ───────────────────────────────────
@@ -2555,7 +2575,7 @@ mod tests {
     #[tokio::test]
     async fn fulfill_frame_requests_end_to_end() {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, true);
+        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "cited".to_string());
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -2616,14 +2636,14 @@ mod tests {
         assert_eq!(frames[1]["error"], "not_found");
         assert_eq!(frames[2]["error"], "fetch_failed");
 
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, false);
+        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
     }
 
     #[tokio::test]
     async fn fulfill_skips_when_stream_disabled() {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
         // frame_images=false is the default; set explicitly for clarity.
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, false);
+        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
 
         let server = wiremock::MockServer::start().await;
         // Zero expected requests — the policy gate short-circuits before HTTP.
@@ -2643,7 +2663,7 @@ mod tests {
     #[tokio::test]
     async fn fulfill_skips_for_zero_knowledge_upload_modes() {
         let _guard = crate::enterprise_policy::sync_streams_test_lock();
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, true);
+        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "cited".to_string());
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -2665,6 +2685,20 @@ mod tests {
         let report = fulfill_frame_requests(&cfg, &FrameMock, &http).await;
         assert_eq!(report, FrameFulfillReport::default());
 
-        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, false);
+        crate::enterprise_policy::set_sync_streams(true, true, true, true, true, "off".to_string());
+    }
+}
+// (frame_batch_max tests live with the rest of the ee_sync tests above; this
+// standalone module keeps them compiled in consumer-test builds too.)
+#[cfg(test)]
+mod frame_batch_tests {
+    use super::frame_batch_max;
+    use crate::enterprise_policy::FrameImagesMode;
+
+    #[test]
+    fn batch_size_follows_mode() {
+        assert_eq!(frame_batch_max(FrameImagesMode::Off), 0);
+        assert_eq!(frame_batch_max(FrameImagesMode::Cited), 20);
+        assert_eq!(frame_batch_max(FrameImagesMode::All), 200);
     }
 }

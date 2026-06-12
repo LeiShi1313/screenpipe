@@ -458,12 +458,16 @@ export function useEnterprisePolicy() {
         const pickBool = (key: string): boolean =>
           typeof streams[key] === "boolean" ? (streams[key] as boolean) : true;
         // frame_images is a NEW data class (screen pixels leave the device on
-        // request) — unlike the legacy streams it defaults to FALSE when the
-        // server omits it. Fail-closed, opt-in via dashboard policy.
+        // request) — a 3-way MODE ("off" | "cited" | "all"), the org's explicit
+        // dashboard choice. Legacy boolean policies map true → "cited".
+        // Anything unrecognized is "off" — fail-closed.
+        const rawMode = streams.frame_images as unknown;
         const frameImages =
-          typeof streams.frame_images === "boolean"
-            ? (streams.frame_images as boolean)
-            : false;
+          rawMode === "off" || rawMode === "cited" || rawMode === "all"
+            ? rawMode
+            : rawMode === true
+            ? "cited"
+            : "off";
         await commands.setSyncStreams(
           pickBool("frames"),
           pickBool("audio"),

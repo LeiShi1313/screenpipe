@@ -69,13 +69,14 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { useChatFilePreview } from "@/lib/hooks/use-chat-file-preview";
-import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
+import { useSqlAutocomplete, useTagAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import {
   parseMentions,
   buildAppMentionSuggestions,
+  buildTagMentionSuggestions,
   normalizeAppTag,
   formatShortcutDisplay,
   extractConversationHistorySyncUserText,
@@ -95,6 +96,10 @@ import {
   parseRateLimitWaitSeconds,
   PI_MAX_RATE_LIMIT_RETRIES,
 } from "@/lib/chat/quota-errors";
+import {
+  buildInvalidatedAuthTokenMessage,
+  isInvalidatedAuthTokenError,
+} from "@/lib/chat/auth-errors";
 import { buildSystemPrompt, buildConnectionsContext } from "@/lib/chat/system-prompt";
 import {
   classifyCurl,
@@ -156,11 +161,12 @@ function MermaidDiagramBlock({ chart }: { chart: string }) {
 interface MentionSuggestion {
   tag: string;
   description: string;
-  category: "time" | "content" | "app" | "speaker";
+  category: "time" | "content" | "app" | "speaker" | "tag";
   appName?: string;
 }
 
 const APP_SUGGESTION_LIMIT = 10;
+const TAG_SUGGESTION_LIMIT = 10;
 const STREAM_RENDER_THROTTLE_MS = 80;
 const EMPTY_QUEUED_PROMPTS: PiQueuedPrompt[] = [];
 const FOLLOW_UP_GENERATION_DELAY_MS = 10_000;
@@ -2502,7 +2508,8 @@ export function StandaloneChat({
   // (the buttons hide). Only relevant in standalone mode (no parent
   // className) — the embedded variant is below the host's chrome anyway.
   const isFullscreen = useIsFullscreen();
-  const { items: appItems } = useSqlAutocomplete("app");
+  const { items: appItems, isLoading: appsLoading, refresh: refreshAppItems } = useSqlAutocomplete("app");
+  const { items: tagItems, isLoading: tagsLoading, refresh: refreshTagItems } = useTagAutocomplete();
   const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
   const { templatePipes, loading: pipesLoading } = usePipes();
   // Connected integrations (gmail, google-sheets, slack, etc.) surfaced in the
@@ -2773,6 +2780,7 @@ export function StandaloneChat({
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
   const [isComposing, setIsComposing] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
+  const [mentionTrigger, setMentionTrigger] = useState<"@" | "#">("@");
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<MentionSuggestion[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
@@ -2867,6 +2875,7 @@ export function StandaloneChat({
   // quota / credits_exhausted errors when agent_end arrives with no content and
   // no explicit stopReason=error on any message (some providers drop that flag).
   const piLastErrorRef = useRef<string | null>(null);
+  const invalidatedAuthHandledRef = useRef(false);
   const piStartInFlightRef = useRef(false);
   const sendDispatchInFlightRef = useRef(false);
   const forceQueueModeRef = useRef(false);
@@ -2880,6 +2889,45 @@ export function StandaloneChat({
   const piActiveStopRequestedRef = useRef(false);
 
   const normalizeTurnIntentText = (value: string) => value.replace(/\s+/g, " ").trim();
+
+  useEffect(() => {
+    if (settings.user?.token) {
+      invalidatedAuthHandledRef.current = false;
+    }
+  }, [settings.user?.token]);
+
+  const handleInvalidatedAuthToken = useCallback(async () => {
+    if (invalidatedAuthHandledRef.current) return;
+    invalidatedAuthHandledRef.current = true;
+    posthog.capture("session_expired", { source: "pi_stream", reason: "token_invalidated" });
+
+    await updateSettings({ user: null as any });
+    try {
+      await commands.setCloudToken(null);
+    } catch (e) {
+      console.warn("failed to clear cloud token after Pi auth error:", e);
+    }
+    try {
+      const result = await commands.piUpdateConfig(null, null);
+      if (result.status === "error") {
+        console.warn("failed to clear Pi auth config after token invalidation:", result.error);
+      }
+    } catch (e) {
+      console.warn("failed to clear Pi auth config after token invalidation:", e);
+    }
+
+    toast({
+      title: "sign in required",
+      description: buildInvalidatedAuthTokenMessage(),
+      variant: "destructive",
+    });
+
+    try {
+      await commands.openLoginWindow();
+    } catch (e) {
+      console.warn("failed to open login after Pi auth error:", e);
+    }
+  }, [updateSettings]);
 
   const turnIntentTextValuesMatch = (leftValue: string, rightValue: string) => {
     const left = normalizeTurnIntentText(leftValue);
@@ -4095,6 +4143,46 @@ export function StandaloneChat({
     [appItems]
   );
 
+  const tagMentionSuggestions = React.useMemo(
+    () => buildTagMentionSuggestions(tagItems, TAG_SUGGESTION_LIMIT),
+    [tagItems]
+  );
+
+  const allTagMentionSuggestions = React.useMemo(
+    () => buildTagMentionSuggestions(tagItems, tagItems.length),
+    [tagItems]
+  );
+
+  const tagMentionSections = React.useMemo(() => {
+    type TagCountKey = "memory_count" | "audio_count" | "frame_count";
+    const used = new Set<string>();
+
+    const sourceCount = (item: (typeof tagItems)[number], key: TagCountKey) =>
+      item[key] ?? 0;
+
+    const pick = (key: TagCountKey) => {
+      const picked = tagItems
+        .filter((item) => sourceCount(item, key) > 0 && !used.has(item.name))
+        .sort((a, b) => {
+          const sourceDelta = sourceCount(b, key) - sourceCount(a, key);
+          if (sourceDelta !== 0) return sourceDelta;
+          const totalDelta = b.count - a.count;
+          if (totalDelta !== 0) return totalDelta;
+          return a.name.localeCompare(b.name);
+        })
+        .slice(0, TAG_SUGGESTION_LIMIT);
+
+      for (const item of picked) used.add(item.name);
+      return buildTagMentionSuggestions(picked, TAG_SUGGESTION_LIMIT);
+    };
+
+    return [
+      { label: "memory tags", suggestions: pick("memory_count") },
+      { label: "audio tags", suggestions: pick("audio_count") },
+      { label: "screen tags", suggestions: pick("frame_count") },
+    ].filter((section) => section.suggestions.length > 0);
+  }, [tagItems]);
+
   const appTagMap = React.useMemo(() => {
     const map: Record<string, string> = {};
     for (const suggestion of appMentionSuggestions) {
@@ -4106,19 +4194,20 @@ export function StandaloneChat({
   }, [appMentionSuggestions]);
 
   const baseMentionSuggestions = React.useMemo(
-    () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions],
-    [appMentionSuggestions]
+    () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions, ...tagMentionSuggestions],
+    [appMentionSuggestions, tagMentionSuggestions]
   );
 
   // Parse current input to extract active filters for chip display
   const activeFilters = React.useMemo(() => {
-    if (!input.trim()) return { timeRanges: [], contentType: null, appName: null, speakerName: null };
+    if (!input.trim()) return { timeRanges: [], contentType: null, appName: null, speakerName: null, tagNames: [] as string[] };
     const parsed = parseMentions(input, { appTagMap });
     return {
       timeRanges: parsed.timeRanges,
       contentType: parsed.contentType,
       appName: parsed.appName,
       speakerName: parsed.speakerName,
+      tagNames: parsed.tagNames,
     };
   }, [input, appTagMap]);
 
@@ -4126,23 +4215,26 @@ export function StandaloneChat({
   const hasActiveFilters = activeFilters.timeRanges.length > 0 ||
     activeFilters.contentType ||
     activeFilters.appName ||
-    activeFilters.speakerName;
+    activeFilters.speakerName ||
+    activeFilters.tagNames.length > 0;
   const activeFilterCount = (activeFilters.timeRanges.length > 0 ? 1 : 0) +
     (activeFilters.contentType ? 1 : 0) +
     (activeFilters.appName ? 1 : 0) +
-    (activeFilters.speakerName ? 1 : 0);
+    (activeFilters.speakerName ? 1 : 0) +
+    activeFilters.tagNames.length;
   const activeFilterLabels = React.useMemo(
     () => [
       ...activeFilters.timeRanges.map((range) => range.label),
       activeFilters.contentType,
       activeFilters.appName,
       activeFilters.speakerName,
+      ...activeFilters.tagNames.map((tag) => `#${tag}`),
     ].filter((label): label is string => Boolean(label)),
     [activeFilters]
   );
 
   // Remove a specific @mention from input
-  const removeFilter = (filterType: "time" | "content" | "app" | "speaker", label?: string) => {
+  const removeFilter = (filterType: "time" | "content" | "app" | "speaker" | "tag", label?: string) => {
     let newInput = input;
     if (filterType === "time") {
       // Remove time mentions like @today, @yesterday, @last-hour, etc.
@@ -4174,6 +4266,9 @@ export function StandaloneChat({
     } else if (filterType === "speaker" && activeFilters.speakerName) {
       const speakerPattern = new RegExp(`@"?${activeFilters.speakerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"?\\b`, "gi");
       newInput = newInput.replace(speakerPattern, "").trim();
+    } else if (filterType === "tag" && label) {
+      const tagPattern = new RegExp(`#${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+      newInput = newInput.replace(tagPattern, "").trim();
     }
     // Clean up extra spaces
     newInput = newInput.replace(/\s+/g, " ").trim();
@@ -4182,6 +4277,11 @@ export function StandaloneChat({
 
   // Fetch speakers dynamically
   useEffect(() => {
+    if (mentionTrigger !== "@") {
+      setSpeakerSuggestions([]);
+      return;
+    }
+
     if (!mentionFilter || mentionFilter.length < 1) {
       setSpeakerSuggestions([]);
       return;
@@ -4222,17 +4322,38 @@ export function StandaloneChat({
 
     const debounceTimeout = setTimeout(searchSpeakers, 300);
     return () => clearTimeout(debounceTimeout);
-  }, [mentionFilter, baseMentionSuggestions]);
+  }, [mentionFilter, mentionTrigger, baseMentionSuggestions]);
 
   const filteredMentions = React.useMemo(() => {
+    if (mentionTrigger === "#") {
+      const tagSuggestions = !mentionFilter
+        ? tagMentionSuggestions
+        : allTagMentionSuggestions.filter(
+            s => s.tag.toLowerCase().includes(mentionFilter.toLowerCase()) ||
+                 s.description.toLowerCase().includes(mentionFilter.toLowerCase())
+          );
+      return tagSuggestions;
+    }
+
+    const searchableSuggestions = mentionFilter
+      ? [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions, ...allTagMentionSuggestions]
+      : baseMentionSuggestions;
     const suggestions = !mentionFilter
-      ? baseMentionSuggestions
-      : baseMentionSuggestions.filter(
+      ? searchableSuggestions
+      : searchableSuggestions.filter(
           s => s.tag.toLowerCase().includes(mentionFilter.toLowerCase()) ||
                s.description.toLowerCase().includes(mentionFilter.toLowerCase())
         );
     return [...suggestions, ...speakerSuggestions];
-  }, [mentionFilter, speakerSuggestions, baseMentionSuggestions]);
+  }, [
+    mentionFilter,
+    mentionTrigger,
+    speakerSuggestions,
+    baseMentionSuggestions,
+    appMentionSuggestions,
+    tagMentionSuggestions,
+    allTagMentionSuggestions,
+  ]);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -4248,15 +4369,17 @@ export function StandaloneChat({
 
     const cursorPos = e.target.selectionStart || 0;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const atMatch = textBeforeCursor.match(/@([\w-]*)$/);
+    const mentionMatch = textBeforeCursor.match(/([@#])([\w:.-]*)$/);
 
-    if (atMatch) {
+    if (mentionMatch) {
       setShowMentionDropdown(true);
-      setMentionFilter(atMatch[1]);
+      setMentionTrigger(mentionMatch[1] as "@" | "#");
+      setMentionFilter(mentionMatch[2]);
       setSelectedMentionIndex(0);
     } else {
       setShowMentionDropdown(false);
       setMentionFilter("");
+      setMentionTrigger("@");
     }
   };
 
@@ -4265,14 +4388,18 @@ export function StandaloneChat({
     const textBeforeCursor = input.slice(0, cursorPos);
     const textAfterCursor = input.slice(cursorPos);
 
-    const atIndex = textBeforeCursor.lastIndexOf("@");
-    if (atIndex !== -1) {
-      const newValue = textBeforeCursor.slice(0, atIndex) + tag + " " + textAfterCursor;
+    const mentionIndex = Math.max(
+      textBeforeCursor.lastIndexOf("@"),
+      textBeforeCursor.lastIndexOf("#")
+    );
+    if (mentionIndex !== -1) {
+      const newValue = textBeforeCursor.slice(0, mentionIndex) + tag + " " + textAfterCursor;
       setInput(newValue);
     }
 
     setShowMentionDropdown(false);
     setMentionFilter("");
+    setMentionTrigger("@");
     inputRef.current?.focus();
   };
 
@@ -4572,6 +4699,19 @@ export function StandaloneChat({
       }
     })();
   }, [appFilterOpen, recentSpeakers.length]);
+
+  // Apps/tags load on mount, but the first fetch often races server startup.
+  // App names are stable enough to retry only when empty; tags can change
+  // from Brain/timeline while chat is open, so refresh them on menu open.
+  useEffect(() => {
+    if (!appFilterOpen) return;
+    if (appItems.length === 0 && !appsLoading) {
+      void refreshAppItems();
+    }
+    if (!tagsLoading) {
+      void refreshTagItems();
+    }
+  }, [appFilterOpen, appItems.length, appsLoading, tagsLoading, refreshAppItems, refreshTagItems]);
 
   // Pi project dir is managed Rust-side at boot
 
@@ -5292,12 +5432,20 @@ export function StandaloneChat({
           console.error("[Pi] LLM error via", data.type, ":", errMsg);
           piLastErrorRef.current = errMsg;
           emitSessionActivity({ status: "error", lastError: errMsg });
+          const authTokenInvalidated = isInvalidatedAuthTokenError(errMsg);
+          if (authTokenInvalidated) {
+            void handleInvalidatedAuthToken();
+          }
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
             const quotaErrorType = classifyQuotaError(errMsg);
-            if (quotaErrorType === "daily") {
+            if (authTokenInvalidated) {
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? { ...m, content: buildInvalidatedAuthTokenMessage() } : m)
+              );
+            } else if (quotaErrorType === "daily") {
               try {
                 const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
                 } catch {}
@@ -5354,7 +5502,10 @@ export function StandaloneChat({
             if (agentEndError && !content) {
               const errStr = agentEndError;
               const quotaErrorType = classifyQuotaError(errStr);
-              if (quotaErrorType === "daily") {
+              if (isInvalidatedAuthTokenError(errStr)) {
+                void handleInvalidatedAuthToken();
+                content = buildInvalidatedAuthTokenMessage();
+              } else if (quotaErrorType === "daily") {
                 try {
                   const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
                     } catch {}
@@ -7878,7 +8029,9 @@ export function StandaloneChat({
           apps
         </div>
         {appMentionSuggestions.length === 0 ? (
-          <div className="px-3 py-2 text-[10px] text-muted-foreground">no apps detected yet</div>
+          <div className="px-3 py-2 text-[10px] text-muted-foreground">
+            {appsLoading ? "loading apps..." : "no apps detected yet"}
+          </div>
         ) : (
           appMentionSuggestions.map((suggestion) => {
             const isActive = activeFilters.appName === suggestion.appName;
@@ -7905,6 +8058,48 @@ export function StandaloneChat({
               </button>
             );
           })
+        )}
+
+        <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+          tags
+        </div>
+        {allTagMentionSuggestions.length === 0 ? (
+          <div className="px-3 py-2 text-[10px] text-muted-foreground">
+            {tagsLoading ? "loading tags..." : "no tags yet"}
+          </div>
+        ) : (
+          tagMentionSections.map((section) => (
+            <React.Fragment key={section.label}>
+              <div className="px-3 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/80 bg-muted/20 border-b border-border/40">
+                {section.label}
+              </div>
+              {section.suggestions.map((suggestion) => {
+                const tagName = suggestion.tag.slice(1);
+                const isActive = activeFilters.tagNames.includes(tagName);
+                return (
+                  <button
+                    key={`tag-${section.label}-${suggestion.tag}`}
+                    type="button"
+                    onClick={() => {
+                      if (isActive) {
+                        removeFilter("tag", tagName);
+                      } else {
+                        setInput((prev) => `${suggestion.tag} ${prev.trim()}`.trim() + " ");
+                      }
+                      setAppFilterOpen(false);
+                    }}
+                    className={cn(
+                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                      isActive && "bg-muted"
+                    )}
+                  >
+                    <span>{suggestion.tag}</span>
+                    <span className="text-[10px] text-muted-foreground truncate">{suggestion.description}</span>
+                  </button>
+                );
+              })}
+            </React.Fragment>
+          ))
         )}
 
         {connections.length > 0 && (
@@ -9215,13 +9410,13 @@ export function StandaloneChat({
                     transition={{ duration: 0.1 }}
                     className="absolute bottom-full left-0 right-0 mb-1 bg-background border border-border rounded-lg shadow-lg overflow-hidden z-50 max-h-[240px] overflow-y-auto"
                   >
-                    {["time", "content", "app", "speaker"].map(category => {
+                    {["time", "content", "app", "tag", "speaker"].map(category => {
                       const items = filteredMentions.filter(m => m.category === category);
                       if (items.length === 0) return null;
                       return (
                         <div key={category}>
                           <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50">
-                            {category === "time" ? "time" : category === "content" ? "content type" : category === "speaker" ? "speakers" : "apps"}
+                            {category === "time" ? "time" : category === "content" ? "content type" : category === "speaker" ? "speakers" : category === "tag" ? "tags" : "apps"}
                           </div>
                           {items.map((suggestion) => {
                             const globalIndex = filteredMentions.indexOf(suggestion);

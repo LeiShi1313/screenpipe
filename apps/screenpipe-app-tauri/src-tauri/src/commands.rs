@@ -809,12 +809,23 @@ pub async fn set_cloud_token(
     state: tauri::State<'_, crate::recording::RecordingState>,
 ) -> Result<(), String> {
     let normalized = token.filter(|t| !t.is_empty());
+    let should_clear_pi_auth = normalized.is_none();
     // Unblock cloud calls for THIS session first — the ArcSwap + cache are the
     // runtime source of truth, so a failed durable write below never breaks an
     // active sign-in.
     state
         .cloud_token
         .store(std::sync::Arc::new(normalized.clone()));
+
+    // Sign-out: scrub the screenpipe token from pi's auth files before the
+    // fallible secret-store write so the on-disk copies never outlive the
+    // session even if persistence below fails.
+    if should_clear_pi_auth {
+        if let Err(e) = crate::pi::clear_screenpipe_auth_token_files() {
+            warn!("failed to clear pi screenpipe auth token: {}", e);
+        }
+    }
+
     // #3943: persist to the encrypted secret store (authoritative at-rest copy)
     // and refresh the in-process cache. We surface a persistence failure as an
     // Err so the frontend won't strip the last plaintext copy of a token it
@@ -3315,7 +3326,6 @@ pub struct CacheFile {
 #[specta::specta]
 pub async fn list_cache_files() -> Result<Vec<CacheFile>, String> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
-    let home_dir = dirs::home_dir().ok_or("no home directory")?;
     let mut files = Vec::new();
 
     // Pi agent node_modules (~/.screenpipe/pi-agent/)
@@ -3329,13 +3339,16 @@ pub async fn list_cache_files() -> Result<Vec<CacheFile>, String> {
         });
     }
 
-    // Pi config (~/.pi/agent/)
-    let pi_config = home_dir.join(".pi").join("agent");
+    // Pi config (~/.screenpipe/pi-config/). Never list the user's global
+    // ~/.pi/agent here — that belongs to their standalone pi install and
+    // offering to delete it risked destroying the user's own setup
+    // (https://github.com/screenpipe/screenpipe/issues/4002).
+    let pi_config = data_dir.join("pi-config");
     if pi_config.exists() {
         let size = dir_size(&pi_config);
         files.push(CacheFile {
             path: pi_config.to_string_lossy().to_string(),
-            label: "AI agent config (.pi/agent)".to_string(),
+            label: "AI agent config (pi-config)".to_string(),
             size_bytes: size,
         });
     }

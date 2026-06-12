@@ -1165,7 +1165,7 @@ impl Default for SettingsStore {
             "Recorder".to_string(),
             "vault".to_string(),
             "OBS Studio".to_string(),
-            "screenpipe".to_string(),
+            "screenpipe::".to_string(),
         ];
 
         #[cfg(target_os = "macos")]
@@ -1328,6 +1328,17 @@ impl SettingsStore {
                     "restartNotificationsDefaultedOff".to_string(),
                     Value::Bool(true),
                 );
+            }
+
+            // Migrate unscoped "screenpipe" ignore-pattern to app-scoped "screenpipe::"
+            // so browser tabs whose title contains "screenpipe" are no longer falsely
+            // excluded from SCK capture and rendered black.
+            if let Some(Value::Array(windows)) = obj.get_mut("ignoredWindows") {
+                for entry in windows.iter_mut() {
+                    if entry.as_str() == Some("screenpipe") {
+                        *entry = Value::String("screenpipe::".to_string());
+                    }
+                }
             }
 
             // Sanitize unknown provider types in aiPresets to prevent deserialization failures
@@ -1851,6 +1862,32 @@ mod tests {
         .unwrap();
 
         assert!(settings.auto_update);
+    }
+
+    #[test]
+    fn keep_computer_awake_defaults_to_disabled() {
+        assert!(!SettingsStore::default().recording.keep_computer_awake);
+    }
+
+    #[test]
+    fn missing_keep_computer_awake_deserializes_disabled() {
+        let settings: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": []
+        }))
+        .unwrap();
+
+        assert!(!settings.recording.keep_computer_awake);
+    }
+
+    #[test]
+    fn explicit_keep_computer_awake_true_is_respected() {
+        let settings: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": [],
+            "keepComputerAwake": true
+        }))
+        .unwrap();
+
+        assert!(settings.recording.keep_computer_awake);
     }
 
     #[test]

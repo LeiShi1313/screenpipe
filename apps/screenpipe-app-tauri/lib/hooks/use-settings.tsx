@@ -598,6 +598,7 @@ let DEFAULT_SETTINGS: Settings = {
 			pauseOnDrmContent: false,
 			disableClipboardCapture: true,
 			disableKeyboardCapture: true,
+			keepComputerAwake: false,
 			experimentalCoreaudioSystemAudio: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,

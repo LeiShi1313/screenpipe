@@ -792,19 +792,20 @@ fn run_command_output(mut cmd: Command) -> Result<Output, String> {
 fn format_install_failure(tool: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Prefer stderr, fall back to stdout (bun reports some failures there),
+    // and never let both-empty reduce the message to a bare "stderr: " —
+    // signal deaths (SIGILL/SIGKILL) produce exactly that shape.
     let details = if !stderr.trim().is_empty() {
         truncate_stderr(&stderr)
+    } else if !stdout.trim().is_empty() {
+        format!("(stdout) {}", truncate_stderr(&stdout))
     } else {
-        truncate_stderr(&stdout)
+        "(no output captured)".to_string()
     };
     format!(
-        "{} install failed (exit {}). stderr: {}",
+        "{} install failed ({}). output: {}",
         tool,
-        output
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string()),
+        screenpipe_core::agents::pi::describe_exit_status(&output.status),
         details
     )
 }
@@ -849,6 +850,16 @@ fn verify_pi_package_install(install_dir: &Path) -> Result<(), String> {
 fn run_pi_package_install(install_dir: &Path, bun: &str) -> Result<(), String> {
     let cache_dir = install_dir.join(".bun-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
+
+    // Log the exact command + bun version so a failed install is reproducible
+    // from the log alone; a bun that can't even execute (e.g. SIGILL on an
+    // unsupported CPU) shows up right here as the version probe failing.
+    info!(
+        "Running Pi dependency install: {} install (cwd: {}, bun version: {})",
+        bun,
+        install_dir.display(),
+        screenpipe_core::agents::pi::bun_version_string(bun),
+    );
 
     let mut bun_cmd = Command::new(bun);
     bun_cmd
@@ -2941,6 +2952,40 @@ mod tests {
         let dist = pi_dir.join("dist");
         std::fs::create_dir_all(&dist).expect("create dist");
         std::fs::write(dist.join("cli.js"), "console.log('pi')").expect("write cli");
+    }
+
+    /// Regression guard for the empty "Pi background install failed: " log
+    /// (Linux AppImage report, 2026-06-12): a bun that exits non-zero without
+    /// writing to either stream must still produce an actionable message with
+    /// the exit status in it.
+    #[cfg(unix)]
+    #[test]
+    fn format_install_failure_never_empty_details() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        let silent = Output {
+            status: ExitStatus::from_raw(0x0100), // exit code 1
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let msg = super::format_install_failure("bun", &silent);
+        assert_eq!(
+            msg,
+            "bun install failed (exit code 1). output: (no output captured)"
+        );
+
+        let sigkill = Output {
+            status: ExitStatus::from_raw(9), // killed by signal 9
+            stdout: b"partial progress".to_vec(),
+            stderr: Vec::new(),
+        };
+        let msg = super::format_install_failure("bun", &sigkill);
+        assert!(
+            msg.contains("killed by signal 9") && msg.contains("(stdout) partial progress"),
+            "signal + stdout fallback must both surface: {}",
+            msg
+        );
     }
 
     #[test]

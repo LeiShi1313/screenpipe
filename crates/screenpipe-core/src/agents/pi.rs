@@ -1756,14 +1756,23 @@ impl AgentExecutor for PiExecutor {
 
         std::fs::create_dir_all(&install_dir)?;
 
-        info!("installing pi into {} via bun …", install_dir.display());
+        // Log the exact command + bun version up front so a failed install is
+        // reproducible from the log alone (and a bun that can't even run —
+        // e.g. SIGILL on an unsupported CPU — is exposed before the install).
+        let args = ["add", PI_PACKAGE, PI_AI_PACKAGE, "@anthropic-ai/sdk"];
+        info!(
+            "installing pi into {} via bun at {} (version: {}); command: bun {}",
+            install_dir.display(),
+            bun,
+            bun_version_string(&bun),
+            args.join(" "),
+        );
 
         // Seed package.json with overrides to fix lru-cache resolution on Windows
         seed_pi_package_json(&install_dir);
 
         let mut cmd = std::process::Command::new(&bun);
-        cmd.current_dir(&install_dir)
-            .args(["add", PI_PACKAGE, PI_AI_PACKAGE, "@anthropic-ai/sdk"]);
+        cmd.current_dir(&install_dir).args(args);
 
         #[cfg(windows)]
         {
@@ -1772,14 +1781,19 @@ impl AgentExecutor for PiExecutor {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let output = cmd.output()?;
+        let output = cmd
+            .output()
+            .map_err(|e| anyhow!("pi installation failed: could not run bun at {}: {}", bun, e))?;
         if output.status.success() {
             info!("pi installed successfully into {}", install_dir.display());
             Ok(())
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("pi installation failed: {}", stderr);
-            Err(anyhow!("pi installation failed: {}", stderr))
+            // Include exit status + both stream tails: bun can exit non-zero
+            // with an EMPTY stderr (signal death, or diagnostics on stdout),
+            // which used to log here as "pi installation failed: " — nothing.
+            let msg = format_subprocess_failure("bun add", &output);
+            error!("pi installation failed: {}", msg);
+            Err(anyhow!("pi installation failed: {}", msg))
         }
     }
 
@@ -2089,6 +2103,87 @@ pub fn find_bun_executable() -> Option<String> {
     ];
 
     paths.into_iter().find(|p| std::path::Path::new(p).exists())
+}
+
+/// Human-readable description of how a subprocess terminated.
+///
+/// Always non-empty: "exit code N", "killed by signal N (NAME)" on unix, or
+/// "terminated without exit code". Signal names matter on Linux/AppImage where
+/// bun can die without writing a single byte to stderr (e.g. SIGILL when the
+/// bundled bun build needs CPU instructions the host lacks, or SIGKILL from
+/// the OOM killer) — exactly the case that used to log as an empty error.
+pub fn describe_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code {}", code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = match sig {
+                4 => " (SIGILL, illegal instruction; the bun binary may not support this CPU)",
+                6 => " (SIGABRT)",
+                9 => " (SIGKILL, possibly the OOM killer)",
+                11 => " (SIGSEGV)",
+                15 => " (SIGTERM)",
+                _ => "",
+            };
+            return format!("killed by signal {}{}", sig, name);
+        }
+    }
+    "terminated without exit code".to_string()
+}
+
+/// Last `max` bytes of a captured process stream, lossy-decoded and
+/// char-boundary safe, with an "(empty)" placeholder so a silent subprocess
+/// can never reduce an error message to nothing.
+pub fn output_tail(bytes: &[u8], max: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if trimmed.len() <= max {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len().saturating_sub(max);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &trimmed[start..])
+}
+
+/// One-line, always-non-empty summary of a failed subprocess: exit status plus
+/// the tail of BOTH streams (bun reports some install failures on stdout, and
+/// signal deaths leave both streams empty — the status is then the only clue).
+pub fn format_subprocess_failure(what: &str, output: &std::process::Output) -> String {
+    const TAIL: usize = 2048;
+    format!(
+        "{} {}; stderr: {}; stdout: {}",
+        what,
+        describe_exit_status(&output.status),
+        output_tail(&output.stderr, TAIL),
+        output_tail(&output.stdout, TAIL),
+    )
+}
+
+/// Best-effort `bun --version` for install-start logging. Never fails; a
+/// crashing bun (e.g. SIGILL on unsupported CPUs) is reported inline, which
+/// diagnoses the install failure before the install is even attempted.
+pub fn bun_version_string(bun: &str) -> String {
+    let mut cmd = std::process::Command::new(bun);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => format!("unknown ({})", describe_exit_status(&o.status)),
+        Err(e) => format!("unknown (failed to run: {})", e),
+    }
 }
 
 /// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/` or SCREENPIPE_DATA_DIR/pi-agent).
@@ -3267,5 +3362,73 @@ mod tests {
             !lock_path.exists(),
             "stale bun.lock must be cleared so bun re-resolves from the fresh manifest"
         );
+    }
+
+    /// Regression guard for the empty "pi installation failed: " log (Linux
+    /// AppImage report, 2026-06-12): a bun that dies without writing to
+    /// stderr must still produce an actionable error message.
+    #[cfg(unix)]
+    #[test]
+    fn install_failure_message_is_never_empty() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        // Non-zero exit, NOTHING on either stream — the exact shape that used
+        // to format as an empty error.
+        let silent_failure = Output {
+            status: ExitStatus::from_raw(0x0100), // exit code 1
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let msg = format_subprocess_failure("bun add", &silent_failure);
+        assert_eq!(
+            msg,
+            "bun add exit code 1; stderr: (empty); stdout: (empty)"
+        );
+
+        // Killed by a signal (raw status = signal number, no exit code).
+        let sigill = Output {
+            status: ExitStatus::from_raw(4),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let msg = format_subprocess_failure("bun add", &sigill);
+        assert!(
+            msg.contains("killed by signal 4") && msg.contains("SIGILL"),
+            "signal deaths must be named: {}",
+            msg
+        );
+
+        // stderr empty but stdout has the diagnostics — both tails included.
+        let stdout_only = Output {
+            status: ExitStatus::from_raw(0x0100),
+            stdout: b"error: tarball download failed".to_vec(),
+            stderr: Vec::new(),
+        };
+        let msg = format_subprocess_failure("bun add", &stdout_only);
+        assert!(
+            msg.contains("stdout: error: tarball download failed"),
+            "stdout diagnostics must survive: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn output_tail_truncates_to_last_bytes() {
+        assert_eq!(output_tail(b"", 100), "(empty)");
+        assert_eq!(output_tail(b"   \n ", 100), "(empty)");
+        assert_eq!(output_tail(b"short error", 100), "short error");
+
+        let long = "x".repeat(3000) + "the real error is at the end";
+        let tail = output_tail(long.as_bytes(), 2048);
+        assert!(tail.starts_with("..."));
+        assert!(tail.ends_with("the real error is at the end"));
+        assert!(tail.len() <= 2048 + 3);
+
+        // Multi-byte chars at the cut point must not panic.
+        let unicode = "é".repeat(2000);
+        let tail = output_tail(unicode.as_bytes(), 101);
+        assert!(tail.starts_with("..."));
+        assert!(tail.ends_with('é'));
     }
 }

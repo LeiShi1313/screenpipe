@@ -16,7 +16,7 @@ import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleV
 import { handleVertexProxy, handleVertexModels } from './handlers/vertex-proxy';
 import { handleWebSearch } from './handlers/web-search';
 import { handleTinfoilAttestation, handleTinfoilProxy } from './handlers/tinfoil-proxy';
-import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost, getMaxDailyCostPerUser, getTierDailyCostCap, isZeroCostModel } from './services/cost-tracker';
+import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost, getMaxDailyCostPerUser, getTierDailyCostCap, isZeroCostModel, resolveServedModel } from './services/cost-tracker';
 import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { getModelWeight } from './services/usage-tracker';
 import { pruneModelHealth } from './services/model-health';
@@ -186,6 +186,13 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			// Add credit info header if paid via credits
 			let response = await handleChatCompletions(body, env);
 
+			// Attribute cost to the model that actually served the request.
+			// 'auto' and fallback cascades resolve to a concrete model; the
+			// handler reports it via x-screenpipe-model. Logging the literal
+			// "auto" had every such row priced by the $0.01 unknown-model
+			// fallback (most auto traffic is free Vertex MaaS = $0 real cost).
+			const servedModel = resolveServedModel(response, body.model);
+
 			// Log cost — for streaming, intercept SSE events to get real token counts
 			if (body.stream) {
 				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(response, 'openai');
@@ -194,13 +201,13 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					device_id: authResult.deviceId,
 					user_id: authResult.userId,
 					tier: authResult.tier,
-					provider: inferProvider(body.model),
-					model: body.model,
+					provider: inferProvider(servedModel),
+					model: servedModel,
 					input_tokens: u.input_tokens ?? null,
 					output_tokens: u.output_tokens ?? null,
 					cache_read_tokens: u.cache_read_input_tokens ?? null,
 					cache_creation_tokens: u.cache_creation_input_tokens ?? null,
-					estimated_cost_usd: getModelCost(body.model, u.input_tokens ?? null, u.output_tokens ?? null, {
+					estimated_cost_usd: getModelCost(servedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
 						cache_read_tokens: u.cache_read_input_tokens,
 						cache_creation_tokens: u.cache_creation_input_tokens,
 					}),
@@ -222,13 +229,13 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 							device_id: authResult.deviceId,
 							user_id: authResult.userId,
 							tier: authResult.tier,
-							provider: inferProvider(body.model),
-							model: body.model,
+							provider: inferProvider(servedModel),
+							model: servedModel,
 							input_tokens: inputTokens,
 							output_tokens: outputTokens,
 							cache_read_tokens: cacheRead,
 							cache_creation_tokens: cacheCreation,
-							estimated_cost_usd: getModelCost(body.model, inputTokens, outputTokens, {
+							estimated_cost_usd: getModelCost(servedModel, inputTokens, outputTokens, {
 								cache_read_tokens: cacheRead,
 								cache_creation_tokens: cacheCreation,
 							}),

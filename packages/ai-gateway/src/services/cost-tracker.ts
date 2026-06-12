@@ -41,6 +41,10 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
   'glm-4.7': { input: 0, output: 0 },
   'glm-5': { input: 0, output: 0 },
   'kimi-k2.5': { input: 0, output: 0 },
+  'deepseek-v3.2': { input: 0, output: 0 },
+  'deepseek-r1': { input: 0, output: 0 },
+  'qwen3-next': { input: 0, output: 0 },
+  'qwen3-next-thinking': { input: 0, output: 0 },
   // Tinfoil — confidential inference (secure enclaves)
   'gemma4-31b': { input: 0.45, output: 1.00 },
   // Anthropic Claude
@@ -258,6 +262,23 @@ export function inferProvider(model: string | null | undefined): string {
 export function isZeroCostModel(model: string | null | undefined): boolean {
   const pricing = findPricing(model);
   return pricing !== null && pricing.input === 0 && pricing.output === 0;
+}
+
+/** True when the model resolves to a MODEL_PRICING entry (exact or fuzzy). */
+export function hasPricing(model: string | null | undefined): boolean {
+  return findPricing(model) !== null;
+}
+
+/**
+ * Cost attribution for routed requests. 'auto' (and explicit models with
+ * fallback chains) can serve a DIFFERENT model than requested — the chat
+ * handler reports the served one in the x-screenpipe-model response header.
+ * Logging the requested name attributed every auto request to the literal
+ * string "auto", which has no pricing entry and fell into the flat $0.01
+ * unknown-model estimate.
+ */
+export function resolveServedModel(response: Response, requestedModel: string): string {
+  return response.headers.get('x-screenpipe-model') || requestedModel;
 }
 
 // Default max daily cost per user in USD (overridable via env.MAX_DAILY_COST_PER_USER)

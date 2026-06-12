@@ -1167,8 +1167,13 @@ function HomeContent() {
           )}
           </TooltipProvider>
 
-          {/* Content */}
-          <div className={cn("flex-1 flex flex-col h-full bg-background min-h-0 relative", isTranslucent ? "rounded-none" : "rounded-tr-lg")}>
+          {/* Content.
+              min-w-0 matters: without it this flex item refuses to shrink
+              below its content's min-content width (truncate spans are
+              nowrap, so that's the FULL untruncated text width), and in a
+              narrow window with the sidebar open the whole pane gets
+              clipped at the right window edge instead of truncating. */}
+          <div className={cn("flex-1 min-w-0 flex flex-col h-full bg-background min-h-0 relative", isTranslucent ? "rounded-none" : "rounded-tr-lg")}>
             {/* ALWAYS-MOUNTED chat layer.
                 Hidden via CSS (display:none) when the user is on a non-chat
                 section, so the StandaloneChat component never unmounts. This

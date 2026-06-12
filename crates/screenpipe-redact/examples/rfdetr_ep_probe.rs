@@ -24,9 +24,7 @@ use std::time::Instant;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,ort=warn".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info,ort=warn".into()))
         .init();
 
     use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
@@ -44,8 +42,7 @@ async fn main() -> anyhow::Result<()> {
         Some(p) => std::path::PathBuf::from(p),
         None => {
             let p = std::env::temp_dir().join("rfdetr_ep_probe.png");
-            image::RgbImage::from_pixel(1280, 800, image::Rgb([245, 245, 245]))
-                .save(&p)?;
+            image::RgbImage::from_pixel(1280, 800, image::Rgb([245, 245, 245])).save(&p)?;
             p
         }
     };
@@ -53,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
     // Warmup (EP compile) + steady state.
     let t0 = Instant::now();
     let _ = redactor.detect(&path).await?;
-    println!("warmup (incl. EP compile): {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "warmup (incl. EP compile): {:.0} ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
     let n = 10;
     let t0 = Instant::now();
     let mut last = Vec::new();

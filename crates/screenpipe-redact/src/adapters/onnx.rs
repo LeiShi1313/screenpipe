@@ -797,9 +797,7 @@ mod runtime {
                 // is the one that actually runs on the ANE.
                 #[cfg(feature = "onnx-directml")]
                 let mut builder = builder.with_execution_providers([
-                    ort::ep::DirectML::default()
-                        .with_device_id(0)
-                        .build(),
+                    ort::ep::DirectML::default().with_device_id(0).build(),
                     ort::ep::CPU::default().build(),
                 ])?;
                 builder.commit_from_file(model_path)

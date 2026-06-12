@@ -266,21 +266,15 @@ mod imp {
                 #[cfg(feature = "onnx-coreml")]
                 let mut builder = builder.with_execution_providers([
                     ort::ep::CoreML::default()
-                        .with_model_format(
-                            ort::ep::coreml::ModelFormat::MLProgram,
-                        )
-                        .with_compute_units(
-                            ort::ep::coreml::ComputeUnits::All,
-                        )
+                        .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+                        .with_compute_units(ort::ep::coreml::ComputeUnits::All)
                         .with_subgraphs(true)
                         .build(),
                     ort::ep::CPU::default().build(),
                 ])?;
                 #[cfg(feature = "onnx-directml")]
                 let mut builder = builder.with_execution_providers([
-                    ort::ep::DirectML::default()
-                        .with_device_id(0)
-                        .build(),
+                    ort::ep::DirectML::default().with_device_id(0).build(),
                     ort::ep::CPU::default().build(),
                 ])?;
                 builder.commit_from_file(model_path)

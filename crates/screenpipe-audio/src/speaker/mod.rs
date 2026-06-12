@@ -15,11 +15,16 @@ pub fn create_session<P: AsRef<Path>>(path: P) -> Result<ort::session::Session> 
     // bubbles up the tokio worker and Sentry — convert it to a normal error
     // so callers fall back gracefully instead of crashing the runtime.
     catch_panic_into_error(|| {
-        let session = ort::session::Session::builder()?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-            .with_intra_threads(1)?
-            .with_inter_threads(1)?
-            .commit_from_file(path)?;
+        // ort rc.12: builder ops return `Error<SessionBuilder>` (recovery
+        // payload, not Send+Sync) — convert via Display for anyhow.
+        let oe = |e: &dyn std::fmt::Display| anyhow!("ort: {e}");
+        let b = ort::session::Session::builder().map_err(|e| oe(&e))?;
+        let b = b
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(|e| oe(&e))?;
+        let b = b.with_intra_threads(1).map_err(|e| oe(&e))?;
+        let mut b = b.with_inter_threads(1).map_err(|e| oe(&e))?;
+        let session = b.commit_from_file(path).map_err(|e| oe(&e))?;
         Ok(session)
     })
 }
@@ -43,7 +48,7 @@ where
 
 /// The output node names of the models we ship.
 pub(crate) fn session_output_names(session: &ort::session::Session) -> Vec<String> {
-    session.outputs.iter().map(|o| o.name.clone()).collect()
+    session.outputs().iter().map(|o| o.name().to_string()).collect()
 }
 
 /// Resolve which output to read from an ORT session's run results.

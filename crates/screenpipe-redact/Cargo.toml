@@ -42,10 +42,16 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = { workspace = true }
 image = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[example]]
 name = "v45_phase3_smoke"
 path = "examples/v45_phase3_smoke.rs"
+required-features = ["onnx-cpu"]
+
+[[example]]
+name = "rfdetr_ep_probe"
+path = "examples/rfdetr_ep_probe.rs"
 required-features = ["onnx-cpu"]
 
 # Optional model adapters. Off by default so the crate builds without
@@ -60,7 +66,7 @@ default = []
 
 # Enable the ONNX-based image redactor (rfdetr) AND the v45 phase 3
 # text redactor (xlm-roberta-base BIO token classifier). CPU baseline.
-onnx-cpu = ["dep:ort", "dep:ndarray", "dep:tokenizers", "dep:serde_json", "ort/download-binaries"]
+onnx-cpu = ["dep:ort", "dep:ndarray", "dep:tokenizers", "dep:serde_json", "ort/download-binaries", "ort/tls-native", "ort/std"]
 # Mac: CoreML execution provider (uses Metal + ANE where available).
 onnx-coreml = ["onnx-cpu", "ort/coreml"]
 # Windows: DirectML EP (any DX12-capable GPU, no CUDA toolkit).

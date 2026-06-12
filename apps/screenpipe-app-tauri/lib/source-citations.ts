@@ -18,6 +18,14 @@ export interface SourceCitation {
   title: string;
   subtitle?: string;
   href?: string;
+  // ISO timestamp of the captured moment this source points at. When set on a
+  // local (screenpipe) citation, the footer makes the row jump into the
+  // timeline at this moment instead of rendering as dead text.
+  timestamp?: string;
+  // The search term behind this source. When set, the footer opens it in the
+  // search window (thumbnail grid of every matching capture) rather than
+  // jumping to a single timeline moment.
+  query?: string;
 }
 
 interface ToolCallLike {
@@ -156,7 +164,10 @@ function sourceCitationsFromToolCall(toolCall: ToolCallLike | undefined): Source
   const args = isObject(toolCall.args) ? toolCall.args : {};
   const resultText = resultToText(toolCall.result);
 
-  if (toolName === "web_search") {
+  // "sp_web_search" is the current bundled tool; bare "web_search" still
+  // appears when replaying sessions recorded before the sp_ rename
+  // (https://github.com/screenpipe/screenpipe/issues/3812).
+  if (toolName === "sp_web_search" || toolName === "web_search") {
     return webSearchCitations(args, toolCall.result, resultText);
   }
 
@@ -227,8 +238,9 @@ function screenpipeToolCitation(args: Record<string, unknown>): SourceCitation {
   const contentType = stringArg(args, "content_type") ?? stringArg(args, "contentType");
   const appName = stringArg(args, "app_name") ?? stringArg(args, "appName");
   const query = stringArg(args, "q") ?? stringArg(args, "query");
+  const startTime = stringArg(args, "start_time") ?? stringArg(args, "startTime");
   const range = timeRange(
-    stringArg(args, "start_time") ?? stringArg(args, "startTime"),
+    startTime,
     stringArg(args, "end_time") ?? stringArg(args, "endTime")
   );
   const parts = [
@@ -243,6 +255,8 @@ function screenpipeToolCitation(args: Record<string, unknown>): SourceCitation {
     kind: "screenpipe",
     title: "Screenpipe search",
     subtitle: parts.join("; ") || undefined,
+    timestamp: navTimestamp(startTime),
+    query: query || undefined,
   };
 }
 
@@ -297,12 +311,19 @@ function screenpipeApiCitation(call: string): SourceCitation {
   const query = extractQuery(call);
   const title = screenpipeTitle(path);
   const kind = screenpipeKind(path);
+  // Only local screen captures map to a moment on the timeline. Memory/db/
+  // connector endpoints aren't time-anchored screen data, so leave them inert.
+  const params = queryParams(query);
+  const timestamp = kind === "screenpipe" ? navTimestamp(params.start_time) : undefined;
+  const searchText = path === "/search" ? params.q : undefined;
 
   return {
     id: stableId(["screenpipe", path, query]),
     kind,
     title,
     subtitle: screenpipeSubtitle(path, query),
+    timestamp,
+    query: searchText,
   };
 }
 
@@ -420,12 +441,16 @@ function normalizeExplicitCitations(value: unknown): SourceCitation[] {
     if (!title) continue;
     const subtitle = typeof item.subtitle === "string" ? item.subtitle : undefined;
     const href = typeof item.href === "string" ? item.href : undefined;
+    const timestamp = typeof item.timestamp === "string" ? navTimestamp(item.timestamp) : undefined;
+    const query = typeof item.query === "string" && item.query.trim() ? item.query.trim() : undefined;
     citations.push({
       id: typeof item.id === "string" && item.id ? item.id : stableId([kind, title, subtitle, href]),
       kind,
       title,
       subtitle,
       href,
+      timestamp,
+      query,
     });
   }
   return dedupeCitations(citations);
@@ -625,6 +650,16 @@ function queryParams(query: string): Record<string, string> {
     if (value && !value.includes("${")) out[safeDecode(rawKey)] = value;
   }
   return out;
+}
+
+// Normalize a (possibly URL-encoded) start time into a timestamp the timeline
+// can navigate to. Returns undefined when the value isn't a parseable date, so
+// only real moments become clickable.
+function navTimestamp(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const decoded = safeDecode(value);
+  const date = new Date(decoded);
+  return Number.isNaN(date.getTime()) ? undefined : decoded;
 }
 
 function timeRange(start: string | undefined, end: string | undefined): string | undefined {

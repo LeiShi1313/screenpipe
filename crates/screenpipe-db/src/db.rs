@@ -216,6 +216,9 @@ pub struct DatabaseManager {
     /// Write coalescing queue. Hot-path writes are submitted here and
     /// batched into single transactions every 100ms.
     write_queue: crate::write_queue::WriteQueue,
+    /// Shared health for the write queue (disk-I/O wedge detection + recovery).
+    /// Polled by the app to surface degradation and trigger an engine restart.
+    write_queue_health: crate::write_queue::WriteQueueHealth,
 }
 
 /// One level-0 OCR element row, buffered for bulk insertion.
@@ -349,14 +352,31 @@ impl DatabaseManager {
             .max_connections(config.write_pool_max)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(connect_options)
+            .connect_with(connect_options.clone())
             .await?;
 
         let write_semaphore = Arc::new(Semaphore::new(1));
-        let write_queue = crate::write_queue::spawn_write_drain(
+        // Recovery wiring: let the drain loop reopen its write pool in-process on a
+        // persistent disk-I/O wedge, surface degradation via `write_queue_health`,
+        // and (via the hook, set by the app) request an engine restart — the only
+        // cure for a shared WAL-index desync. See write_queue::WriteDrainOpts.
+        let write_queue_health = crate::write_queue::WriteQueueHealth::default();
+        let write_pool_rebuilder = crate::write_queue::WritePoolRebuilder::new(
+            connect_options,
+            config.write_pool_max,
+            1,
+            Duration::from_secs(10),
+        );
+        let write_queue = crate::write_queue::spawn_write_drain_with(
             write_pool.clone(),
             Arc::clone(&write_semaphore),
             Arc::from(database_path),
+            crate::write_queue::WriteDrainOpts {
+                rebuilder: Some(write_pool_rebuilder),
+                on_persistent_failure: None,
+                health: write_queue_health.clone(),
+                ..Default::default()
+            },
         );
         let db_manager = DatabaseManager {
             pool: read_pool,
@@ -364,6 +384,7 @@ impl DatabaseManager {
             write_semaphore,
             heavy_read_semaphore: Arc::new(Semaphore::new(2)),
             write_queue,
+            write_queue_health,
         };
 
         // Checkpoint any stale WAL before running migrations or starting captures.
@@ -389,6 +410,11 @@ impl DatabaseManager {
 
         // Run migrations after establishing the connection
         Self::run_migrations(&db_manager.pool).await?;
+
+        // Surface corruption proactively at boot with a recovery hint,
+        // instead of only discovering it later via worker query errors
+        // (which used to spin a CPU core retrying a malformed DB).
+        db_manager.spawn_startup_integrity_check(Arc::from(database_path));
 
         Ok(db_manager)
     }
@@ -715,6 +741,15 @@ impl DatabaseManager {
             self.write_pool.size(),
             self.write_pool.num_idle() as u32,
         )
+    }
+
+    /// Observe write-queue health: disk-I/O wedge detection + recovery state
+    /// (degraded flag, consecutive fatal batches, in-process write-pool reopens,
+    /// persistent-failure signals). The app polls this to surface "recording
+    /// degraded" and, on sustained failure, restart the engine — the cure for a
+    /// disk-I/O write wedge that an in-process reopen can't clear.
+    pub fn write_queue_health(&self) -> crate::write_queue::WriteQueueHealth {
+        self.write_queue_health.clone()
     }
 
     /// Check if the error indicates a stuck/nested transaction on the connection.
@@ -3321,7 +3356,63 @@ impl DatabaseManager {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn search(
+        &self,
+        query: &str,
+        content_type: ContentType,
+        limit: u32,
+        offset: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        speaker_ids: Option<Vec<i64>>,
+        frame_name: Option<&str>,
+        browser_url: Option<&str>,
+        focused: Option<bool>,
+        speaker_name: Option<&str>,
+        device_name: Option<&str>,
+        machine_id: Option<&str>,
+        on_screen: Option<bool>,
+    ) -> Result<Vec<SearchResult>, sqlx::Error> {
+        self.search_with_tags(
+            query,
+            content_type,
+            limit,
+            offset,
+            start_time,
+            end_time,
+            app_name,
+            window_name,
+            min_length,
+            max_length,
+            speaker_ids,
+            frame_name,
+            browser_url,
+            focused,
+            speaker_name,
+            device_name,
+            machine_id,
+            on_screen,
+            &[],
+        )
+        .await
+    }
+
+    /// Like [`search`](Self::search) but additionally restricts results to
+    /// items carrying ALL of the given `tags`. An empty `tags` slice behaves
+    /// exactly like `search`.
+    ///
+    /// Tags span three stores under one string namespace: the
+    /// `vision_tags` / `audio_tags` junction tables (screen + audio) and the
+    /// `memories.tags` JSON array (content_type=memory). Content types with no
+    /// tags (input, accessibility) return nothing when a tag filter is active
+    /// rather than ignoring it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_with_tags(
         &self,
         query: &str,
         mut content_type: ContentType,
@@ -3345,12 +3436,25 @@ impl DatabaseManager {
         // captured frame. Falls through to the legacy frames_fts path
         // when None, preserving current behavior for unaware callers.
         on_screen: Option<bool>,
+        tags: &[String],
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let mut results = Vec::new();
 
         // if focused or browser_url is present, we run only on OCR
         if focused.is_some() || browser_url.is_some() {
             content_type = ContentType::OCR;
+        }
+
+        // Input events and accessibility-only hits have no tag table, so a
+        // tag filter can never match them — short-circuit to empty. Screen
+        // (OCR), audio, and memories all carry tags and are filtered below.
+        if !tags.is_empty()
+            && matches!(
+                content_type,
+                ContentType::Input | ContentType::Accessibility
+            )
+        {
+            return Ok(results);
         }
 
         match content_type {
@@ -3379,6 +3483,7 @@ impl DatabaseManager {
                                 focused,
                                 device_name,
                                 machine_id,
+                                tags,
                             ),
                             self.search_audio(
                                 query,
@@ -3392,11 +3497,17 @@ impl DatabaseManager {
                                 speaker_name,
                                 device_name,
                                 machine_id,
+                                tags,
                             ),
                             // Issue #2436: branch the accessibility plan
                             // on the on_screen filter — see the dispatch
                             // in ContentType::Accessibility above.
+                            // Accessibility frames have no tag table, so a
+                            // tag filter yields nothing for the UI leg.
                             async {
+                                if !tags.is_empty() {
+                                    return Ok(Vec::new());
+                                }
                                 match on_screen {
                                     Some(v) => {
                                         self.search_accessibility_visible(
@@ -3445,8 +3556,12 @@ impl DatabaseManager {
                                 focused,
                                 device_name,
                                 machine_id,
+                                tags,
                             ),
                             async {
+                                if !tags.is_empty() {
+                                    return Ok(Vec::new());
+                                }
                                 match on_screen {
                                     Some(v) => {
                                         self.search_accessibility_visible(
@@ -3502,6 +3617,7 @@ impl DatabaseManager {
                         focused,
                         device_name,
                         machine_id,
+                        tags,
                     )
                     .await?;
                 results.extend(ocr_results.into_iter().map(SearchResult::OCR));
@@ -3521,6 +3637,7 @@ impl DatabaseManager {
                             speaker_name,
                             device_name,
                             machine_id,
+                            tags,
                         )
                         .await?;
                     results.extend(audio_results.into_iter().map(SearchResult::Audio));
@@ -3590,6 +3707,7 @@ impl DatabaseManager {
                         offset,
                         None,
                         None,
+                        tags,
                     )
                     .await?;
                 results.extend(memory_results.into_iter().map(SearchResult::Memory));
@@ -3649,6 +3767,9 @@ impl DatabaseManager {
         focused: Option<bool>,
         device_name: Option<&str>,
         machine_id: Option<&str>,
+        // Match only frames carrying ALL of these tags (vision_tags join).
+        // Empty slice = no tag filter. See `search_with_tags`.
+        tags: &[String],
     ) -> Result<Vec<OCRResult>, sqlx::Error> {
         // Acquire a heavy-read permit (max 2 concurrent). OCR searches can
         // return massive text blobs and hold connections for seconds, starving
@@ -3731,6 +3852,14 @@ impl DatabaseManager {
             AND (?7 IS NULL OR frames.machine_id = ?7)
             AND (?8 IS NULL OR frames.focused = ?8)
             AND (?9 IS NULL OR frames.name LIKE '%' || ?9 || '%')
+            AND (json_array_length(?12) = 0 OR frames.id IN (
+                SELECT vt.vision_id
+                FROM vision_tags vt
+                JOIN tags t ON vt.tag_id = t.id
+                WHERE t.name IN (SELECT value FROM json_each(?12))
+                GROUP BY vt.vision_id
+                HAVING COUNT(DISTINCT t.name) = json_array_length(?12)
+            ))
         GROUP BY frames.id
         ORDER BY frames.timestamp DESC
         LIMIT ?10 OFFSET ?11
@@ -3747,6 +3876,11 @@ impl DatabaseManager {
             },
         );
 
+        // Serialize the tag filter to a JSON array so the SQL can use
+        // `json_each` / `json_array_length`. Empty array short-circuits the
+        // filter via the `json_array_length(?12) = 0` guard above.
+        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+
         let query_builder = sqlx::query_as(&sql);
 
         let raw_results: Vec<OCRResultRaw> = query_builder
@@ -3761,6 +3895,7 @@ impl DatabaseManager {
             .bind(frame_name)
             .bind(limit)
             .bind(offset)
+            .bind(&tags_json)
             .fetch_all(&self.pool)
             .await?;
 
@@ -3803,6 +3938,9 @@ impl DatabaseManager {
         speaker_name: Option<&str>,
         device_name: Option<&str>,
         machine_id: Option<&str>,
+        // Match only audio chunks carrying ALL of these tags (audio_tags
+        // join). Empty slice = no tag filter. See `search_with_tags`.
+        tags: &[String],
     ) -> Result<Vec<AudioResult>, sqlx::Error> {
         let fetch_limit = limit.saturating_add(offset);
         let (mut background_results, mut live_results) = tokio::try_join!(
@@ -3818,6 +3956,7 @@ impl DatabaseManager {
                 speaker_name,
                 device_name,
                 machine_id,
+                tags,
             ),
             self.search_live_meeting_transcripts(
                 query,
@@ -3831,6 +3970,7 @@ impl DatabaseManager {
                 speaker_name,
                 device_name,
                 machine_id,
+                tags,
             )
         )?;
 
@@ -3857,6 +3997,7 @@ impl DatabaseManager {
         speaker_name: Option<&str>,
         device_name: Option<&str>,
         machine_id: Option<&str>,
+        tags: &[String],
     ) -> Result<Vec<AudioResult>, sqlx::Error> {
         // base query for audio search
         let base_sql = String::from(
@@ -3982,6 +4123,18 @@ impl DatabaseManager {
         if machine_id.is_some() {
             conditions.push("audio_chunks.machine_id = ?");
         }
+        if !tags.is_empty() {
+            conditions.push(
+                "audio_chunks.id IN (
+                    SELECT a_inner.audio_chunk_id
+                    FROM audio_tags a_inner
+                    JOIN tags t_inner ON a_inner.tag_id = t_inner.id
+                    WHERE t_inner.name IN (SELECT value FROM json_each(?))
+                    GROUP BY a_inner.audio_chunk_id
+                    HAVING COUNT(DISTINCT t_inner.name) = json_array_length(?)
+                )",
+            );
+        }
 
         let where_clause = if conditions.is_empty() {
             "WHERE 1=1".to_owned()
@@ -4032,6 +4185,10 @@ impl DatabaseManager {
         }
         if let Some(mid) = machine_id {
             query_builder = query_builder.bind(mid);
+        }
+        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+        if !tags.is_empty() {
+            query_builder = query_builder.bind(&tags_json).bind(&tags_json);
         }
         query_builder = query_builder.bind(limit as i64).bind(offset as i64);
 
@@ -4115,8 +4272,15 @@ impl DatabaseManager {
         speaker_name: Option<&str>,
         device_name: Option<&str>,
         machine_id: Option<&str>,
+        tags: &[String],
     ) -> Result<Vec<AudioResult>, sqlx::Error> {
-        if machine_id.is_some() || speaker_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+        // Live meeting transcripts live in `meeting_transcript_segments`, which
+        // has no `audio_tags` join — their tags are display-only placeholders.
+        // A tag filter targets the junction tables, so these can't match.
+        if !tags.is_empty()
+            || machine_id.is_some()
+            || speaker_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        {
             return Ok(Vec::new());
         }
 
@@ -4222,8 +4386,11 @@ impl DatabaseManager {
         max_length: Option<usize>,
         has_speaker_id_filter: bool,
         speaker_name: Option<&str>,
+        tags: &[String],
     ) -> Result<i64, sqlx::Error> {
-        if has_speaker_id_filter {
+        // Live meeting segments aren't in `audio_tags` (see
+        // `search_live_meeting_transcripts`), so a tag filter excludes them.
+        if has_speaker_id_filter || !tags.is_empty() {
             return Ok(0);
         }
 
@@ -4458,7 +4625,48 @@ impl DatabaseManager {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn count_search_results(
+        &self,
+        query: &str,
+        content_type: ContentType,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        speaker_ids: Option<Vec<i64>>,
+        frame_name: Option<&str>,
+        browser_url: Option<&str>,
+        focused: Option<bool>,
+        speaker_name: Option<&str>,
+        on_screen: Option<bool>,
+    ) -> Result<usize, sqlx::Error> {
+        self.count_search_results_with_tags(
+            query,
+            content_type,
+            start_time,
+            end_time,
+            app_name,
+            window_name,
+            min_length,
+            max_length,
+            speaker_ids,
+            frame_name,
+            browser_url,
+            focused,
+            speaker_name,
+            on_screen,
+            &[],
+        )
+        .await
+    }
+
+    /// Counterpart to [`search_with_tags`](Self::search_with_tags): the total
+    /// that matches a tag-filtered search, so pagination stays correct.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn count_search_results_with_tags(
         &self,
         query: &str,
         mut content_type: ContentType,
@@ -4476,10 +4684,23 @@ impl DatabaseManager {
         // Mirror of `db::search`'s on_screen — must agree or pagination
         // breaks (`total` no longer matches the visible page). Issue #2436.
         on_screen: Option<bool>,
+        tags: &[String],
     ) -> Result<usize, sqlx::Error> {
         // if focused or browser_url is present, we run only on OCR
         if focused.is_some() || browser_url.is_some() {
             content_type = ContentType::OCR;
+        }
+
+        // Mirror `search_with_tags`: input and accessibility have no tag
+        // table, so their tag-filtered count is zero. Memory is counted with
+        // its own tag filter below.
+        if !tags.is_empty()
+            && matches!(
+                content_type,
+                ContentType::Input | ContentType::Accessibility
+            )
+        {
+            return Ok(0);
         }
 
         // on_screen filter is meaningful only for accessibility-bearing
@@ -4512,7 +4733,7 @@ impl DatabaseManager {
                         end_time,
                     );
                     if app_name.is_none() && window_name.is_none() {
-                        let audio_future = Box::pin(self.count_search_results(
+                        let audio_future = Box::pin(self.count_search_results_with_tags(
                             query,
                             ContentType::Audio,
                             start_time,
@@ -4527,9 +4748,16 @@ impl DatabaseManager {
                             None,
                             speaker_name,
                             None,
+                            tags,
                         ));
+                        if !tags.is_empty() {
+                            // accessibility frames carry no tags → audio only
+                            return audio_future.await;
+                        }
                         let (ax, audio) = tokio::try_join!(ax_fut, audio_future)?;
                         return Ok(ax + audio);
+                    } else if !tags.is_empty() {
+                        return Ok(0);
                     } else {
                         return ax_fut.await;
                     }
@@ -4543,7 +4771,7 @@ impl DatabaseManager {
         if content_type == ContentType::All {
             // Since OCR and Accessibility now both query frames_fts,
             // count frames once (not separately) to avoid double-counting
-            let frames_future = Box::pin(self.count_search_results(
+            let frames_future = Box::pin(self.count_search_results_with_tags(
                 query,
                 ContentType::OCR, // OCR branch now counts all frames via frames_fts
                 start_time,
@@ -4558,10 +4786,11 @@ impl DatabaseManager {
                 focused,
                 None,
                 None,
+                tags,
             ));
 
             if app_name.is_none() && window_name.is_none() {
-                let audio_future = Box::pin(self.count_search_results(
+                let audio_future = Box::pin(self.count_search_results_with_tags(
                     query,
                     ContentType::Audio,
                     start_time,
@@ -4576,6 +4805,7 @@ impl DatabaseManager {
                     None,
                     speaker_name,
                     None,
+                    tags,
                 ));
 
                 let (frames_count, audio_count) = tokio::try_join!(frames_future, audio_future)?;
@@ -4642,6 +4872,14 @@ impl DatabaseManager {
                        AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
                        AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
                        AND (?7 IS NULL OR frames.focused = ?7)
+                       AND (json_array_length(?8) = 0 OR frames.id IN (
+                           SELECT vt.vision_id
+                           FROM vision_tags vt
+                           JOIN tags t ON vt.tag_id = t.id
+                           WHERE t.name IN (SELECT value FROM json_each(?8))
+                           GROUP BY vt.vision_id
+                           HAVING COUNT(DISTINCT t.name) = json_array_length(?8)
+                       ))
                        {a11y_filter}"#,
                 fts_join = if has_fts {
                     "JOIN frames_fts ON frames.id = frames_fts.rowid"
@@ -4670,6 +4908,7 @@ impl DatabaseManager {
                        AND (?5 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) <= ?5)
                        AND (json_array_length(?6) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?6)))
                        {speaker_name_condition}
+                       {tag_filter}
                 "#,
                 table = if query.is_empty() {
                     "audio_transcriptions"
@@ -4685,6 +4924,24 @@ impl DatabaseManager {
                     "AND speakers.name LIKE '%' || ?7 || '%' COLLATE NOCASE"
                 } else {
                     ""
+                },
+                // Tag filter binds after the conditional speaker-name param,
+                // so its placeholder is ?8 when a name filter is present, ?7
+                // otherwise. Empty tag slice = no clause (and no bind).
+                tag_filter = if tags.is_empty() {
+                    String::new()
+                } else {
+                    let n = if speaker_name.is_some() { 8 } else { 7 };
+                    format!(
+                        "AND audio_transcriptions.audio_chunk_id IN (
+                            SELECT a_inner.audio_chunk_id
+                            FROM audio_tags a_inner
+                            JOIN tags t_inner ON a_inner.tag_id = t_inner.id
+                            WHERE t_inner.name IN (SELECT value FROM json_each(?{n}))
+                            GROUP BY a_inner.audio_chunk_id
+                            HAVING COUNT(DISTINCT t_inner.name) = json_array_length(?{n})
+                        )"
+                    )
                 },
                 match_condition = if query.is_empty() {
                     "1=1"
@@ -4703,6 +4960,7 @@ impl DatabaseManager {
                         None,
                         start_str.as_deref(),
                         end_str.as_deref(),
+                        tags,
                     )
                     .await?;
                 return Ok(count as usize);
@@ -4759,6 +5017,11 @@ impl DatabaseManager {
             _ => return Ok(0),
         };
 
+        // Serialized tag filter, shared by the OCR and Audio count paths.
+        // Empty array short-circuits the SQL guards (OCR) or omits the clause
+        // entirely (Audio), so no-tag callers behave exactly as before.
+        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+
         let count: i64 = match content_type {
             ContentType::OCR | ContentType::Accessibility => {
                 sqlx::query_scalar(&sql)
@@ -4769,6 +5032,7 @@ impl DatabaseManager {
                     .bind(max_length.map(|l| l as i64))
                     .bind(frame_name)
                     .bind(focused)
+                    .bind(&tags_json)
                     .fetch_one(&self.pool)
                     .await?
             }
@@ -4788,6 +5052,9 @@ impl DatabaseManager {
                 if let Some(name) = speaker_name {
                     query_builder = query_builder.bind(name);
                 }
+                if !tags.is_empty() {
+                    query_builder = query_builder.bind(&tags_json);
+                }
                 let background_count: i64 = query_builder.fetch_one(&self.pool).await?;
                 let live_count = self
                     .count_live_meeting_transcript_results(
@@ -4798,6 +5065,7 @@ impl DatabaseManager {
                         max_length,
                         has_speaker_id_filter,
                         speaker_name,
+                        tags,
                     )
                     .await?;
                 background_count + live_count
@@ -8458,6 +8726,54 @@ LIMIT ? OFFSET ?
         });
     }
 
+    /// Spawn a one-shot background `PRAGMA quick_check` shortly after startup.
+    ///
+    /// Corruption ("database disk image is malformed", SQLITE_CORRUPT)
+    /// otherwise only surfaces later, via worker query errors. We run it in
+    /// the background (not inline in `new()`) because `quick_check` still
+    /// scans every page, which would add seconds of boot latency on a
+    /// multi-GB database. On failure we log loudly with the exact recovery
+    /// command so the user can self-heal via the existing `screenpipe db
+    /// recover` path (which backs up the original before rebuilding).
+    fn spawn_startup_integrity_check(&self, database_path: Arc<str>) {
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            // Let boot settle so the scan doesn't compete with migrations
+            // and the first capture writes for I/O.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // quick_check(1) stops after the first error — we only need a
+            // yes/no signal here, not the full corruption inventory.
+            match sqlx::query_scalar::<_, String>("PRAGMA quick_check(1)")
+                .fetch_one(&pool)
+                .await
+            {
+                Ok(result) if result == "ok" => {
+                    debug!("startup integrity check: ok");
+                }
+                Ok(detail) => {
+                    error!(
+                        db = %database_path,
+                        detail = %detail,
+                        "DATABASE CORRUPTION DETECTED at startup. Recording continues but \
+                         some reads/writes may fail. Quit screenpipe and run \
+                         `screenpipe db recover` to rebuild the database (it backs up the \
+                         original first)."
+                    );
+                }
+                Err(e) => {
+                    // The check itself failing usually means the file is too
+                    // damaged to even scan — still actionable.
+                    error!(
+                        db = %database_path,
+                        error = %e,
+                        "startup integrity check could not run (database may be corrupt). \
+                         If problems persist, quit screenpipe and run `screenpipe db recover`."
+                    );
+                }
+            }
+        });
+    }
+
     /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on demand, flushing WAL into the
     /// main database file so it can be safely copied.
     /// Returns (busy, log_pages, checkpointed_pages).
@@ -9127,7 +9443,7 @@ LIMIT ? OFFSET ?
                   SELECT 1 FROM meeting_transcript_segments mts
                   WHERE mts.meeting_id = ?2
                     AND ABS(julianday(mts.captured_at) - julianday(audio_chunks.timestamp)) <= ?3
-                    AND instr(audio_chunks.file_path, mts.device_name) > 0
+                    AND instr(lower(audio_chunks.file_path), lower(mts.device_name)) > 0
                     AND instr(lower(audio_chunks.file_path), '(' || lower(mts.device_type) || ')') > 0
               )
             "#,
@@ -9157,8 +9473,11 @@ LIMIT ? OFFSET ?
     /// - `speaker_id` is left NULL — live diarization stores a free-text
     ///   `speaker_name`, not a `speakers.id`; the Meeting view still shows the live
     ///   row's speaker (it reads `meeting_transcript_segments` directly).
-    /// - Segments with no covering chunk within `coverage_window_secs` are skipped
-    ///   (the timeline still surfaces them live via `find_video_chunks`).
+    /// - A segment whose nearest same-device chunk is OUTSIDE `coverage_window_secs`
+    ///   is still mirrored onto that chunk (carrying the segment's real timestamp)
+    ///   rather than dropped, so live transcript text is never lost. Only a segment
+    ///   whose device has NO chunk at all is skipped (the timeline still surfaces it
+    ///   live via `find_video_chunks`).
     /// - `timestamp` is bound as a `DateTime<Utc>` so its on-disk format matches
     ///   every other `audio_transcriptions` row (range queries stay consistent).
     pub async fn mirror_live_meeting_to_audio_transcriptions(
@@ -9244,9 +9563,16 @@ LIMIT ? OFFSET ?
             // Match the SAME physical device's chunk so an input (mic) segment can't
             // inherit a remote speaker from a System Audio (output) chunk, and vice
             // versa. The device string is sanitized the same way the recorder names
-            // files (only '/' and '\\' replaced). If no same-device chunk exists,
-            // skip the mirror and leave the chunk pending for backfill rather than
-            // corrupting source attribution.
+            // files (only '/' and '\\' replaced). Prefer the nearest same-device chunk
+            // WITHIN the window; if none is in the window (the live provider can
+            // finalize a turn seconds after the audio, drifting captured_at past the
+            // chunk timestamp, and chunks longer than 2x the window leave segments with
+            // no in-window chunk) fall back to the nearest same-device chunk regardless
+            // of distance rather than silently DROPPING the segment. Losing the
+            // transcript text is worse than a small playback offset, and the stored
+            // `timestamp` is the segment's real captured_at so search/timeline stay
+            // correct. Only skip when the device has NO chunk at all (leave it pending
+            // for backfill). Device attribution stays strict: never a different device.
             let device_key = format!(
                 "{} ({})",
                 s.device_name,
@@ -9256,8 +9582,14 @@ LIMIT ? OFFSET ?
             .to_lowercase();
             let pick = chunks
                 .iter()
-                .filter(|c| (c.1 - seg_ms).abs() <= window_ms && c.2.contains(device_key.as_str()))
-                .min_by_key(|c| (c.1 - seg_ms).abs());
+                .filter(|c| c.2.contains(device_key.as_str()))
+                .min_by_key(|c| {
+                    // In-window chunks (false) sort before out-of-window (true); the
+                    // nearest wins within each group. So an in-window chunk is always
+                    // preferred, but a far same-device chunk still beats dropping.
+                    let dt = (c.1 - seg_ms).abs();
+                    (dt > window_ms, dt)
+                });
             let Some(chunk) = pick else {
                 continue;
             };
@@ -10035,6 +10367,7 @@ LIMIT ? OFFSET ?
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_memories(
         &self,
         query: Option<&str>,
@@ -10047,8 +10380,16 @@ LIMIT ? OFFSET ?
         offset: u32,
         order_by: Option<&str>,
         order_dir: Option<&str>,
+        // Exact-match tag filter with AND semantics: a memory must carry ALL
+        // of these tags (matched against its JSON `tags` array). Empty slice =
+        // no filter. This is the unified tag interface shared with
+        // `search_with_tags` (vs `tags_filter`, a single fuzzy substring used
+        // by the public `GET /memories?tags=`).
+        tags_all: &[String],
     ) -> Result<Vec<MemoryRecord>, SqlxError> {
         let use_fts = query.is_some_and(|q| !q.is_empty());
+        let tags_col = if use_fts { "m.tags" } else { "tags" };
+        let tags_all_json = serde_json::to_string(tags_all).unwrap_or_else(|_| "[]".to_string());
 
         let mut sql = if use_fts {
             String::from(
@@ -10084,6 +10425,14 @@ LIMIT ? OFFSET ?
         if end_time.is_some() {
             sql.push_str(" AND created_at <= ?6");
         }
+        // Exact-match AND tag filter. The `json_array_length(?9) = 0` guard
+        // short-circuits (SQLite evaluates OR left-to-right) so non-tag
+        // callers pay nothing.
+        sql.push_str(&format!(
+            " AND (json_array_length(?9) = 0 OR \
+             (SELECT COUNT(DISTINCT je.value) FROM json_each({tags_col}) je \
+              WHERE je.value IN (SELECT value FROM json_each(?9))) = json_array_length(?9))"
+        ));
 
         // Allow caller to control sort order; default to newest first
         let order_col = match order_by {
@@ -10110,10 +10459,12 @@ LIMIT ? OFFSET ?
             .bind(end_time)
             .bind(limit)
             .bind(offset)
+            .bind(&tags_all_json)
             .fetch_all(&self.pool)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn count_memories(
         &self,
         query: Option<&str>,
@@ -10122,8 +10473,13 @@ LIMIT ? OFFSET ?
         min_importance: Option<f64>,
         start_time: Option<&str>,
         end_time: Option<&str>,
+        // Exact-match AND tag filter; mirror of `list_memories`'s `tags_all`
+        // so a counted total matches a tag-filtered memory search.
+        tags_all: &[String],
     ) -> Result<i64, SqlxError> {
         let use_fts = query.is_some_and(|q| !q.is_empty());
+        let tags_col = if use_fts { "m.tags" } else { "tags" };
+        let tags_all_json = serde_json::to_string(tags_all).unwrap_or_else(|_| "[]".to_string());
 
         let mut sql = if use_fts {
             String::from(
@@ -10153,6 +10509,11 @@ LIMIT ? OFFSET ?
         if end_time.is_some() {
             sql.push_str(" AND created_at <= ?6");
         }
+        sql.push_str(&format!(
+            " AND (json_array_length(?7) = 0 OR \
+             (SELECT COUNT(DISTINCT je.value) FROM json_each({tags_col}) je \
+              WHERE je.value IN (SELECT value FROM json_each(?7))) = json_array_length(?7))"
+        ));
 
         let fts_query = query.map(crate::text_normalizer::sanitize_fts5_query);
 
@@ -10163,6 +10524,7 @@ LIMIT ? OFFSET ?
             .bind(min_importance)
             .bind(start_time)
             .bind(end_time)
+            .bind(&tags_all_json)
             .fetch_one(&self.pool)
             .await
     }
@@ -10177,6 +10539,184 @@ LIMIT ? OFFSET ?
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    // ========================================================================
+    // Outputs
+    // ========================================================================
+
+    pub async fn insert_output(
+        &self,
+        source: &str,
+        source_type: &str,
+        title: &str,
+        kind: &str,
+        original_path: Option<&str>,
+        output_path: &str,
+        size_bytes: i64,
+        preview: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<i64, SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let id = sqlx::query(
+            "INSERT INTO outputs (source, source_type, title, kind, original_path, output_path, \
+             size_bytes, preview, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(source)
+        .bind(source_type)
+        .bind(title)
+        .bind(kind)
+        .bind(original_path)
+        .bind(output_path)
+        .bind(size_bytes)
+        .bind(preview)
+        .bind(metadata.unwrap_or("{}"))
+        .execute(&mut **tx.conn())
+        .await?
+        .last_insert_rowid();
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn get_output_by_id(&self, id: i64) -> Result<crate::types::OutputRecord, SqlxError> {
+        sqlx::query_as::<_, crate::types::OutputRecord>(
+            "SELECT id, source, source_type, title, kind, original_path, output_path, \
+             size_bytes, preview, metadata, created_at, updated_at \
+             FROM outputs WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn get_output_by_path(
+        &self,
+        output_path: &str,
+    ) -> Result<Option<crate::types::OutputRecord>, SqlxError> {
+        sqlx::query_as::<_, crate::types::OutputRecord>(
+            "SELECT id, source, source_type, title, kind, original_path, output_path, \
+             size_bytes, preview, metadata, created_at, updated_at \
+             FROM outputs WHERE output_path = ?1",
+        )
+        .bind(output_path)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn list_outputs(
+        &self,
+        source: Option<&str>,
+        source_type: Option<&str>,
+        kind: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<crate::types::OutputRecord>, SqlxError> {
+        let mut sql = String::from(
+            "SELECT id, source, source_type, title, kind, original_path, output_path, \
+             size_bytes, preview, metadata, created_at, updated_at \
+             FROM outputs WHERE 1=1",
+        );
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(s) = source {
+            binds.push(s.to_string());
+            sql.push_str(&format!(" AND source = ?{}", binds.len()));
+        }
+        if let Some(st) = source_type {
+            binds.push(st.to_string());
+            sql.push_str(&format!(" AND source_type = ?{}", binds.len()));
+        }
+        if let Some(k) = kind {
+            binds.push(k.to_string());
+            sql.push_str(&format!(" AND kind = ?{}", binds.len()));
+        }
+        sql.push_str(&format!(
+            " ORDER BY updated_at DESC LIMIT ?{} OFFSET ?{}",
+            binds.len() + 1,
+            binds.len() + 2,
+        ));
+
+        let mut query = sqlx::query_as::<_, crate::types::OutputRecord>(&sql);
+        for b in &binds {
+            query = query.bind(b);
+        }
+        query = query.bind(limit).bind(offset);
+        query.fetch_all(&self.pool).await
+    }
+
+    pub async fn count_outputs(
+        &self,
+        source: Option<&str>,
+        source_type: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<i64, SqlxError> {
+        let mut sql = String::from("SELECT COUNT(*) FROM outputs WHERE 1=1");
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(s) = source {
+            binds.push(s.to_string());
+            sql.push_str(&format!(" AND source = ?{}", binds.len()));
+        }
+        if let Some(st) = source_type {
+            binds.push(st.to_string());
+            sql.push_str(&format!(" AND source_type = ?{}", binds.len()));
+        }
+        if let Some(k) = kind {
+            binds.push(k.to_string());
+            sql.push_str(&format!(" AND kind = ?{}", binds.len()));
+        }
+
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for b in &binds {
+            query = query.bind(b);
+        }
+        query.fetch_one(&self.pool).await
+    }
+
+    pub async fn update_output(
+        &self,
+        id: i64,
+        title: &str,
+        kind: &str,
+        original_path: Option<&str>,
+        size_bytes: i64,
+        preview: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            "UPDATE outputs SET title = ?1, kind = ?2, original_path = ?3, size_bytes = ?4, \
+             preview = ?5, metadata = ?6, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?7",
+        )
+        .bind(title)
+        .bind(kind)
+        .bind(original_path)
+        .bind(size_bytes)
+        .bind(preview)
+        .bind(metadata.unwrap_or("{}"))
+        .bind(id)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_output(&self, id: i64) -> Result<Option<String>, SqlxError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT output_path FROM outputs WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        if let Some((path,)) = &row {
+            let mut tx = self.begin_immediate_with_retry().await?;
+            sqlx::query("DELETE FROM outputs WHERE id = ?1")
+                .bind(id)
+                .execute(&mut **tx.conn())
+                .await?;
+            tx.commit().await?;
+            return Ok(Some(path.clone()));
+        }
+        Ok(None)
     }
 }
 

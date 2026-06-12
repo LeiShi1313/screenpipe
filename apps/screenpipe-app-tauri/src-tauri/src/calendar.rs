@@ -146,7 +146,7 @@ pub async fn calendar_status() -> Result<CalendarStatus, String> {
 
 /// Reset TCC (privacy) permission for Calendars on this app's bundle ID.
 ///
-/// Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+/// Why: multiple users (including Louis's own Mac mini) clicked
 /// "Fix Calendar Permission" → macOS opened the Calendars privacy pane
 /// with an EMPTY app list, so they had no way to grant access. Root cause
 /// is a stale TCC record (dev-build → prod-build reinstall, OS update,
@@ -362,8 +362,14 @@ async fn collect_calendar_events() -> Vec<CalendarEventItem> {
     {
         use screenpipe_connect::calendar::ScreenpipeCalendar;
 
+        // Allow reads once access was granted this session, even if the OS's
+        // cached status still lags (macOS 26 reports a stale non-FullAccess
+        // value for minutes after an in-process grant). `get_events` re-checks
+        // and re-syncs internally; explicit denials still yield no events.
         let status = ScreenpipeCalendar::authorization_status();
-        if format!("{}", status) != "Full Access" {
+        if format!("{}", status) != "Full Access"
+            && !ScreenpipeCalendar::access_granted_this_session()
+        {
             return Vec::new();
         }
 
@@ -375,7 +381,7 @@ async fn collect_calendar_events() -> Vec<CalendarEventItem> {
         {
             Ok(Ok(events)) => events.into_iter().map(calendar_event_to_item).collect(),
             Ok(Err(e)) => {
-                debug!("calendar publisher: fetch failed: {}", e);
+                warn!("calendar publisher: fetch failed (status={}): {}", status, e);
                 Vec::new()
             }
             Err(e) => {

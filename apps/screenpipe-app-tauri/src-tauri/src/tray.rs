@@ -46,6 +46,8 @@ struct TrayMenuData {
     search_shortcut: String,
     chat_shortcut: String,
     cloud_subscribed: bool,
+    /// Internal plan id from /api/user (standard|pro|team|enterprise|lifetime|none).
+    subscription_plan: Option<String>,
     has_permission_issue: bool,
     app_ui_hidden: bool,
     disable_timeline: bool,
@@ -109,6 +111,7 @@ fn prefetch_tray_menu_data(app: &AppHandle) -> TrayMenuData {
     }
 
     let cloud_subscribed = settings.user.cloud_subscribed == Some(true);
+    let subscription_plan = settings.user.subscription_plan.clone();
     let disable_timeline = settings.recording.disable_timeline;
 
     let app_ui_hidden = is_app_ui_hidden();
@@ -133,9 +136,25 @@ fn prefetch_tray_menu_data(app: &AppHandle) -> TrayMenuData {
         search_shortcut,
         chat_shortcut,
         cloud_subscribed,
+        subscription_plan,
         has_permission_issue,
         app_ui_hidden,
         disable_timeline,
+    }
+}
+
+/// Map an internal plan id to the public pricing-page display name.
+/// The pricing page renames the tiers: standard→"Basic", pro→"Business",
+/// enterprise→"Enterprise". Keep in sync with `planDisplayName` in
+/// lib/app-entitlement.ts.
+fn plan_display_name(plan: Option<&str>) -> &'static str {
+    match plan.unwrap_or("none").to_ascii_lowercase().as_str() {
+        "standard" => "Basic",
+        "pro" => "Business",
+        "team" => "Team",
+        "enterprise" => "Enterprise",
+        "lifetime" => "Lifetime",
+        _ => "Free",
     }
 }
 
@@ -256,11 +275,15 @@ fn get_effective_recording_status() -> RecordingStatus {
     if let Some((status, expiry)) = opt.as_ref() {
         if std::time::Instant::now() < *expiry {
             // Don't mask a failed start — optimistic "Starting" is only useful
-            // while capture is genuinely booting, not after a terminal error.
+            // while capture is genuinely booting, not after a terminal error or
+            // when the work-hours schedule has parked capture (ScheduledPause).
             if *status == RecordingStatus::Starting
                 && matches!(
                     real,
-                    RecordingStatus::Error | RecordingStatus::Paused | RecordingStatus::Stopped
+                    RecordingStatus::Error
+                        | RecordingStatus::Paused
+                        | RecordingStatus::ScheduledPause
+                        | RecordingStatus::Stopped
                 )
             {
                 *opt = None;
@@ -360,8 +383,21 @@ struct MenuState {
     has_permission_issue: bool,
     /// Device names + active status for change detection
     devices: Vec<(String, bool)>,
-    /// Whether user has a pro subscription (triggers menu rebuild on login)
+    /// Whether user has a cloud (Business+) subscription (triggers menu rebuild on login)
     cloud_subscribed: bool,
+    /// Plan id (Free/Basic/Business/…) so plan-label changes also rebuild the menu
+    subscription_plan: Option<String>,
+    /// HD high-fps session state, for change detection. Without these, starting
+    /// or stopping an HD session changes nothing in MenuState, so
+    /// update_menu_if_needed computes should_update=false and never re-queues
+    /// the menu — the "Stop HD recording" item then never replaces the "Record
+    /// HD" submenu (and the countdown never ticks). Mirrors what
+    /// create_dynamic_menu renders into the HD label so any visible change
+    /// triggers a rebuild.
+    hd_active: bool,
+    hd_remaining_secs: u64,
+    hd_session_kind: String,
+    hd_interval_ms: u64,
 }
 
 pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wry>>) -> Result<()> {
@@ -605,6 +641,7 @@ fn create_dynamic_menu(
         RecordingStatus::Starting => "○ Starting…",
         RecordingStatus::Recording => "● Recording",
         RecordingStatus::Paused => "◐ Paused",
+        RecordingStatus::ScheduledPause => "○ Outside work hours",
         RecordingStatus::Stopped => "○ Stopped",
         RecordingStatus::Error => "○ Error",
     };
@@ -688,22 +725,19 @@ fn create_dynamic_menu(
 
     // --- Plan / usage info ---
     if !data.app_ui_hidden && !is_tray_item_hidden("tray_plan") {
-        let is_pro = data.cloud_subscribed;
+        let plan_label = plan_display_name(data.subscription_plan.as_deref());
+        let has_cloud = data.cloud_subscribed;
         menu_builder = menu_builder.item(&PredefinedMenuItem::separator(app)?);
-        if is_pro {
-            menu_builder = menu_builder.item(
-                &MenuItemBuilder::with_id("plan_info", "Pro plan")
-                    .enabled(false)
-                    .build(app)?,
-            );
-        } else {
+        menu_builder = menu_builder.item(
+            &MenuItemBuilder::with_id("plan_info", format!("{} plan", plan_label))
+                .enabled(false)
+                .build(app)?,
+        );
+        // Anyone without cloud (Free, Basic, or Lifetime-only) can move up to
+        // Business to add cloud sync, cloud AI, and integrations.
+        if !has_cloud {
             menu_builder = menu_builder
-                .item(
-                    &MenuItemBuilder::with_id("plan_info", "Free plan")
-                        .enabled(false)
-                        .build(app)?,
-                )
-                .item(&MenuItemBuilder::with_id("upgrade", "⚡ Upgrade to Pro").build(app)?);
+                .item(&MenuItemBuilder::with_id("upgrade", "⚡ Upgrade to Business").build(app)?);
         }
     }
 
@@ -738,6 +772,7 @@ fn create_dynamic_menu(
         let label = match effective_status {
             RecordingStatus::Recording => "Recording",
             RecordingStatus::Paused => "Paused — click to resume",
+            RecordingStatus::ScheduledPause => "Outside work hours — paused by schedule",
             RecordingStatus::Starting => "Starting…",
             RecordingStatus::Error => "Error — click to retry",
             _ => "Stopped — click to record",
@@ -1374,6 +1409,7 @@ async fn update_menu_if_needed(
 
     let recording_info = get_recording_info();
     let effective_status = get_effective_recording_status();
+    let hd = get_high_fps_status();
     let new_state = MenuState {
         shortcuts: {
             let mut m = HashMap::new();
@@ -1391,6 +1427,11 @@ async fn update_menu_if_needed(
             .map(|d| (d.name.clone(), d.active))
             .collect(),
         cloud_subscribed: data.cloud_subscribed,
+        subscription_plan: data.subscription_plan.clone(),
+        hd_active: hd.active,
+        hd_remaining_secs: hd.remaining_secs,
+        hd_session_kind: hd.session_kind,
+        hd_interval_ms: hd.interval_ms,
     };
 
     // Compare with last state (poison-safe: run handler must not panic)
@@ -1415,6 +1456,8 @@ async fn update_menu_if_needed(
             Some(d) => format!("screenpipe — paused, resumes in {}", format_remaining(d)),
             None => "screenpipe — paused".to_string(),
         }
+    } else if effective_status == RecordingStatus::ScheduledPause {
+        "screenpipe — outside work hours (paused by schedule)".to_string()
     } else {
         "screenpipe".to_string()
     };

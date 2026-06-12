@@ -23,21 +23,13 @@ import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { PipeContextBanner } from "@/components/chat/pipe-context-banner";
 import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
 import { BrowserSidebar } from "@/components/browser-sidebar";
+import { MarkdownBlock } from "@/components/chat/markdown-block";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
 import { PipeAIIconLarge } from "@/components/pipe-ai-icon";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  MemoizedReactMarkdown,
-  chatUrlTransform,
-  openScreenpipeViewerLink,
-  rewriteLocalMarkdownLinksForChat,
-} from "@/components/markdown";
-import { ChatCodeBlock } from "@/components/ui/chat-code-block";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
-import remarkGfm from "remark-gfm";
-import rehypeRaw from "rehype-raw";
 // OpenAI SDK no longer used directly — all providers route through Pi agent
 import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -71,17 +63,20 @@ import { useChatStore } from "@/lib/stores/chat-store";
 import { useFeedbackStore } from "@/lib/stores/feedback-store";
 import { statusForEvent } from "@/lib/stores/pi-event-router";
 import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
+import { buildChipModelContent, buildChipDisplayContent, parseConnectionChip } from "@/lib/utils/connection-chip";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
-import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
+import { useChatFilePreview } from "@/lib/hooks/use-chat-file-preview";
+import { useSqlAutocomplete, useTagAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import {
   parseMentions,
   buildAppMentionSuggestions,
+  buildTagMentionSuggestions,
   normalizeAppTag,
   formatShortcutDisplay,
   extractConversationHistorySyncUserText,
@@ -91,7 +86,6 @@ import {
   shouldHandleChatLoadConversationForWindow,
   shouldHandleChatPrefillForWindow,
 } from "@/lib/chat-utils";
-import { sanitizeToolCallXml } from "@/lib/utils/sanitize-tool-call-xml";
 import { useAutoSuggestions, type Suggestion } from "@/lib/hooks/use-auto-suggestions";
 import { SummaryCards, type ConnectionSetupSuggestion } from "@/components/chat/summary-cards";
 import { type CustomTemplate } from "@/lib/summary-templates";
@@ -102,6 +96,10 @@ import {
   parseRateLimitWaitSeconds,
   PI_MAX_RATE_LIMIT_RETRIES,
 } from "@/lib/chat/quota-errors";
+import {
+  buildInvalidatedAuthTokenMessage,
+  isInvalidatedAuthTokenError,
+} from "@/lib/chat/auth-errors";
 import { buildSystemPrompt, buildConnectionsContext } from "@/lib/chat/system-prompt";
 import {
   classifyCurl,
@@ -128,6 +126,7 @@ import {
   type SourceCitation,
 } from "@/lib/source-citations";
 import { getFaviconUrl } from "@/components/rewind/timeline/favicon-utils";
+import { IntegrationIcon, INTEGRATION_ICON_KEYS } from "@/components/settings/connections-section";
 import {
   formatSteerShortcut,
   getComposerPrimaryAction,
@@ -162,16 +161,18 @@ function MermaidDiagramBlock({ chart }: { chart: string }) {
 interface MentionSuggestion {
   tag: string;
   description: string;
-  category: "time" | "content" | "app" | "speaker";
+  category: "time" | "content" | "app" | "speaker" | "tag";
   appName?: string;
 }
 
 const APP_SUGGESTION_LIMIT = 10;
+const TAG_SUGGESTION_LIMIT = 10;
 const STREAM_RENDER_THROTTLE_MS = 80;
 const EMPTY_QUEUED_PROMPTS: PiQueuedPrompt[] = [];
 const FOLLOW_UP_GENERATION_DELAY_MS = 10_000;
 const POST_STREAM_SIDE_EFFECT_DELAY_MS = 1_500;
 const CHAT_RAIL_CLASS = "max-w-4xl mx-auto w-full";
+
 const CONNECTION_SUGGESTION_LIMIT = 3;
 const VISIBLE_SUGGESTION_LIMIT = 2;
 const LARGE_CONTEXT_CHAR_THRESHOLD = 160_000;
@@ -193,7 +194,6 @@ type ConnectedIntegration = {
 
 type ConnectionListItem = ConnectedIntegration & { connected: boolean };
 type ActivityAppItem = { name: string; count: number; app_name?: string };
-
 function normalizeConnectionForPlatform<T extends ConnectedIntegration>(connection: T, isWindows: boolean): T {
   if (isWindows && connection.id === "apple-calendar") {
     return {
@@ -584,7 +584,8 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
  * Extract tier info from gateway error JSON embedded in error strings and
  * return a user-facing message appropriate to their actual subscription tier.
  */
-// Helper to get timezone offset string (e.g., "+1" or "-5")
+
+
 interface SearchResult {
   type: "OCR" | "Audio" | "UI";
   content: {
@@ -1424,6 +1425,7 @@ const STATIC_APP_ICONS: Record<string, string> = {
   resend: "/images/resend.svg",
   limitless: "/images/limitless.svg",
   granola: "/images/granola.png",
+  mochi: "/images/mochi.png",
   fireflies: "/images/fireflies.png",
   otter: "/images/otter.png",
   bee: "/images/bee.png",
@@ -1581,147 +1583,6 @@ function AppStatsBlock({ content }: { content: string }) {
         );
       })}
     </div>
-  );
-}
-
-// Markdown renderer for text blocks
-function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
-  // Assistant messages occasionally contain raw tool-call XML the model emitted
-  // as text — rewrite it to a fenced code block so rehypeRaw doesn't collapse
-  // the unknown tags and bleed the args into the prose. See sanitize-tool-call-xml.ts.
-  const renderText = rewriteLocalMarkdownLinksForChat(
-    isUser ? text : sanitizeToolCallXml(text),
-  );
-  return (
-    <MemoizedReactMarkdown
-      className={cn(
-        "prose prose-sm max-w-full break-words overflow-hidden [word-break:break-word]",
-        isUser
-          ? "text-foreground dark:prose-invert"
-          : "dark:prose-invert"
-      )}
-      remarkPlugins={[remarkGfm]}
-      urlTransform={chatUrlTransform}
-      rehypePlugins={[rehypeRaw]}
-      components={{
-        p({ children }) {
-          return <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>;
-        },
-        details({ children, ...props }) {
-          return (
-            <details
-              className="mt-4 border border-border rounded-md overflow-hidden not-prose"
-              {...(props as React.HTMLAttributes<HTMLDetailsElement>)}
-            >
-              {children}
-            </details>
-          );
-        },
-        summary({ children, ...props }) {
-          return (
-            <summary
-              className="px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer select-none list-none flex items-center gap-2 hover:bg-muted/50 hover:text-foreground transition-colors"
-              {...(props as React.HTMLAttributes<HTMLElement>)}
-            >
-              <svg
-                className="w-2.5 h-2.5 transition-transform [[open]_&]:rotate-90"
-                viewBox="0 0 6 10"
-                fill="currentColor"
-              >
-                <path d="M1 1l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-              </svg>
-              {children}
-            </summary>
-          );
-        },
-        a({ href, children, ...props }) {
-          if (
-            href?.startsWith("screenpipe://timeline") ||
-            href?.startsWith("screenpipe://frame") ||
-            href?.startsWith("screenpipe://view")
-          ) {
-            const handleScreenpipeLinkClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
-              e.preventDefault();
-              try {
-                if (await openScreenpipeViewerLink(href)) return;
-
-                if (href.startsWith("screenpipe://frame")) {
-                  const frameId = href.split("frame/")[1]?.replace(/^\//, "");
-                  if (frameId) {
-                    useTimelineStore.getState().setPendingNavigation({ timestamp: "", frameId });
-                    await commands.showWindow("Main");
-                    await emit("navigate-to-frame", frameId);
-                  }
-                  return;
-                }
-                const url = new URL(href);
-                const timestamp = url.searchParams.get("timestamp") || url.searchParams.get("start_time");
-                if (timestamp) {
-                  const date = new Date(timestamp);
-                  if (!isNaN(date.getTime())) {
-                    useTimelineStore.getState().setPendingNavigation({ timestamp });
-                    await commands.showWindow("Main");
-                    await emit("navigate-to-timestamp", timestamp);
-                  }
-                }
-              } catch (error) {
-                console.error("Failed to open screenpipe link:", error);
-              }
-            };
-
-            return (
-              <a
-                href="#"
-                onClick={handleScreenpipeLinkClick}
-                className="underline underline-offset-2 text-blue-500 hover:text-blue-400 cursor-pointer inline"
-                {...props}
-              >
-                {children}
-              </a>
-            );
-          }
-
-          return (
-            <a href={href} target="_blank" rel="noopener noreferrer" className="underline underline-offset-2" {...props}>
-              {children}
-            </a>
-          );
-        },
-        pre({ children, ...props }) {
-          return (
-            <pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 p-3 my-2 text-xs max-w-full not-prose" {...props}>
-              {children}
-            </pre>
-          );
-        },
-        code({ className, children, ...props }) {
-          const content = String(children).replace(/\n$/, "");
-          const match = /language-([^\s]+)/.exec(className || "");
-          const language = match?.[1] || "";
-          const isCodeBlock = className?.includes("language-");
-
-          if (language === "mermaid") {
-            return <MermaidDiagramBlock chart={content} />;
-          }
-
-          if (language === "app-stats") {
-            return <AppStatsBlock content={content} />;
-          }
-
-          if (isCodeBlock) {
-            return <ChatCodeBlock language={language} value={content} />;
-          }
-
-          return (
-            <code className="px-1.5 py-0.5 rounded bg-neutral-800 dark:bg-neutral-900 text-neutral-200 font-mono text-xs not-prose" {...props}>
-              {content}
-            </code>
-          );
-        },
-      }}
-    >
-      {renderText}
-    </MemoizedReactMarkdown>
   );
 }
 
@@ -1957,11 +1818,13 @@ function MessageContent({
   deferSourceFooter = false,
   onImageClick,
   onRetry,
+  onOpenViewerPath,
 }: {
   message: Message;
   deferSourceFooter?: boolean;
   onImageClick?: (images: string[], index: number) => void;
   onRetry?: (prompt: string) => void;
+  onOpenViewerPath?: (path: string) => void;
 }) {
   const isUser = message.role === "user";
   const { settings } = useSettings();
@@ -2029,7 +1892,23 @@ function MessageContent({
       <div className="space-y-2 min-w-0 w-full overflow-hidden">
         {displayGroups.map((group) => {
           if (group.type === "text") {
-            return <MarkdownBlock key={`text-${group.key}`} text={group.text} isUser={isUser} />;
+            return (
+              <MarkdownBlock
+                key={`text-${group.key}`}
+                text={group.text}
+                isUser={isUser}
+                onOpenViewerPath={onOpenViewerPath}
+                renderSpecialCodeBlock={(language, content) => {
+                  if (language === "mermaid") {
+                    return <MermaidDiagramBlock chart={content} />;
+                  }
+                  if (language === "app-stats") {
+                    return <AppStatsBlock content={content} />;
+                  }
+                  return null;
+                }}
+              />
+            );
           }
           if (group.type === "thinking") {
             // Settings → Display → Hide Thinking Blocks (default true). Even
@@ -2120,6 +1999,26 @@ function MessageContent({
   // attachment cards above already disclose what was attached, so we
   // suppress the expansion chevron in that case (label-only bubble).
   if (isUser && message.displayContent) {
+    const chipMatch = message.displayContent.match(/^\[chip:([^|]+)\|([^\]]+)\] ([\s\S]*)/);
+    if (chipMatch) {
+      const [, chipId, chipName, chipText] = chipMatch;
+      return (
+        <div className="space-y-2">
+          {attachmentsRow}
+          <div className="flex flex-wrap gap-x-1.5 gap-y-0.5">
+            <span className="inline-flex h-5 items-center gap-1 shrink-0 align-top">
+              <IntegrationIcon
+                icon={chipId}
+                className="w-4 h-4 flex items-center justify-center overflow-hidden shrink-0"
+                fallbackClassName="h-3 w-3 text-muted-foreground"
+              />
+              <span className="text-sm font-mono font-semibold text-foreground/80 leading-5">{chipName}</span>
+            </span>
+            <span className="text-sm leading-5 break-words min-w-0">{chipText}</span>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="space-y-2">
         {attachmentsRow}
@@ -2137,7 +2036,20 @@ function MessageContent({
   return (
     <div className="space-y-2">
       {attachmentsRow}
-      <MarkdownBlock text={displayText} isUser={isUser} />
+      <MarkdownBlock
+        text={displayText}
+        isUser={isUser}
+        onOpenViewerPath={onOpenViewerPath}
+        renderSpecialCodeBlock={(language, content) => {
+          if (language === "mermaid") {
+            return <MermaidDiagramBlock chart={content} />;
+          }
+          if (language === "app-stats") {
+            return <AppStatsBlock content={content} />;
+          }
+          return null;
+        }}
+      />
       {sourceFooter}
       {retryCta}
     </div>
@@ -2596,7 +2508,8 @@ export function StandaloneChat({
   // (the buttons hide). Only relevant in standalone mode (no parent
   // className) — the embedded variant is below the host's chrome anyway.
   const isFullscreen = useIsFullscreen();
-  const { items: appItems } = useSqlAutocomplete("app");
+  const { items: appItems, isLoading: appsLoading, refresh: refreshAppItems } = useSqlAutocomplete("app");
+  const { items: tagItems, isLoading: tagsLoading, refresh: refreshTagItems } = useTagAutocomplete();
   const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
   const { templatePipes, loading: pipesLoading } = usePipes();
   // Connected integrations (gmail, google-sheets, slack, etc.) surfaced in the
@@ -2605,6 +2518,9 @@ export function StandaloneChat({
   const [connections, setConnections] = useState<ConnectedIntegration[]>([]);
   const [allConnectionItems, setAllConnectionItems] = useState<ConnectionListItem[]>([]);
   const [connectionPreviewSuggestions, setConnectionPreviewSuggestions] = useState<Suggestion[]>([]);
+  const [showConnectBanner, setShowConnectBanner] = useState(() => {
+    try { return localStorage.getItem("screenpipe_connect_banner_dismissed") !== "true"; } catch { return true; }
+  });
   const [suggestionRefreshSeed, setSuggestionRefreshSeed] = useState(0);
   const connectionSetupSuggestions = React.useMemo(
     () => buildConnectionSetupSuggestions(allConnectionItems, appItems),
@@ -2683,6 +2599,28 @@ export function StandaloneChat({
     };
   }, [refreshConnectionState]);
 
+  // Pre-fill chat input when "Try in Chat" is clicked from the connections page.
+  // Always opens a new chat so the prompt never lands in an existing conversation.
+  // Uses a ref so the effect doesn't need startNewConversation as a dep (avoids
+  // re-registering the listener on every render while still calling the latest fn).
+  const tryInChatStartNewRef = useRef<(() => Promise<void> | void) | null>(null);
+  useEffect(() => {
+    const handler = async (e: Event) => {
+      const { connectionId, connectionName, prompt } = (e as CustomEvent<{
+        connectionId: string;
+        connectionName: string;
+        prompt: string;
+      }>).detail;
+      // Start a fresh conversation so the prompt doesn't pollute an existing chat.
+      await tryInChatStartNewRef.current?.();
+      setConnectionChip({ id: connectionId, name: connectionName, icon: connectionId });
+      setInput(prompt);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    };
+    window.addEventListener("try-in-chat", handler);
+    return () => window.removeEventListener("try-in-chat", handler);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     if (connections.length === 0) {
@@ -2739,6 +2677,7 @@ export function StandaloneChat({
   };
 
   const [input, setInput] = useState("");
+  const [connectionChip, setConnectionChip] = useState<{ id: string; name: string; icon: string } | null>(null);
   // Mirror `input` into a ref so the chat-switch logic in
   // useChatConversations can snapshot the outgoing composer text
   // without needing it as a dep (which would re-bind handlers every
@@ -2841,6 +2780,7 @@ export function StandaloneChat({
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
   const [isComposing, setIsComposing] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
+  const [mentionTrigger, setMentionTrigger] = useState<"@" | "#">("@");
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<MentionSuggestion[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
@@ -2860,6 +2800,14 @@ export function StandaloneChat({
   const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  // Inline connection prefix: icon+name rendered as an absolute overlay on the
+  // textarea's first line. We measure its width and indent the textarea's first
+  // line so the typed text flows after the prefix. chipScrollTop tracks the
+  // textarea's scroll offset so the overlay scrolls with its line instead of
+  // staying pinned at the top once the input grows past maxHeight.
+  const chipPrefixRef = useRef<HTMLDivElement>(null);
+  const [chipPrefixWidth, setChipPrefixWidth] = useState(0);
+  const [chipScrollTop, setChipScrollTop] = useState(0);
   // Root of the chat surface. The webview drag-drop event is window-global and
   // this chat is kept mounted-but-hidden (display:none) on non-chat sections,
   // so we use this ref's visibility to ignore drops meant for another view
@@ -2927,6 +2875,7 @@ export function StandaloneChat({
   // quota / credits_exhausted errors when agent_end arrives with no content and
   // no explicit stopReason=error on any message (some providers drop that flag).
   const piLastErrorRef = useRef<string | null>(null);
+  const invalidatedAuthHandledRef = useRef(false);
   const piStartInFlightRef = useRef(false);
   const sendDispatchInFlightRef = useRef(false);
   const forceQueueModeRef = useRef(false);
@@ -2940,6 +2889,45 @@ export function StandaloneChat({
   const piActiveStopRequestedRef = useRef(false);
 
   const normalizeTurnIntentText = (value: string) => value.replace(/\s+/g, " ").trim();
+
+  useEffect(() => {
+    if (settings.user?.token) {
+      invalidatedAuthHandledRef.current = false;
+    }
+  }, [settings.user?.token]);
+
+  const handleInvalidatedAuthToken = useCallback(async () => {
+    if (invalidatedAuthHandledRef.current) return;
+    invalidatedAuthHandledRef.current = true;
+    posthog.capture("session_expired", { source: "pi_stream", reason: "token_invalidated" });
+
+    await updateSettings({ user: null as any });
+    try {
+      await commands.setCloudToken(null);
+    } catch (e) {
+      console.warn("failed to clear cloud token after Pi auth error:", e);
+    }
+    try {
+      const result = await commands.piUpdateConfig(null, null);
+      if (result.status === "error") {
+        console.warn("failed to clear Pi auth config after token invalidation:", result.error);
+      }
+    } catch (e) {
+      console.warn("failed to clear Pi auth config after token invalidation:", e);
+    }
+
+    toast({
+      title: "sign in required",
+      description: buildInvalidatedAuthTokenMessage(),
+      variant: "destructive",
+    });
+
+    try {
+      await commands.openLoginWindow();
+    } catch (e) {
+      console.warn("failed to open login after Pi auth error:", e);
+    }
+  }, [updateSettings]);
 
   const turnIntentTextValuesMatch = (leftValue: string, rightValue: string) => {
     const left = normalizeTurnIntentText(leftValue);
@@ -3067,11 +3055,29 @@ export function StandaloneChat({
   const [conversationId, setConversationId] = useState<string | null>(
     initialSessionIdRef.current,
   );
+  const { filePreview, openFilePreview, closeFilePreview } =
+    useChatFilePreview(conversationId);
   const currentQueueSessionId = conversationId ?? piSessionIdRef.current;
   const queuedPrompts = useMemo(
     () => queuedPromptsBySession[currentQueueSessionId] ?? EMPTY_QUEUED_PROMPTS,
     [queuedPromptsBySession, currentQueueSessionId]
   );
+
+  // Clear the connection chip whenever the active conversation changes (new chat or history switch).
+  useEffect(() => { setConnectionChip(null); }, [conversationId]);
+
+  // Measure the inline connection prefix so the textarea first line can indent
+  // past it. Re-measure on chip change and container resize.
+  React.useLayoutEffect(() => {
+    if (!connectionChip) { setChipPrefixWidth(0); setChipScrollTop(0); return; }
+    const el = chipPrefixRef.current;
+    if (!el) return;
+    const measure = () => setChipPrefixWidth(el.offsetWidth);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [connectionChip]);
 
   useEffect(() => {
     void refreshConnectionState();
@@ -3451,10 +3457,26 @@ export function StandaloneChat({
     }
 
     const text = e.clipboardData?.getData("text/plain") ?? "";
+
+    // Reconstruct the connection chip when pasting a copied chip message
+    // (content or display form). Restoring the pill keeps the connection
+    // context intact across copy/paste, including paste into a different chat
+    // window (handler runs per-window).
+    if (!connectionChip) {
+      const parsed = parseConnectionChip(text, (id) => INTEGRATION_ICON_KEYS.has(id));
+      if (parsed) {
+        e.preventDefault();
+        setConnectionChip({ ...parsed.chip, icon: parsed.chip.id });
+        setInput((prev) => prev + parsed.prompt);
+        requestAnimationFrame(() => inputRef.current?.focus());
+        return;
+      }
+    }
+
     if (attachPastedText(text)) {
       e.preventDefault();
     }
-  }, [processImageFile, processDocFile, attachPastedText]);
+  }, [processImageFile, processDocFile, attachPastedText, connectionChip]);
 
   // Signal that this chat window is ready to receive prefill events.
   // Other windows wait for "chat-ready" before emitting "chat-prefill"
@@ -3738,6 +3760,8 @@ export function StandaloneChat({
   const startNewConversationRef = useRef(startNewConversation);
   loadConversationRef.current = loadConversation;
   startNewConversationRef.current = startNewConversation;
+  // Keep the try-in-chat ref in sync so the event handler always calls the latest fn.
+  tryInChatStartNewRef.current = startNewConversation;
 
   const openConversationLocally = useCallback(async (convId: string) => {
     const { loadConversationFile } = await import("@/lib/chat-storage");
@@ -4119,6 +4143,46 @@ export function StandaloneChat({
     [appItems]
   );
 
+  const tagMentionSuggestions = React.useMemo(
+    () => buildTagMentionSuggestions(tagItems, TAG_SUGGESTION_LIMIT),
+    [tagItems]
+  );
+
+  const allTagMentionSuggestions = React.useMemo(
+    () => buildTagMentionSuggestions(tagItems, tagItems.length),
+    [tagItems]
+  );
+
+  const tagMentionSections = React.useMemo(() => {
+    type TagCountKey = "memory_count" | "audio_count" | "frame_count";
+    const used = new Set<string>();
+
+    const sourceCount = (item: (typeof tagItems)[number], key: TagCountKey) =>
+      item[key] ?? 0;
+
+    const pick = (key: TagCountKey) => {
+      const picked = tagItems
+        .filter((item) => sourceCount(item, key) > 0 && !used.has(item.name))
+        .sort((a, b) => {
+          const sourceDelta = sourceCount(b, key) - sourceCount(a, key);
+          if (sourceDelta !== 0) return sourceDelta;
+          const totalDelta = b.count - a.count;
+          if (totalDelta !== 0) return totalDelta;
+          return a.name.localeCompare(b.name);
+        })
+        .slice(0, TAG_SUGGESTION_LIMIT);
+
+      for (const item of picked) used.add(item.name);
+      return buildTagMentionSuggestions(picked, TAG_SUGGESTION_LIMIT);
+    };
+
+    return [
+      { label: "memory tags", suggestions: pick("memory_count") },
+      { label: "audio tags", suggestions: pick("audio_count") },
+      { label: "screen tags", suggestions: pick("frame_count") },
+    ].filter((section) => section.suggestions.length > 0);
+  }, [tagItems]);
+
   const appTagMap = React.useMemo(() => {
     const map: Record<string, string> = {};
     for (const suggestion of appMentionSuggestions) {
@@ -4130,19 +4194,20 @@ export function StandaloneChat({
   }, [appMentionSuggestions]);
 
   const baseMentionSuggestions = React.useMemo(
-    () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions],
-    [appMentionSuggestions]
+    () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions, ...tagMentionSuggestions],
+    [appMentionSuggestions, tagMentionSuggestions]
   );
 
   // Parse current input to extract active filters for chip display
   const activeFilters = React.useMemo(() => {
-    if (!input.trim()) return { timeRanges: [], contentType: null, appName: null, speakerName: null };
+    if (!input.trim()) return { timeRanges: [], contentType: null, appName: null, speakerName: null, tagNames: [] as string[] };
     const parsed = parseMentions(input, { appTagMap });
     return {
       timeRanges: parsed.timeRanges,
       contentType: parsed.contentType,
       appName: parsed.appName,
       speakerName: parsed.speakerName,
+      tagNames: parsed.tagNames,
     };
   }, [input, appTagMap]);
 
@@ -4150,23 +4215,26 @@ export function StandaloneChat({
   const hasActiveFilters = activeFilters.timeRanges.length > 0 ||
     activeFilters.contentType ||
     activeFilters.appName ||
-    activeFilters.speakerName;
+    activeFilters.speakerName ||
+    activeFilters.tagNames.length > 0;
   const activeFilterCount = (activeFilters.timeRanges.length > 0 ? 1 : 0) +
     (activeFilters.contentType ? 1 : 0) +
     (activeFilters.appName ? 1 : 0) +
-    (activeFilters.speakerName ? 1 : 0);
+    (activeFilters.speakerName ? 1 : 0) +
+    activeFilters.tagNames.length;
   const activeFilterLabels = React.useMemo(
     () => [
       ...activeFilters.timeRanges.map((range) => range.label),
       activeFilters.contentType,
       activeFilters.appName,
       activeFilters.speakerName,
+      ...activeFilters.tagNames.map((tag) => `#${tag}`),
     ].filter((label): label is string => Boolean(label)),
     [activeFilters]
   );
 
   // Remove a specific @mention from input
-  const removeFilter = (filterType: "time" | "content" | "app" | "speaker", label?: string) => {
+  const removeFilter = (filterType: "time" | "content" | "app" | "speaker" | "tag", label?: string) => {
     let newInput = input;
     if (filterType === "time") {
       // Remove time mentions like @today, @yesterday, @last-hour, etc.
@@ -4198,6 +4266,9 @@ export function StandaloneChat({
     } else if (filterType === "speaker" && activeFilters.speakerName) {
       const speakerPattern = new RegExp(`@"?${activeFilters.speakerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"?\\b`, "gi");
       newInput = newInput.replace(speakerPattern, "").trim();
+    } else if (filterType === "tag" && label) {
+      const tagPattern = new RegExp(`#${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+      newInput = newInput.replace(tagPattern, "").trim();
     }
     // Clean up extra spaces
     newInput = newInput.replace(/\s+/g, " ").trim();
@@ -4206,6 +4277,11 @@ export function StandaloneChat({
 
   // Fetch speakers dynamically
   useEffect(() => {
+    if (mentionTrigger !== "@") {
+      setSpeakerSuggestions([]);
+      return;
+    }
+
     if (!mentionFilter || mentionFilter.length < 1) {
       setSpeakerSuggestions([]);
       return;
@@ -4246,17 +4322,38 @@ export function StandaloneChat({
 
     const debounceTimeout = setTimeout(searchSpeakers, 300);
     return () => clearTimeout(debounceTimeout);
-  }, [mentionFilter, baseMentionSuggestions]);
+  }, [mentionFilter, mentionTrigger, baseMentionSuggestions]);
 
   const filteredMentions = React.useMemo(() => {
+    if (mentionTrigger === "#") {
+      const tagSuggestions = !mentionFilter
+        ? tagMentionSuggestions
+        : allTagMentionSuggestions.filter(
+            s => s.tag.toLowerCase().includes(mentionFilter.toLowerCase()) ||
+                 s.description.toLowerCase().includes(mentionFilter.toLowerCase())
+          );
+      return tagSuggestions;
+    }
+
+    const searchableSuggestions = mentionFilter
+      ? [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions, ...allTagMentionSuggestions]
+      : baseMentionSuggestions;
     const suggestions = !mentionFilter
-      ? baseMentionSuggestions
-      : baseMentionSuggestions.filter(
+      ? searchableSuggestions
+      : searchableSuggestions.filter(
           s => s.tag.toLowerCase().includes(mentionFilter.toLowerCase()) ||
                s.description.toLowerCase().includes(mentionFilter.toLowerCase())
         );
     return [...suggestions, ...speakerSuggestions];
-  }, [mentionFilter, speakerSuggestions, baseMentionSuggestions]);
+  }, [
+    mentionFilter,
+    mentionTrigger,
+    speakerSuggestions,
+    baseMentionSuggestions,
+    appMentionSuggestions,
+    tagMentionSuggestions,
+    allTagMentionSuggestions,
+  ]);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -4266,18 +4363,23 @@ export function StandaloneChat({
     const textarea = e.target;
     textarea.style.height = "auto";
     textarea.style.height = Math.min(textarea.scrollHeight, 150) + "px";
+    // Keep the inline connection prefix aligned with its line: typing can grow
+    // the textarea past maxHeight and scroll it without firing onScroll.
+    if (connectionChip) setChipScrollTop(textarea.scrollTop);
 
     const cursorPos = e.target.selectionStart || 0;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const atMatch = textBeforeCursor.match(/@([\w-]*)$/);
+    const mentionMatch = textBeforeCursor.match(/([@#])([\w:.-]*)$/);
 
-    if (atMatch) {
+    if (mentionMatch) {
       setShowMentionDropdown(true);
-      setMentionFilter(atMatch[1]);
+      setMentionTrigger(mentionMatch[1] as "@" | "#");
+      setMentionFilter(mentionMatch[2]);
       setSelectedMentionIndex(0);
     } else {
       setShowMentionDropdown(false);
       setMentionFilter("");
+      setMentionTrigger("@");
     }
   };
 
@@ -4286,14 +4388,18 @@ export function StandaloneChat({
     const textBeforeCursor = input.slice(0, cursorPos);
     const textAfterCursor = input.slice(cursorPos);
 
-    const atIndex = textBeforeCursor.lastIndexOf("@");
-    if (atIndex !== -1) {
-      const newValue = textBeforeCursor.slice(0, atIndex) + tag + " " + textAfterCursor;
+    const mentionIndex = Math.max(
+      textBeforeCursor.lastIndexOf("@"),
+      textBeforeCursor.lastIndexOf("#")
+    );
+    if (mentionIndex !== -1) {
+      const newValue = textBeforeCursor.slice(0, mentionIndex) + tag + " " + textAfterCursor;
       setInput(newValue);
     }
 
     setShowMentionDropdown(false);
     setMentionFilter("");
+    setMentionTrigger("@");
     inputRef.current?.focus();
   };
 
@@ -4308,6 +4414,19 @@ export function StandaloneChat({
 
     // Ignore Enter while an IME composition is active so confirmation does not submit the message.
     if (isComposing || nativeIsComposing) {
+      return;
+    }
+
+    // Backspace at the very start of the input deletes the connection prefix
+    // (icon+name), since it sits before the typed text.
+    if (
+      (e.key === "Backspace" || e.key === "Delete") &&
+      connectionChip &&
+      e.currentTarget.selectionStart === 0 &&
+      e.currentTarget.selectionEnd === 0
+    ) {
+      e.preventDefault();
+      setConnectionChip(null);
       return;
     }
 
@@ -4337,7 +4456,12 @@ export function StandaloneChat({
       // which is the exact silent-drop bug the pending-chips fix.
       if (pendingDocsRef.current.length > 0) return;
       if (input.trim() || pastedImages.length > 0 || attachedDocsRef.current.length > 0) {
-        sendMessage(input.trim());
+        const chip = connectionChip;
+        setConnectionChip(null);
+        sendMessage(
+          chip ? buildChipModelContent(chip, input.trim()) : input.trim(),
+          chip ? buildChipDisplayContent(chip, input.trim()) : undefined,
+        );
       }
       return;
     }
@@ -4575,6 +4699,19 @@ export function StandaloneChat({
       }
     })();
   }, [appFilterOpen, recentSpeakers.length]);
+
+  // Apps/tags load on mount, but the first fetch often races server startup.
+  // App names are stable enough to retry only when empty; tags can change
+  // from Brain/timeline while chat is open, so refresh them on menu open.
+  useEffect(() => {
+    if (!appFilterOpen) return;
+    if (appItems.length === 0 && !appsLoading) {
+      void refreshAppItems();
+    }
+    if (!tagsLoading) {
+      void refreshTagItems();
+    }
+  }, [appFilterOpen, appItems.length, appsLoading, tagsLoading, refreshAppItems, refreshTagItems]);
 
   // Pi project dir is managed Rust-side at boot
 
@@ -5295,12 +5432,20 @@ export function StandaloneChat({
           console.error("[Pi] LLM error via", data.type, ":", errMsg);
           piLastErrorRef.current = errMsg;
           emitSessionActivity({ status: "error", lastError: errMsg });
+          const authTokenInvalidated = isInvalidatedAuthTokenError(errMsg);
+          if (authTokenInvalidated) {
+            void handleInvalidatedAuthToken();
+          }
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
             const quotaErrorType = classifyQuotaError(errMsg);
-            if (quotaErrorType === "daily") {
+            if (authTokenInvalidated) {
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? { ...m, content: buildInvalidatedAuthTokenMessage() } : m)
+              );
+            } else if (quotaErrorType === "daily") {
               try {
                 const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
                 } catch {}
@@ -5357,7 +5502,10 @@ export function StandaloneChat({
             if (agentEndError && !content) {
               const errStr = agentEndError;
               const quotaErrorType = classifyQuotaError(errStr);
-              if (quotaErrorType === "daily") {
+              if (isInvalidatedAuthTokenError(errStr)) {
+                void handleInvalidatedAuthToken();
+                content = buildInvalidatedAuthTokenMessage();
+              } else if (quotaErrorType === "daily") {
                 try {
                   const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
                     } catch {}
@@ -6969,16 +7117,9 @@ export function StandaloneChat({
           };
         });
       } catch {
-        if (!cancelled) {
-          setQueuedPromptsBySession((prev) => {
-            const existing = prev[sid] ?? [];
-            if (existing.length === 0) return prev;
-            return {
-              ...prev,
-              [sid]: [],
-            };
-          });
-        }
+        // Transient queue refresh failures should not erase the last known
+        // visible queue. The Rust-side `pi-queue-changed` subscription is the
+        // source of truth and will reconcile once IPC recovers.
       }
     })();
 
@@ -7761,7 +7902,12 @@ export function StandaloneChat({
     e.preventDefault();
     if (pendingDocsRef.current.length > 0) return; // wait for extraction to finish
     if (!input.trim() && pastedImages.length === 0 && attachedDocsRef.current.length === 0) return;
-    sendMessage(input.trim());
+    const chip = connectionChip;
+    setConnectionChip(null);
+    sendMessage(
+      chip ? buildChipModelContent(chip, input.trim()) : input.trim(),
+      chip ? buildChipDisplayContent(chip, input.trim()) : undefined,
+    );
   };
 
   const handleStop = async () => {
@@ -7883,7 +8029,9 @@ export function StandaloneChat({
           apps
         </div>
         {appMentionSuggestions.length === 0 ? (
-          <div className="px-3 py-2 text-[10px] text-muted-foreground">no apps detected yet</div>
+          <div className="px-3 py-2 text-[10px] text-muted-foreground">
+            {appsLoading ? "loading apps..." : "no apps detected yet"}
+          </div>
         ) : (
           appMentionSuggestions.map((suggestion) => {
             const isActive = activeFilters.appName === suggestion.appName;
@@ -7910,6 +8058,48 @@ export function StandaloneChat({
               </button>
             );
           })
+        )}
+
+        <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+          tags
+        </div>
+        {allTagMentionSuggestions.length === 0 ? (
+          <div className="px-3 py-2 text-[10px] text-muted-foreground">
+            {tagsLoading ? "loading tags..." : "no tags yet"}
+          </div>
+        ) : (
+          tagMentionSections.map((section) => (
+            <React.Fragment key={section.label}>
+              <div className="px-3 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/80 bg-muted/20 border-b border-border/40">
+                {section.label}
+              </div>
+              {section.suggestions.map((suggestion) => {
+                const tagName = suggestion.tag.slice(1);
+                const isActive = activeFilters.tagNames.includes(tagName);
+                return (
+                  <button
+                    key={`tag-${section.label}-${suggestion.tag}`}
+                    type="button"
+                    onClick={() => {
+                      if (isActive) {
+                        removeFilter("tag", tagName);
+                      } else {
+                        setInput((prev) => `${suggestion.tag} ${prev.trim()}`.trim() + " ");
+                      }
+                      setAppFilterOpen(false);
+                    }}
+                    className={cn(
+                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                      isActive && "bg-muted"
+                    )}
+                  >
+                    <span>{suggestion.tag}</span>
+                    <span className="text-[10px] text-muted-foreground truncate">{suggestion.description}</span>
+                  </button>
+                );
+              })}
+            </React.Fragment>
+          ))
         )}
 
         {connections.length > 0 && (
@@ -8546,6 +8736,7 @@ export function StandaloneChat({
                     }
                     onImageClick={(images, index) => setImageViewer({ images, index })}
                     onRetry={(prompt) => sendMessage(prompt)}
+                    onOpenViewerPath={openFilePreview}
                   />
                 )}
               </div>
@@ -9148,12 +9339,45 @@ export function StandaloneChat({
           >
             {/* Textarea row: full width so scrollbar is above the buttons and no dead zone */}
             <div className="relative flex-1 min-w-0">
+              {/* Connection chip — inline icon + name prefix on the
+                  textarea's first line. The prefix is an absolute overlay; the
+                  textarea's first line is indented past it so typed text flows
+                  after the name. X (absolute, top-right) clears it. */}
+              {connectionChip && (
+                <>
+                  {/* Clip wrapper: matches the textarea's visible box so the
+                      prefix never bleeds above the first line when scrolled. */}
+                  <div className="pointer-events-none absolute left-3 right-7 top-2.5 bottom-2.5 z-10 overflow-hidden">
+                    <div
+                      ref={chipPrefixRef}
+                      className="absolute left-0 top-0 flex h-5 items-center gap-1.5"
+                      style={{ transform: `translateY(${-chipScrollTop}px)` }}
+                    >
+                      <IntegrationIcon
+                        icon={connectionChip.icon}
+                        className="w-4 h-4 flex items-center justify-center overflow-hidden shrink-0 bg-transparent"
+                        fallbackClassName="h-3 w-3 text-muted-foreground"
+                      />
+                      <span className="text-sm font-mono font-semibold text-foreground/80 leading-5 whitespace-nowrap">{connectionChip.name}</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Remove connection context"
+                    onClick={() => setConnectionChip(null)}
+                    className="absolute right-2.5 top-2 z-10 text-muted-foreground/60 hover:text-foreground transition-colors shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
               <textarea
                 ref={inputRef}
                 value={input}
                 onChange={handleInputChange}
                 onCompositionStart={() => setIsComposing(true)}
                 onCompositionEnd={() => setIsComposing(false)}
+                onScroll={connectionChip ? (e) => setChipScrollTop(e.currentTarget.scrollTop) : undefined}
                 onKeyDown={handleKeyDown}
                 placeholder={
                   disabledReason
@@ -9166,8 +9390,14 @@ export function StandaloneChat({
                 spellCheck={false}
                 autoCorrect="off"
                 rows={1}
-                className="w-full min-h-[44px] border-0 bg-transparent px-3 py-2.5 pr-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto scrollbar-minimal"
-                style={{ maxHeight: "150px" }}
+                className={cn(
+                  "w-full min-h-[44px] border-0 bg-transparent px-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto scrollbar-minimal py-2.5",
+                  connectionChip ? "pr-7" : "pr-3"
+                )}
+                style={{
+                  maxHeight: "150px",
+                  textIndent: connectionChip && chipPrefixWidth ? `${chipPrefixWidth + 8}px` : undefined,
+                }}
               />
 
               <AnimatePresence>
@@ -9180,13 +9410,13 @@ export function StandaloneChat({
                     transition={{ duration: 0.1 }}
                     className="absolute bottom-full left-0 right-0 mb-1 bg-background border border-border rounded-lg shadow-lg overflow-hidden z-50 max-h-[240px] overflow-y-auto"
                   >
-                    {["time", "content", "app", "speaker"].map(category => {
+                    {["time", "content", "app", "tag", "speaker"].map(category => {
                       const items = filteredMentions.filter(m => m.category === category);
                       if (items.length === 0) return null;
                       return (
                         <div key={category}>
                           <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50">
-                            {category === "time" ? "time" : category === "content" ? "content type" : category === "speaker" ? "speakers" : "apps"}
+                            {category === "time" ? "time" : category === "content" ? "content type" : category === "speaker" ? "speakers" : category === "tag" ? "tags" : "apps"}
                           </div>
                           {items.map((suggestion) => {
                             const globalIndex = filteredMentions.indexOf(suggestion);
@@ -9340,6 +9570,49 @@ export function StandaloneChat({
               })()}
             </div>
           </div>
+
+          {/* Connect apps nudge banner — inside the form, below the input box */}
+          {showConnectBanner && (
+            <div className="flex items-center gap-2 mt-2">
+              <button
+                type="button"
+                onClick={() => openConnectionSetup("connections")}
+                className="text-[11px] text-muted-foreground/70 hover:text-foreground transition-colors flex-1 text-left"
+              >
+                Connect your apps to get better answers
+              </button>
+              <div className="flex items-center gap-1">
+                {connections
+                  .filter((c) => INTEGRATION_ICON_KEYS.has(c.icon || c.id))
+                  .slice(0, 8)
+                  .map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      title={c.name}
+                      onClick={() => openConnectionSetup(c.id)}
+                      className="shrink-0 opacity-70 hover:opacity-100 transition-opacity"
+                    >
+                      <IntegrationIcon
+                        icon={c.icon || c.id}
+                        className="w-6 h-6 bg-muted/40 rounded-md flex items-center justify-center"
+                        fallbackClassName="h-3 w-3 text-muted-foreground"
+                      />
+                    </button>
+                  ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowConnectBanner(false);
+                  try { localStorage.setItem("screenpipe_connect_banner_dismissed", "true"); } catch {}
+                }}
+                className="text-muted-foreground/50 hover:text-foreground transition-colors shrink-0"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
         </form>
       </div> {/* End of max-w-4xl input wrapper */}
       </div>
@@ -9349,7 +9622,12 @@ export function StandaloneChat({
           the agent navigates (or when restoring a chat that has saved
           state). The actual page is rendered by a Tauri WebviewWindow
           positioned over the placeholder div inside this component. */}
-      <BrowserSidebar conversationId={conversationId} />
+      <BrowserSidebar
+        conversationId={conversationId}
+        filePreview={filePreview}
+        onCloseFilePreview={closeFilePreview}
+        onReplaceFilePreviewPath={openFilePreview}
+      />
       </div> {/* End of horizontal chat+browser split */}
 
 

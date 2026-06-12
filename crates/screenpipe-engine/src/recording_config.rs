@@ -138,6 +138,9 @@ pub struct RecordingConfig {
     /// Restored from settings on startup so the user's choice survives app restarts.
     pub power_mode: Option<String>,
 
+    /// Keep the computer awake while screenpipe is running.
+    pub keep_computer_awake: bool,
+
     /// Database configuration (pool sizes, mmap, cache) derived from device tier.
     pub db_config: DbConfig,
 
@@ -160,6 +163,10 @@ pub struct RecordingConfig {
     /// Skip the v2 meeting detector watcher.
     /// See `RecordingSettings.disable_meeting_detector` for details.
     pub disable_meeting_detector: bool,
+
+    /// Apps / meeting services excluded from meeting detection.
+    /// See `RecordingSettings.ignored_meeting_apps` for matching semantics.
+    pub ignored_meeting_apps: Vec<String>,
 
     /// Mitsukeru fork: overrides for event-driven capture parameters.
     /// None = follow active PowerProfile.
@@ -315,6 +322,7 @@ impl RecordingConfig {
                 .collect(),
             batch_max_duration_secs: settings.batch_max_duration_secs.filter(|&v| v > 0),
             power_mode: settings.power_mode.clone(),
+            keep_computer_awake: settings.keep_computer_awake,
             db_config: settings
                 .device_tier
                 .as_deref()
@@ -332,6 +340,7 @@ impl RecordingConfig {
             max_snapshot_width: settings.max_snapshot_width,
             disable_snapshot_compaction: settings.disable_snapshot_compaction,
             disable_meeting_detector: settings.disable_meeting_detector,
+            ignored_meeting_apps: settings.ignored_meeting_apps.clone(),
             idle_capture_interval_ms: settings.idle_capture_interval_ms,
             visual_check_interval_ms: settings.visual_check_interval_ms,
             visual_change_threshold: settings.visual_change_threshold,
@@ -443,6 +452,7 @@ impl RecordingConfig {
             output_path,
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            ignored_urls: self.ignored_urls.clone(),
             vision_metrics,
             use_pii_removal: self.use_pii_removal,
             monitor_ids: self.monitor_ids.clone(),

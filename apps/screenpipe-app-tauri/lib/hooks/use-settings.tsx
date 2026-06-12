@@ -20,6 +20,7 @@ import type {
 	EnterpriseAppUpdatePolicy,
 	EnterpriseInstallMetadata,
 } from "@ee/lib/app-update-policy";
+import { type FontSize, applyFontSize } from "@/lib/utils/font-size";
 export type VadSensitivity = "low" | "medium" | "high";
 
 export type AIProviderType =
@@ -239,6 +240,8 @@ export type Settings = SettingsStore & {
 	 * purpose: it syncs secrets, so enabling it is a distinct informed choice.
 	 * Credentials are end-to-end encrypted in the sync blob. Pro-gated. */
 	connectionsSyncEnabled?: boolean;
+	/** Font size for the entire app UI */
+	fontSize?: FontSize;
 	/** OpenAI-compatible transcription endpoint URL */
 	openaiCompatibleEndpoint?: string;
 	/** OpenAI-compatible transcription API key */
@@ -420,17 +423,15 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 	linux: ["Info center", "Discover", "Parted"],
 };
 
-// Two default screenpipe-cloud presets on first install:
-// - "Chat":  Claude Opus 4.7 if the user is pro, Claude Sonnet 4.5 otherwise.
-//           Opus is gated in the ai-gateway (subscribed tier), so pushing
-//           it to non-pro users would 403 their first message.
-// - "Pipes": Claude Haiku 4.5 — cheap/fast for recurring pipe runs.
-//           Pipes default to this preset; users can override per-pipe.
+// Default screenpipe-cloud presets on first install — every seed runs on
+// "auto": the ai-gateway routes to the best model the user's tier allows, so
+// nobody starts pinned to a specific (possibly tier-gated) Claude model.
+// - "Chat":  default preset, used by interactive chat.
+// - "Pipes": same routing, separate id so recurring pipe runs can be
+//           customized independently; users can override per-pipe.
 const CHAT_PRESET_ID = "chat";
 const PIPES_PRESET_ID = "pipes";
 
-// Pro users get the chat / pipes pair (opus for interactive chat, auto for
-// pipe runs that pick the cheapest model that fits the task).
 // Non-pro users get a single "screenpipe" preset on auto — auto handles
 // model routing without needing the user to know what to pick.
 const SCREENPIPE_PRESET_ID = "screenpipe";
@@ -442,7 +443,7 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 				id: CHAT_PRESET_ID,
 				provider: "screenpipe-cloud",
 				url: "",
-				model: "claude-opus-4-8",
+				model: "auto",
 				maxContextChars: 200000,
 				defaultPreset: true,
 				prompt: "",
@@ -527,6 +528,7 @@ let DEFAULT_SETTINGS: Settings = {
 			],
 			includedWindows: [],
 			ignoredUrls: [],
+			ignoredMeetingApps: [],
 			teamFilters: { ignoredWindows: [], includedWindows: [], ignoredUrls: [] },
 
 			analyticsEnabled: true,
@@ -594,6 +596,7 @@ let DEFAULT_SETTINGS: Settings = {
 			pauseOnDrmContent: false,
 			disableClipboardCapture: true,
 			disableKeyboardCapture: true,
+			keepComputerAwake: false,
 			experimentalCoreaudioSystemAudio: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,
@@ -604,6 +607,7 @@ let DEFAULT_SETTINGS: Settings = {
 			encryptStore: true,
 			hdRecordingDefault: "ask",
 			hdRecordingIntervalMs: 100,
+			fontSize: "16px",
 		};
 
 export function createDefaultSettingsObject(): Settings {
@@ -689,8 +693,8 @@ function createSettingsStore() {
 		// cancellation — so the tap silently captured zeroed buffers on every
 		// meeting. Users who explicitly want the tap (e.g. to dodge SCK's
 		// sleep/wake display-enumeration bug) can re-enable it in Settings.
-		// Reported by Ruark Ferreira on 2026-04-24 after his v2.4.46 calls
-		// kept dropping other participants.
+		// Reported on 2026-04-24 after v2.4.46 calls kept dropping
+		// other participants.
 		if (!(settings as any).coreaudioTapMigrationV2) {
 			settings.experimentalCoreaudioSystemAudio = false;
 			(settings as any).coreaudioTapMigrationV2 = true;
@@ -1166,6 +1170,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		} as any);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [settings.user?.cloud_subscribed, isSettingsLoaded]);
+
+	useEffect(() => {
+		applyFontSize(settings.fontSize);
+	}, [settings.fontSize]);
 
 	const updateSettings = async (updates: Partial<Settings>) => {
 		// Sign-out (user → null) must invalidate any loadUser() request that is

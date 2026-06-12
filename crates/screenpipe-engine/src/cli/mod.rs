@@ -435,7 +435,11 @@ pub struct RecordArgs {
     /// Which PII classes the AI redaction workers rewrite when enabled.
     /// Comma-separated canonical labels: secret, person, email, phone,
     /// address, sensitive, url, company, repo, handle, channel, id,
-    /// date. `secret` is always included regardless. Default: secret.
+    /// date. Also accepts fine-grained structured-ID sub-types handled by
+    /// the deterministic detector: us_ssn, credit_card, iban, spain_dni,
+    /// brazil_cpf, india_aadhaar, canada_sin, imei (enable one without
+    /// turning on the whole `id` class). `secret` is always included
+    /// regardless. Default: secret.
     #[arg(long, value_delimiter = ',', default_value = "secret")]
     pub pii_redaction_labels: Vec<String>,
 
@@ -465,6 +469,14 @@ pub struct RecordArgs {
     #[arg(long)]
     pub ignored_urls: Vec<String>,
 
+    /// Apps / meeting services to exclude from automatic meeting detection
+    /// (case-insensitive contains). Matches the running app's name/process or
+    /// the matched detection profile's identifiers, so an entry can be the app
+    /// (e.g. `discord`, `zoom.us`) or the service/domain (e.g. `google meet`,
+    /// `meet.google.com`). Repeatable. Other meeting apps stay detected.
+    #[arg(long)]
+    pub ignored_meeting_apps: Vec<String>,
+
     /// Deepgram API Key for audio transcription
     #[arg(long = "deepgram-api-key")]
     pub deepgram_api_key: Option<String>,
@@ -484,6 +496,10 @@ pub struct RecordArgs {
     /// Video quality preset: low, balanced, high, max
     #[arg(long, default_value = "balanced")]
     pub video_quality: String,
+
+    /// Keep the computer awake while screenpipe is running.
+    #[arg(long, default_value_t = false)]
+    pub keep_computer_awake: bool,
 
     /// Mitsukeru fork: override the active PowerProfile's idle_capture_interval_ms.
     /// Forces this idle snapshot interval regardless of power mode. Useful for
@@ -554,6 +570,12 @@ pub struct RecordArgs {
     /// Enable cloud sync
     #[arg(long, default_value_t = false)]
     pub enable_sync: bool,
+
+    /// Enable mDNS LAN discovery (advertise this instance + browse for peers).
+    /// Off by default: it opens a multicast socket, which triggers the macOS
+    /// "Local Network" permission prompt. Opt in for multi-device sync.
+    #[arg(long, env = "SCREENPIPE_ENABLE_MDNS", default_value_t = false)]
+    pub enable_mdns: bool,
 
     /// API token for cloud sync
     #[arg(long, env = "SCREENPIPE_SYNC_TOKEN")]
@@ -677,10 +699,12 @@ pub struct RecordArgSources {
     pub ignored_windows: bool,
     pub included_windows: bool,
     pub ignored_urls: bool,
+    pub ignored_meeting_apps: bool,
     pub deepgram_api_key: bool,
     pub transcription_mode: bool,
     pub disable_telemetry: bool,
     pub video_quality: bool,
+    pub keep_computer_awake: bool,
     pub pause_on_drm_content: bool,
     pub disable_clipboard_capture: bool,
     pub disable_keyboard_capture: bool,
@@ -725,10 +749,12 @@ impl RecordArgSources {
             ignored_windows: from_command_line(record, "ignored_windows"),
             included_windows: from_command_line(record, "included_windows"),
             ignored_urls: from_command_line(record, "ignored_urls"),
+            ignored_meeting_apps: from_command_line(record, "ignored_meeting_apps"),
             deepgram_api_key: from_command_line(record, "deepgram_api_key"),
             transcription_mode: from_command_line(record, "transcription_mode"),
             disable_telemetry: from_command_line(record, "disable_telemetry"),
             video_quality: from_command_line(record, "video_quality"),
+            keep_computer_awake: from_command_line(record, "keep_computer_awake"),
             pause_on_drm_content: from_command_line(record, "pause_on_drm_content"),
             disable_clipboard_capture: from_command_line(record, "disable_clipboard_capture"),
             disable_keyboard_capture: from_command_line(record, "disable_keyboard_capture"),
@@ -765,10 +791,12 @@ impl RecordArgSources {
             || self.ignored_windows
             || self.included_windows
             || self.ignored_urls
+            || self.ignored_meeting_apps
             || self.deepgram_api_key
             || self.transcription_mode
             || self.disable_telemetry
             || self.video_quality
+            || self.keep_computer_awake
             || self.pause_on_drm_content
             || self.disable_clipboard_capture
             || self.disable_keyboard_capture
@@ -915,6 +943,7 @@ impl RecordArgs {
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
             ignored_urls: self.ignored_urls.clone(),
+            ignored_meeting_apps: self.ignored_meeting_apps.clone(),
             languages: self
                 .language
                 .iter()
@@ -935,6 +964,7 @@ impl RecordArgs {
             extraction_thread_priority: self.extraction_thread_priority.clone(),
             pause_extraction_on_input_ms: self.pause_extraction_on_input_ms,
             analytics_enabled: !self.disable_telemetry,
+            keep_computer_awake: self.keep_computer_awake,
             ignore_incognito_windows: true,
             pause_on_drm_content: self.pause_on_drm_content,
             disable_clipboard_capture: self.disable_clipboard_capture,
@@ -1187,6 +1217,9 @@ impl RecordArgs {
         if sources.ignored_urls {
             settings.ignored_urls = self.ignored_urls.clone();
         }
+        if sources.ignored_meeting_apps {
+            settings.ignored_meeting_apps = self.ignored_meeting_apps.clone();
+        }
         if sources.deepgram_api_key {
             settings.deepgram_api_key = self.deepgram_api_key.clone().unwrap_or_default();
         }
@@ -1201,6 +1234,9 @@ impl RecordArgs {
         }
         if sources.video_quality {
             settings.video_quality = self.video_quality.clone();
+        }
+        if sources.keep_computer_awake {
+            settings.keep_computer_awake = self.keep_computer_awake;
         }
         if sources.pause_on_drm_content {
             settings.pause_on_drm_content = self.pause_on_drm_content;
@@ -1978,6 +2014,32 @@ mod tests {
                 assert!(
                     !settings.pause_on_drm_content,
                     "absent flag should be false in settings"
+                );
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    #[test]
+    fn test_keep_computer_awake_default_false() {
+        let cli = Cli::try_parse_from(["screenpipe", "record"]).unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                assert!(!args.keep_computer_awake, "default should be false");
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    #[test]
+    fn test_keep_computer_awake_flag_flows_to_recording_settings() {
+        let cli = Cli::try_parse_from(["screenpipe", "record", "--keep-computer-awake"]).unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                let settings = args.to_recording_settings();
+                assert!(
+                    settings.keep_computer_awake,
+                    "flag should propagate to RecordingSettings"
                 );
             }
             _ => panic!("expected Record command"),

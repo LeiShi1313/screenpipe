@@ -18,6 +18,7 @@ import type {
   ConversationKind,
   PipeContext,
 } from "@/lib/hooks/use-settings";
+import { deleteCachedBrowserState } from "@/lib/browser-state-cache";
 import {
   CHAT_PROCESSING_PLACEHOLDER,
   CONVERSATION_DEDUP_WINDOW_MS,
@@ -134,16 +135,18 @@ export async function loadConversationFile(
 }
 
 export async function deleteConversationFile(id: string): Promise<void> {
-  const dir = await getChatsDir();
-  const filename = conversationFilename(id);
-  const filePath = `${dir}/${filename}`;
   try {
+    const dir = await getChatsDir();
+    const filename = conversationFilename(id);
+    const filePath = `${dir}/${filename}`;
     if (await exists(filePath)) {
       await remove(filePath);
       forgetConversationEntry(dir, filename);
     }
   } catch {
     // ignore
+  } finally {
+    deleteCachedBrowserState(id);
   }
 }
 
@@ -276,16 +279,20 @@ export function conversationMetaFromJson(conv: any): ConversationMeta | null {
   if (!conv || typeof conv.id !== "string") return null;
 
   const messages = Array.isArray(conv.messages) ? conv.messages : [];
-  let lastUserMessageAt = conv.lastUserMessageAt;
-  if (lastUserMessageAt == null) {
-    for (const m of messages) {
-      if (m?.role === "user" && typeof m.timestamp === "number") {
-        if (lastUserMessageAt == null || m.timestamp > lastUserMessageAt) {
-          lastUserMessageAt = m.timestamp;
-        }
+  let newestUserMessageAt: number | undefined;
+  for (const m of messages) {
+    if (m?.role === "user" && typeof m.timestamp === "number") {
+      if (newestUserMessageAt == null || m.timestamp > newestUserMessageAt) {
+        newestUserMessageAt = m.timestamp;
       }
     }
   }
+  const persistedLastUserMessageAt =
+    typeof conv.lastUserMessageAt === "number" ? conv.lastUserMessageAt : undefined;
+  const lastUserMessageAt =
+    newestUserMessageAt == null
+      ? persistedLastUserMessageAt
+      : Math.max(persistedLastUserMessageAt ?? 0, newestUserMessageAt);
 
   return {
     id: conv.id,

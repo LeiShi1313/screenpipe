@@ -22,6 +22,10 @@ import {
   shouldAcceptTitleSource,
 } from "@/lib/utils/chat-title";
 import { isInjectedTitleSourcePrompt } from "@/lib/chat-utils";
+import {
+  getCachedBrowserStateEntry,
+  resolveNewestBrowserState,
+} from "@/lib/browser-state-cache";
 import { commands, type AIPreset } from "@/lib/utils/tauri";
 import {
   saveConversationFile,
@@ -120,6 +124,15 @@ interface SaveConversationOptions {
   syncActiveConversation?: boolean;
 }
 
+function newestUserMessageTimestamp(messages: Message[]): number | undefined {
+  let latest: number | undefined;
+  for (const message of messages) {
+    if (message.role !== "user" || typeof message.timestamp !== "number") continue;
+    if (latest == null || message.timestamp > latest) latest = message.timestamp;
+  }
+  return latest;
+}
+
 /** Module-scope guard for AI title generation — survives component remounts
  *  and is shared across all hook instances so two StandaloneChat mounts
  *  (chat window + home page) never both fire for the same conversation.
@@ -196,16 +209,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     if (historySearch.trim()) return;
 
     const msgs = Array.isArray(conversation.messages) ? conversation.messages : [];
-    let lastUserMessageAt = conversation.lastUserMessageAt;
-    if (lastUserMessageAt == null) {
-      for (const m of msgs) {
-        if (m?.role === "user" && typeof m.timestamp === "number") {
-          if (lastUserMessageAt == null || m.timestamp > lastUserMessageAt) {
-            lastUserMessageAt = m.timestamp;
-          }
-        }
-      }
-    }
+    const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
+    const lastUserMessageAt =
+      computedLastUserMessageAt == null
+        ? conversation.lastUserMessageAt
+        : Math.max(conversation.lastUserMessageAt ?? 0, computedLastUserMessageAt);
 
     const meta: ConversationMeta = {
       id: conversation.id,
@@ -497,6 +505,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // Try to load existing conversation to preserve createdAt + title + kind.
     const { loadConversationFile } = await import("@/lib/chat-storage");
     const existing = await loadConversationFile(convId);
+    const browserState = resolveNewestBrowserState(
+      existing?.browserState,
+      getCachedBrowserStateEntry(convId),
+    );
 
     // Find first real user message, skipping injected metadata.
     const firstUserMsg = msgs.find((m) => (
@@ -504,6 +516,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     ));
     const fallbackTitle = deriveFallbackConversationTitle(firstUserMsg);
     const existingTitle = existing?.title?.trim() || null;
+    const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
 
     const hasValidPreset =
       selectedPreset &&
@@ -704,17 +717,21 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       // plain chat (kind/pipeContext dropped on disk).
       ...(existing?.kind ? { kind: existing.kind } : {}),
       ...(existing?.pipeContext ? { pipeContext: existing.pipeContext } : {}),
+      ...(browserState ? { browserState } : {}),
       ...(existing?.pinned ? { pinned: existing.pinned } : {}),
       ...(existing?.hidden ? { hidden: existing.hidden } : {}),
-      // Preserve sort key across reloads. Source of truth: the in-memory
-      // chat-store, which is bumped exactly once per user-send.
+      // Preserve sort key across reloads. Source of truth: the transcript
+      // being saved, then the in-memory chat-store, then older disk state.
+      // This prevents a stale persisted/store value from keeping an old
+      // sidebar age after a fresh user message is already in `msgs`.
       ...(await (async () => {
         const { useChatStore } = await import("@/lib/stores/chat-store");
         const sid = piSessionIdRef.current;
         const fromStore = sid
           ? useChatStore.getState().sessions[sid]?.lastUserMessageAt
           : undefined;
-        const lastUserMessageAt = fromStore ?? existing?.lastUserMessageAt;
+        const lastUserMessageAt =
+          computedLastUserMessageAt ?? fromStore ?? existing?.lastUserMessageAt;
         return lastUserMessageAt ? { lastUserMessageAt } : {};
       })()),
     };

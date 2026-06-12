@@ -7,6 +7,32 @@
 const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
+import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
+
+/** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
+export const searchIndex: SettingsField[] = [
+  // Mirrors the labels actually rendered by RecordingSettings. Keep in sync.
+  { label: "Audio Recording", keywords: ["mic", "microphone", "audio"] },
+  { label: "Transcription engine", keywords: ["whisper", "cloud", "stt"] },
+  // conditional: rendered only when audio is enabled / engine selected.
+  { label: "Live meeting notes", keywords: ["captions", "meeting", "live"], conditional: true },
+  { label: "Append typed text to note", keywords: ["note", "append"], conditional: true },
+  { label: "Batch Transcription", keywords: ["batch", "chunks", "quality"], conditional: true },
+  { label: "Filter Music", keywords: ["music", "background music", "filter"], conditional: true },
+  { label: "Auto-select audio devices", keywords: ["devices", "bluetooth"], conditional: true },
+  { label: "Languages", keywords: ["transcript language", "language"], conditional: true },
+  { label: "Custom Vocabulary", keywords: ["vocabulary", "names", "jargon", "replacement"], conditional: true },
+  // conditional: platform/OS-gated (Windows-only / macOS CoreAudio tap).
+  { label: "Microphone echo cancellation", keywords: ["echo", "voiceprocessingio"], conditional: true },
+  { label: "CoreAudio system audio capture", keywords: ["coreaudio", "system audio"], conditional: true },
+  { label: "Screen recording", keywords: ["screen", "video"] },
+  { label: "Use all monitors", keywords: ["monitor", "display"] },
+  { label: "Recording quality", keywords: ["fps", "quality"] },
+  // conditional: monitor picker only renders when "Use all monitors" is off.
+  { label: "Monitors", conditional: true },
+  { label: "HD recording for meetings", keywords: ["hd", "meeting"] },
+  { label: "Chinese mirror", keywords: ["china", "mirror"] },
+];
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
 import { Label } from "@/components/ui/label";
 import {
@@ -49,6 +75,7 @@ import {
   FileText,
   User,
   Users,
+  UserX,
   ChevronUp,
   ChevronDown,
   CheckCircle2,
@@ -90,7 +117,16 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
-import { Language } from "@/lib/language";
+import {
+  Language,
+  areLanguageSelectionsEqual,
+  filterLanguagesForTranscriptionEngine,
+  getLanguageOptionsForTranscriptionEngine,
+  getTranscriptionEngineLanguageSupportKey,
+  hasLimitedLanguageSupport,
+  resolveLanguageSelectionForTranscriptionEngine,
+  transcriptionEngineUsesLanguageHints,
+} from "@/lib/language";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ToastAction } from "@/components/ui/toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -100,7 +136,7 @@ import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/compone
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { MultiSelect } from "@/components/ui/multi-select";
+import { MeetingAppsPicker } from "./meeting-apps-picker";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import * as Sentry from "@sentry/react";
@@ -151,6 +187,7 @@ const TRANSCRIPTION_ENGINE_LABELS: Record<string, string> = {
   "openai-compatible": "OpenAI Compatible",
   "qwen3-asr": "Qwen3-ASR",
   parakeet: "Parakeet",
+  "parakeet-mlx": "Parakeet MLX",
   disabled: "Disabled (capture only)",
 };
 
@@ -165,10 +202,17 @@ type AudioEngineResolution = {
   fallbackReason: AudioEngineFallbackReason | null;
 };
 
+type AudioEngineResolutionSettings = Pick<
+  Settings,
+  "audioTranscriptionEngine" | "deepgramApiKey" | "user"
+>;
+
 const getTranscriptionEngineLabel = (engine: string) =>
   TRANSCRIPTION_ENGINE_LABELS[engine] ?? engine;
 
-const getAudioEngineResolution = (settings: Settings): AudioEngineResolution => {
+const getAudioEngineResolution = (
+  settings: AudioEngineResolutionSettings
+): AudioEngineResolution => {
   const requested = settings.audioTranscriptionEngine;
   const fallback = FALLBACK_TRANSCRIPTION_ENGINE;
   const hasCloudAuth = Boolean(settings.user?.token || settings.user?.id);
@@ -1670,10 +1714,16 @@ function HighFpsCard({
 export function RecordingSettings() {
   const { settings, updateSettings, getDataDir, loadUser } = useSettings();
   const [openLanguages, setOpenLanguages] = React.useState(false);
+  // Dev-only: warn if searchIndex drifts from rendered headings. State-gated
+  // fields are marked `conditional: true` in the index above, so no false
+  // positives while they're hidden — no hardcoded allowlist here.
+  const sectionRootRef = React.useRef<HTMLDivElement | null>(null);
+  useSettingsIndexDriftCheck("Recording", searchIndex, sectionRootRef);
 
   // Add validation state
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
   const [pendingChanges, setPendingChanges] = useState<Partial<SettingsStore>>({});
+  const [meetingAppsPickerOpen, setMeetingAppsPickerOpen] = useState(false);
 
   const { items: windowItems, isLoading: isWindowItemsLoading } =
     useSqlAutocomplete("window");
@@ -1845,6 +1895,37 @@ export function RecordingSettings() {
       settings.user?.token,
     ]
   );
+  const languageSupportEngine = audioEngineResolution.active;
+  const languageSupportKey =
+    getTranscriptionEngineLanguageSupportKey(languageSupportEngine);
+  const languageSelectionsBySupportKeyRef = React.useRef<Record<string, string[]>>(
+    {}
+  );
+  const languageSelectionSnapshotRef = React.useRef<{
+    supportKey: string;
+    languages: string[];
+  }>({
+    supportKey: languageSupportKey,
+    languages: [...settings.languages],
+  });
+  const supportedLanguageOptions = useMemo(
+    () => getLanguageOptionsForTranscriptionEngine(languageSupportEngine),
+    [languageSupportEngine]
+  );
+  const languageSupportIsLimited = hasLimitedLanguageSupport(languageSupportEngine);
+  const languageSupportLabel = getTranscriptionEngineLabel(languageSupportEngine);
+  const languageSelectionUsesHints =
+    transcriptionEngineUsesLanguageHints(languageSupportEngine);
+  const languageSupportDescription =
+    settings.languages.length === 0
+      ? languageSupportIsLimited
+        ? `Auto-detects among ${supportedLanguageOptions.length} languages supported by ${languageSupportLabel}`
+        : "Automatically detects spoken language"
+      : !languageSelectionUsesHints
+        ? `${settings.languages.length} supported selected for ${languageSupportLabel}`
+        : languageSupportIsLimited
+          ? `Restricts transcription to selected languages supported by ${languageSupportLabel}`
+          : "Restricts transcription to selected";
 
   // Add new state to track if settings have changed
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
@@ -1917,6 +1998,52 @@ export function RecordingSettings() {
     };
     checkPlatform();
   }, []);
+
+  useEffect(() => {
+    const previousSnapshot = languageSelectionSnapshotRef.current;
+    if (previousSnapshot.supportKey !== languageSupportKey) {
+      languageSelectionsBySupportKeyRef.current[previousSnapshot.supportKey] = [
+        ...previousSnapshot.languages,
+      ];
+    }
+
+    const preferredLanguages =
+      languageSelectionsBySupportKeyRef.current[languageSupportKey];
+    const resolvedLanguages = resolveLanguageSelectionForTranscriptionEngine(
+      settings.languages,
+      languageSupportEngine,
+      preferredLanguages
+    );
+
+    if (!areLanguageSelectionsEqual(settings.languages, resolvedLanguages)) {
+      languageSelectionSnapshotRef.current = {
+        supportKey: languageSupportKey,
+        languages: resolvedLanguages,
+      };
+      handleSettingsChange({ languages: resolvedLanguages }, false);
+      return;
+    }
+
+    const supportedLanguages = filterLanguagesForTranscriptionEngine(
+      settings.languages,
+      languageSupportEngine
+    );
+    if (areLanguageSelectionsEqual(settings.languages, supportedLanguages)) {
+      languageSelectionsBySupportKeyRef.current[languageSupportKey] = [
+        ...settings.languages,
+      ];
+    }
+
+    languageSelectionSnapshotRef.current = {
+      supportKey: languageSupportKey,
+      languages: [...settings.languages],
+    };
+  }, [
+    settings.languages,
+    languageSupportEngine,
+    languageSupportKey,
+    handleSettingsChange,
+  ]);
 
   // Listen for data-dir-fallback event (custom dir unavailable, fell back to default)
   useEffect(() => {
@@ -2187,10 +2314,38 @@ export function RecordingSettings() {
       return;
     }
 
-    // Only proceed with the change if all checks pass
-    const newSettings = realtime
-      ? { realtimeAudioTranscriptionEngine: value }
-      : { audioTranscriptionEngine: value };
+    let newSettings: Partial<Settings>;
+    if (realtime) {
+      newSettings = { realtimeAudioTranscriptionEngine: value };
+    } else {
+      languageSelectionsBySupportKeyRef.current[languageSupportKey] = [
+        ...settings.languages,
+      ];
+      languageSelectionSnapshotRef.current = {
+        supportKey: languageSupportKey,
+        languages: [...settings.languages],
+      };
+
+      const nextAudioEngineResolution = getAudioEngineResolution({
+        ...settings,
+        audioTranscriptionEngine: value,
+      });
+      const nextLanguageSupportEngine = nextAudioEngineResolution.active;
+      const nextLanguageSupportKey =
+        getTranscriptionEngineLanguageSupportKey(nextLanguageSupportEngine);
+      const preferredLanguages =
+        languageSelectionsBySupportKeyRef.current[nextLanguageSupportKey];
+
+      newSettings = {
+        audioTranscriptionEngine: value,
+        languages: resolveLanguageSelectionForTranscriptionEngine(
+          settings.languages,
+          nextLanguageSupportEngine,
+          preferredLanguages
+        ),
+      };
+    }
+
     handleSettingsChange(newSettings, true);
   };
 
@@ -2369,8 +2524,23 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
     }
   };
 
+  // Toggle one app in/out of the meeting-detection ignore list (used by the
+  // MeetingAppsPicker rows and chips). Case-insensitive; stores the trimmed
+  // label the user picked.
+  const handleToggleIgnoredMeetingApp = (value: string) => {
+    const cur = settings.ignoredMeetingApps ?? [];
+    const term = value.trim();
+    if (!term) return;
+    const lower = term.toLowerCase();
+    const exists = cur.some((v) => v.toLowerCase() === lower);
+    const next = exists
+      ? cur.filter((v) => v.toLowerCase() !== lower)
+      : [...cur, term];
+    handleSettingsChange({ ignoredMeetingApps: next }, true);
+  };
+
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" ref={sectionRootRef}>
       <p className="text-muted-foreground text-sm mb-4">
         Screen and audio recording preferences
       </p>
@@ -3133,7 +3303,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <Languages className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
                   <h3 className="text-sm font-medium text-foreground">Languages</h3>
-                  <p className="text-xs text-muted-foreground">{settings.languages.length === 0 ? "Automatically detects spoken language" : "Restricts transcription to selected"}</p>
+                  <p className="text-xs text-muted-foreground">{languageSupportDescription}</p>
                 </div>
               </div>
               <Popover open={openLanguages} onOpenChange={setOpenLanguages}>
@@ -3149,48 +3319,9 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <CommandList>
                       <CommandEmpty>No languages found.</CommandEmpty>
                       <CommandGroup>
-                        {[
-                          { code: "english", name: "English" }, { code: "spanish", name: "Spanish" },
-                          { code: "french", name: "French" }, { code: "german", name: "German" },
-                          { code: "italian", name: "Italian" }, { code: "portuguese", name: "Portuguese" },
-                          { code: "russian", name: "Russian" }, { code: "japanese", name: "Japanese" },
-                          { code: "korean", name: "Korean" }, { code: "chinese", name: "Chinese" },
-                          { code: "arabic", name: "Arabic" }, { code: "hindi", name: "Hindi" },
-                          { code: "dutch", name: "Dutch" }, { code: "swedish", name: "Swedish" },
-                          { code: "indonesian", name: "Indonesian" }, { code: "finnish", name: "Finnish" },
-                          { code: "hebrew", name: "Hebrew" }, { code: "ukrainian", name: "Ukrainian" },
-                          { code: "greek", name: "Greek" }, { code: "malay", name: "Malay" },
-                          { code: "czech", name: "Czech" }, { code: "romanian", name: "Romanian" },
-                          { code: "danish", name: "Danish" }, { code: "hungarian", name: "Hungarian" },
-                          { code: "norwegian", name: "Norwegian" }, { code: "thai", name: "Thai" },
-                          { code: "urdu", name: "Urdu" }, { code: "croatian", name: "Croatian" },
-                          { code: "bulgarian", name: "Bulgarian" }, { code: "lithuanian", name: "Lithuanian" },
-                          { code: "latin", name: "Latin" }, { code: "welsh", name: "Welsh" },
-                          { code: "slovak", name: "Slovak" }, { code: "persian", name: "Persian" },
-                          { code: "latvian", name: "Latvian" }, { code: "bengali", name: "Bengali" },
-                          { code: "serbian", name: "Serbian" }, { code: "azerbaijani", name: "Azerbaijani" },
-                          { code: "slovenian", name: "Slovenian" }, { code: "estonian", name: "Estonian" },
-                          { code: "macedonian", name: "Macedonian" }, { code: "nepali", name: "Nepali" },
-                          { code: "mongolian", name: "Mongolian" }, { code: "bosnian", name: "Bosnian" },
-                          { code: "kazakh", name: "Kazakh" }, { code: "albanian", name: "Albanian" },
-                          { code: "swahili", name: "Swahili" }, { code: "galician", name: "Galician" },
-                          { code: "marathi", name: "Marathi" }, { code: "punjabi", name: "Punjabi" },
-                          { code: "sinhala", name: "Sinhala" }, { code: "khmer", name: "Khmer" },
-                          { code: "afrikaans", name: "Afrikaans" }, { code: "belarusian", name: "Belarusian" },
-                          { code: "gujarati", name: "Gujarati" }, { code: "amharic", name: "Amharic" },
-                          { code: "yiddish", name: "Yiddish" }, { code: "lao", name: "Lao" },
-                          { code: "uzbek", name: "Uzbek" }, { code: "faroese", name: "Faroese" },
-                          { code: "pashto", name: "Pashto" }, { code: "maltese", name: "Maltese" },
-                          { code: "sanskrit", name: "Sanskrit" }, { code: "luxembourgish", name: "Luxembourgish" },
-                          { code: "myanmar", name: "Myanmar" }, { code: "tibetan", name: "Tibetan" },
-                          { code: "tagalog", name: "Tagalog" }, { code: "assamese", name: "Assamese" },
-                          { code: "tatar", name: "Tatar" }, { code: "hausa", name: "Hausa" },
-                          { code: "javanese", name: "Javanese" }, { code: "turkish", name: "Turkish" },
-                          { code: "polish", name: "Polish" }, { code: "catalan", name: "Catalan" },
-                          { code: "malayalam", name: "Malayalam" },
-                        ].map((language) => (
-                          <CommandItem key={language.code} value={language.code} onSelect={() => handleLanguageChange(language.code as Language)}>
-                            <Check className={cn("mr-2 h-3 w-3", settings.languages.includes(language.code as Language) ? "opacity-100" : "opacity-0")} />
+                        {supportedLanguageOptions.map((language) => (
+                          <CommandItem key={language.code} value={language.code} onSelect={() => handleLanguageChange(language.code)}>
+                            <Check className={cn("mr-2 h-3 w-3", settings.languages.includes(language.code) ? "opacity-100" : "opacity-0")} />
                             <span className="text-xs">{language.name}</span>
                           </CommandItem>
                         ))}
@@ -3307,16 +3438,46 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-muted-foreground">Auto-start meetings when a call app is detected</p>
                 </div>
               </div>
-              <ManagedSwitch
-                settingKey="disableMeetingDetector"
-                id="disableMeetingDetector"
-                checked={!settings.disableMeetingDetector}
-                onCheckedChange={(checked) => handleSettingsChange({ disableMeetingDetector: !checked }, true)}
-              />
+              <div className="flex items-center gap-2 shrink-0">
+                {!settings.disableMeetingDetector && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-[11px] gap-1.5"
+                    onClick={() => setMeetingAppsPickerOpen(true)}
+                    title="Choose apps that should never auto-start a meeting"
+                    data-testid="settings-ignore-meeting-apps-button"
+                  >
+                    <UserX className="h-3.5 w-3.5" />
+                    ignore apps
+                    {(settings.ignoredMeetingApps?.length ?? 0) > 0 && (
+                      <span
+                        className="rounded bg-muted px-1.5 py-0.5 text-[10px] tabular-nums"
+                        data-testid="settings-ignore-meeting-apps-count"
+                      >
+                        {settings.ignoredMeetingApps!.length}
+                      </span>
+                    )}
+                  </Button>
+                )}
+                <ManagedSwitch
+                  settingKey="disableMeetingDetector"
+                  id="disableMeetingDetector"
+                  checked={!settings.disableMeetingDetector}
+                  onCheckedChange={(checked) => handleSettingsChange({ disableMeetingDetector: !checked }, true)}
+                />
+              </div>
             </div>
           </CardContent>
         </Card>
         )}
+
+        <MeetingAppsPicker
+          open={meetingAppsPickerOpen}
+          onOpenChange={setMeetingAppsPickerOpen}
+          selected={settings.ignoredMeetingApps ?? []}
+          onToggle={handleToggleIgnoredMeetingApp}
+        />
 
         {/* Per-app exclusion list for the CoreAudio Process Tap. Only
             meaningful when the tap is the active backend. */}

@@ -67,7 +67,7 @@ async calendarGetEvents(hoursBack: number | null, hoursAhead: number | null) : P
 /**
  * Reset TCC (privacy) permission for Calendars on this app's bundle ID.
  *
- * Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+ * Why: multiple users (including Louis's own Mac mini) clicked
  * "Fix Calendar Permission" → macOS opened the Calendars privacy pane
  * with an EMPTY app list, so they had no way to grant access. Root cause
  * is a stale TCC record (dev-build → prod-build reinstall, OS update,
@@ -970,10 +970,9 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 },
 /**
  * Open the screenpi.pe login page.
- * On Windows, opens in the system browser (WebView2 has issues with some auth
- * providers; the registered deep-link scheme handles the redirect back).
- * On macOS/Linux, uses an in-app WebView that intercepts the screenpipe://
- * deep-link redirect (Safari blocks custom-scheme redirects).
+ * Windows: system browser + registered deep-link scheme handles the redirect.
+ * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
+ * Linux: in-app WebView that intercepts the screenpipe:// redirect.
  */
 async openLoginWindow() : Promise<Result<null, string>> {
     try {
@@ -1059,14 +1058,17 @@ async ownedBrowserHide() : Promise<Result<null, string>> {
 }
 },
 /**
- * Navigate the embedded webview to `url`. Used by the sidebar when restoring
- * per-chat state or on user reload — i.e. always an action of the chat that's
- * on screen, so it carries no owner (`None`) and the frontend always honors
- * it. The agent/pipe path is the connect-trait `navigate` (owner-tagged).
+ * Navigate the embedded webview to `url`.
+ *
+ * Frontend restore/reload calls pass the foreground conversation id as
+ * `owner`, so the entire browser lifecycle stays scoped to that chat. Retry
+ * paths that are continuing a pipe/chat-owned navigation (for example after an
+ * extension or cookie-consent flow) can pass the original `owner` through so
+ * the follow-up navigate does not look like a fresh restore in every chat.
  */
-async ownedBrowserNavigate(url: string) : Promise<Result<null, string>> {
+async ownedBrowserNavigate(url: string, owner: string | null, reveal: boolean | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("owned_browser_navigate", { url }) };
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_navigate", { url, owner, reveal }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1581,6 +1583,21 @@ async resizeSearchWindow(width: number, height: number) : Promise<Result<null, s
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Banner-click restart. plugin-process `relaunch()` fires
+ * `ExitRequested` which `main.rs` blocks unless `QUIT_REQUESTED` is set —
+ * banner never set it, so the exit was silently cancelled and the button
+ * hung on "restarting…". Mirror the auto-update path: gate, stop server,
+ * set `QUIT_REQUESTED`, then `app.restart()`. See 2026-06-10 report.
+ */
+async restartForUpdate(timeoutSecs: number | null) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_for_update", { timeoutSecs }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async resumeGlobalShortcuts() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("resume_global_shortcuts") };
@@ -1785,6 +1802,14 @@ async setEnhancedAiSuggestions(enabled: boolean, token: string) : Promise<Result
 async setEnterprisePolicy(hiddenSections: string[]) : Promise<void> {
     await TAURI_INVOKE("set_enterprise_policy", { hiddenSections });
 },
+async setKeepAwake(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_keep_awake", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async setNativeTheme(theme: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_native_theme", { theme }) };
@@ -1825,6 +1850,23 @@ async setTrayHealthIcon() : Promise<void> {
 },
 async setTrayUnhealthIcon() : Promise<void> {
     await TAURI_INVOKE("set_tray_unhealth_icon");
+},
+/**
+ * Programmatically adjust a window's always-on-top level after creation.
+ *
+ * Tauri's JS `setAlwaysOnTop` can be unreliable for macOS panel-style
+ * windows. For permission flows we need Screenpipe to stay normally
+ * always-on-top, but temporarily drop below System Settings while the user is
+ * granting permissions. On macOS this directly sets the underlying NSWindow
+ * level: floating when enabled, normal when disabled.
+ */
+async setWindowAlwaysOnTopNative(label: string, alwaysOnTop: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_window_always_on_top_native", { label, alwaysOnTop }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async setWindowSize(window: ShowRewindWindow, width: number, height: number) : Promise<Result<null, string>> {
     try {
@@ -2376,17 +2418,19 @@ audioDevices: string[];
 useSystemDefaultAudio: boolean;
 /**
  * Experimental: capture System Audio via the CoreAudio Process Tap API
- * (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
- * enumeration failures after sleep/wake, the GPU/compositor wake
- * overhead, and — most importantly — captures audio that's been
- * routed to a Bluetooth headset via HFP (which SCK can't see; see
- * Ruark Ferreira's 2026-04-24 Zoom call where AirPods-as-input
- * silently routed output away from the SCK-visible mixer).
+ * (macOS 14.4+) instead of ScreenCaptureKit. The tap sidesteps SCK's
+ * display-enumeration failures after sleep/wake and the GPU/compositor
+ * wake overhead, but it cannot see audio rendered through a
+ * VoiceProcessing AudioUnit (Zoom / Google Meet / Microsoft Teams all
+ * use one for echo cancellation), so on meeting audio it silently
+ * captures zeroed buffers even though tap creation succeeds.
  *
- * Default `true`: if tap creation fails for any reason (permission,
- * macOS <14.4, OS quirk), stream.rs falls back to the SCK path
- * automatically — so flipping the default on can't regress anyone.
- * Ignored on non-macOS platforms.
+ * Default `false` (see `default_experimental_coreaudio_system_audio`).
+ * SCK captures at the display compositor, which does see VoiceProcessing
+ * output, so it is the right default for anyone on calls. Users who hit
+ * SCK's sleep/wake display-enumeration bug can still opt in; when the tap
+ * is on and creation fails (permission, macOS <14.4, OS quirk), stream.rs
+ * falls back to the SCK path automatically. Ignored on non-macOS platforms.
  */
 experimentalCoreaudioSystemAudio?: boolean;
 /**
@@ -2470,6 +2514,17 @@ disableSnapshotCompaction?: boolean;
  * in_meeting override flag stays false.
  */
 disableMeetingDetector?: boolean;
+/**
+ * Apps / meeting services to exclude from automatic meeting detection
+ * while leaving detection on for everything else. Case-insensitive
+ * substring match against the running app's name/process AND the matched
+ * detection profile's identifiers (native names + browser URL patterns),
+ * so an entry can be what the user sees ("Discord") or a service domain
+ * ("meet.google.com"). Use when one app trips the detector spuriously
+ * (an always-open Teams, a Discord call you don't want logged) but you
+ * still want Zoom/Meet/etc. detected. Empty = detect all known apps.
+ */
+ignoredMeetingApps?: string[];
 /**
  * Override `EventDrivenCaptureConfig::idle_capture_interval_ms` (milliseconds).
  * None = follow active PowerProfile.
@@ -2702,6 +2757,11 @@ port: number;
  * Previously stored in SettingsStore.extra["powerMode"].
  */
 powerMode?: string | null;
+/**
+ * Keep the computer awake while screenpipe is running.
+ * Default off so existing installs keep the OS sleep behavior they chose.
+ */
+keepComputerAwake?: boolean;
 /**
  * Use Chinese mirror for Hugging Face model downloads.
  */

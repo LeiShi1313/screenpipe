@@ -43,14 +43,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { useRef } from "react";
+import {
+  deleteCachedBrowserState,
+  setCachedBrowserState,
+} from "../browser-state-cache";
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 // Capture every disk write so the test can assert (id, messages) pairs.
-const saveCalls: Array<{ id: string; messages: any[] }> = [];
+const saveCalls: Array<{
+  id: string;
+  messages: any[];
+  browserState?: any;
+  lastUserMessageAt?: number;
+}> = [];
 
 vi.mock("@/lib/chat-storage", () => ({
   saveConversationFile: vi.fn(async (conv: any) => {
-    saveCalls.push({ id: conv.id, messages: conv.messages });
+    saveCalls.push({
+      id: conv.id,
+      messages: conv.messages,
+      browserState: conv.browserState,
+      lastUserMessageAt: conv.lastUserMessageAt,
+    });
   }),
   loadConversationFile: vi.fn(async () => null),
   deleteConversationFile: vi.fn(async () => undefined),
@@ -82,6 +96,7 @@ vi.mock("@/lib/hooks/use-settings", () => ({
 
 // ── Import under test (after mocks) ───────────────────────────────────
 import { useChatConversations } from "../../components/hooks/use-chat-conversations";
+import { loadConversationFile } from "@/lib/chat-storage";
 
 // Test harness: thin component that wires up the refs/state the hook
 // needs, then exposes `saveConversation` for the test to call. Mirrors
@@ -131,6 +146,8 @@ function useHarness(args: {
 
 beforeEach(() => {
   saveCalls.length = 0;
+  deleteCachedBrowserState("chat-A");
+  deleteCachedBrowserState("fresh-sid");
 });
 
 afterEach(() => {
@@ -197,5 +214,67 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
 
     expect(saveCalls).toHaveLength(1);
     expect(saveCalls[0].id).toBe("fresh-sid");
+  });
+
+  it("preserves browserState from the shadow cache when the disk file does not exist yet", async () => {
+    const messages = [{ id: "u1", role: "user" as const, content: "hello", timestamp: 1 }];
+    setCachedBrowserState("fresh-sid", {
+      url: "https://example.com/browser-state-shadow",
+      updatedAt: 1_234,
+      width: 512,
+      collapsed: true,
+    });
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: null,
+        initialPiSessionId: "fresh-sid",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0].browserState).toEqual({
+      url: "https://example.com/browser-state-shadow",
+      updatedAt: 1_234,
+      width: 512,
+      collapsed: true,
+    });
+  });
+
+  it("recomputes lastUserMessageAt from the outgoing transcript instead of preserving a stale saved value", async () => {
+    vi.mocked(loadConversationFile).mockResolvedValueOnce({
+      id: "chat-A",
+      title: "chat-A",
+      createdAt: 1,
+      updatedAt: 2,
+      lastUserMessageAt: 1_000,
+      messages: [],
+    } as any);
+
+    const messages = [
+      { id: "u1", role: "user" as const, content: "old", timestamp: 1_000 },
+      { id: "a1", role: "assistant" as const, content: "reply", timestamp: 1_200 },
+      { id: "u2", role: "user" as const, content: "new", timestamp: 9_000 },
+    ];
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: "chat-A",
+        initialPiSessionId: "chat-A",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0].lastUserMessageAt).toBe(9_000);
   });
 });

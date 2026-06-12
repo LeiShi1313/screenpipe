@@ -463,6 +463,37 @@ function SettingsContent() {
               )
           )}
         </div>
+
+        {/* Identity footer — always visible, even when enterprise policy
+            hides the Account section. Knowing WHICH account this device is
+            signed into must never be hidden (multi-account admins, support
+            debugging); only account MANAGEMENT is policy-gated. */}
+        <div className={cn(
+          "p-2 border-t flex-shrink-0",
+          isTranslucent ? "border-white/10" : "border-border",
+        )}>
+          <button
+            data-testid="settings-identity-footer"
+            onClick={() => { if (!isSectionHidden("account")) setSection("account"); }}
+            disabled={isSectionHidden("account")}
+            title={
+              isSectionHidden("account")
+                ? "account is managed by your organization"
+                : "open account settings"
+            }
+            className={cn(
+              "w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg text-left transition-all duration-150",
+              !isSectionHidden("account") &&
+                (isTranslucent ? "vibrant-nav-item vibrant-nav-hover" : "hover:bg-card/50"),
+              isTranslucent ? "vibrant-sidebar-fg-muted" : "text-muted-foreground",
+            )}
+          >
+            <User className="h-4 w-4 flex-shrink-0" />
+            <span className="text-xs truncate font-medium">
+              {settings.user?.email || "not signed in"}
+            </span>
+          </button>
+        </div>
       </AppSidebar>
 
       {/* Content area — always opaque; only the sidebar gets vibrancy */}

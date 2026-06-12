@@ -157,6 +157,9 @@ async function disableUnlistedManagedPipes(
 
   for (const entry of entries) {
     if (!entry.isDirectory || keep.has(entry.name)) continue;
+    // Hidden dirs (.pi, .git, ...) are agent/internal state, never managed
+    // pipes — and the fs capability scope forbids touching them anyway.
+    if (entry.name.startsWith(".")) continue;
     try {
       const pipeMdPath = await join(pipesDir, entry.name, "pipe.md");
       if (!(await exists(pipeMdPath))) continue;

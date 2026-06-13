@@ -1190,10 +1190,21 @@ async fn main() -> anyhow::Result<()> {
         let h = runtime.spawn(async move {
             let mut shutdown_rx = shutdown_tx_clone2.subscribe();
 
-            // Start VisionManager
+            // Start VisionManager. A failure here must NOT abort this task.
+            // `VisionManager::start()` returns Err when zero monitors are
+            // enumerated at boot — lid closed at login, screen locked, or a
+            // transient TCC/ScreenCaptureKit race (list_monitors swallows
+            // those to an empty set). Returning here used to leave vision
+            // permanently dead for the whole process lifetime, because every
+            // retry/recovery path lives inside the monitor watcher spawned
+            // below (it re-calls VisionManager::start() whenever status !=
+            // Running — see monitor_watcher.rs). Log and fall through so the
+            // watcher gets a chance to recover once a display appears.
             if let Err(e) = vm_clone.start().await {
-                error!("Failed to start VisionManager: {:?}", e);
-                return;
+                error!(
+                    "Failed to start VisionManager (monitor watcher will retry): {:?}",
+                    e
+                );
             }
 
             // Start MonitorWatcher for dynamic detection (with audio DRM pause support)

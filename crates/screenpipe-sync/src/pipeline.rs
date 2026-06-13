@@ -350,7 +350,9 @@ mod tests {
 
         let storage = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path("/acme-telemetry/customer-a/enterprise-telemetry/lic-1/dev-1/direct/b-1.jsonl"))
+            .and(path(
+                "/acme-telemetry/customer-a/enterprise-telemetry/lic-1/dev-1/direct/b-1.jsonl",
+            ))
             .and(query_param("X-Amz-Algorithm", "AWS4-HMAC-SHA256"))
             .and(query_param("X-Amz-Expires", "900"))
             .and(query_param(

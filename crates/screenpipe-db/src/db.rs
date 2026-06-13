@@ -3033,9 +3033,7 @@ impl DatabaseManager {
                 accessibility_tree_json: accessibility_tree_json.map(String::from),
                 content_hash,
                 simhash,
-                ocr_text: ocr_data.map(|(t, _, _)| t.to_string()),
                 ocr_text_json: ocr_data.map(|(_, j, _)| j.to_string()),
-                ocr_engine: ocr_data.map(|(_, _, e)| e.to_string()),
                 full_text,
                 elements_ref_frame_id,
             })
@@ -3100,6 +3098,11 @@ impl DatabaseManager {
         Ok(offset)
     }
 
+    /// Store OCR text on a frame. The `ocr_text` table was retired
+    /// (2026-06): OCR text now lives on the frame itself. `full_text` feeds
+    /// `frames_fts` (the UPDATE trigger keeps the index in sync) and `text_json`
+    /// holds the per-word bounding boxes used for highlight rendering + PII.
+    /// `ocr_engine` is no longer persisted per-frame.
     pub async fn insert_ocr_text(
         &self,
         frame_id: i64,
@@ -3107,29 +3110,22 @@ impl DatabaseManager {
         text_json: &str,
         ocr_engine: Arc<OcrEngine>,
     ) -> Result<(), sqlx::Error> {
-        let text_length = text.len() as i64;
+        let _ = ocr_engine;
         let mut tx = self.begin_immediate_with_retry().await?;
-        sqlx::query("INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)")
-            .bind(frame_id)
-            .bind(text)
-            .bind(text_json)
-            .bind(format!("{:?}", *ocr_engine))
-            .bind(text_length)
-            .execute(&mut **tx.conn())
-            .await?;
-
-        // Also set full_text on the frame so frames_fts stays in sync.
-        // The UPDATE trigger on frames will handle the FTS index update.
-        if !text.is_empty() {
-            sqlx::query("UPDATE frames SET full_text = ?1 WHERE id = ?2 AND (full_text IS NULL OR full_text = '')")
-                .bind(text)
-                .bind(frame_id)
-                .execute(&mut **tx.conn())
-                .await?;
-        }
+        sqlx::query(
+            "UPDATE frames SET \
+                full_text = CASE WHEN ?2 != '' THEN ?2 ELSE full_text END, \
+                text_json = CASE WHEN ?3 != '' THEN ?3 ELSE text_json END \
+             WHERE id = ?1",
+        )
+        .bind(frame_id)
+        .bind(text)
+        .bind(text_json)
+        .execute(&mut **tx.conn())
+        .await?;
 
         tx.commit().await?;
-        debug!("OCR text inserted into db successfully");
+        debug!("OCR text stored on frame successfully");
         Ok(())
     }
 
@@ -3266,7 +3262,8 @@ impl DatabaseManager {
             }
         };
 
-        let ocr_engine_str = format!("{:?}", *ocr_engine);
+        // ocr_engine is no longer persisted per-frame (ocr_text table retired).
+        let _ = &ocr_engine;
         let mut all_results = Vec::with_capacity(frames.len());
 
         // Single transaction for all frames — one semaphore acquisition.
@@ -3306,8 +3303,15 @@ impl DatabaseManager {
                     Some(window.text.as_str())
                 };
 
+                // text_json (per-word OCR bounds) now lives on the frame.
+                let text_json = if window.text_json.is_empty() {
+                    None
+                } else {
+                    Some(window.text_json.as_str())
+                };
+
                 let frame_id = sqlx::query(
-                    "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text, text_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .bind(video_chunk_id)
                 .bind(offset_index)
@@ -3319,28 +3323,14 @@ impl DatabaseManager {
                 .bind(window.focused)
                 .bind(device_name)
                 .bind(full_text)
+                .bind(text_json)
                 .execute(&mut **tx.conn())
                 .await?
                 .last_insert_rowid();
 
-                // Only insert ocr_text if there's actual text content
-                if !window.text.is_empty() {
-                    let text_length = window.text.len() as i64;
-                    sqlx::query(
-                        "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )
-                    .bind(frame_id)
-                    .bind(&window.text)
-                    .bind(&window.text_json)
-                    .bind(&ocr_engine_str)
-                    .bind(text_length)
-                    .execute(&mut **tx.conn())
-                    .await?;
-
-                    // Dual-write: insert OCR elements into unified elements table
-                    if !window.text_json.is_empty() {
-                        Self::insert_ocr_elements(tx.conn(), frame_id, &window.text_json).await;
-                    }
+                // OCR elements still go to the unified elements table for rendering.
+                if !window.text.is_empty() && !window.text_json.is_empty() {
+                    Self::insert_ocr_elements(tx.conn(), frame_id, &window.text_json).await;
                 }
 
                 frame_results.push((frame_id, idx));
@@ -3826,14 +3816,14 @@ impl DatabaseManager {
             r#"
         SELECT
             frames.id as frame_id,
-            COALESCE(frames.full_text, ocr_text.text, frames.accessibility_text, '') as ocr_text,
-            ocr_text.text_json,
+            COALESCE(frames.full_text, frames.accessibility_text, '') as ocr_text,
+            frames.text_json,
             frames.timestamp,
             frames.name as frame_name,
             COALESCE(frames.snapshot_path, video_chunks.file_path) as file_path,
             frames.offset_index,
             frames.app_name,
-            COALESCE(ocr_text.ocr_engine, '') as ocr_engine,
+            '' as ocr_engine,
             frames.window_name,
             COALESCE(video_chunks.device_name, frames.device_name) as device_name,
             GROUP_CONCAT(tags.name, ',') as tags,
@@ -3842,7 +3832,6 @@ impl DatabaseManager {
             frames.text_source
         FROM frames
         LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
-        LEFT JOIN ocr_text ON frames.id = ocr_text.frame_id
         LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
         LEFT JOIN tags ON vision_tags.tag_id = tags.id
         {fts_join}
@@ -3850,8 +3839,8 @@ impl DatabaseManager {
             {fts_condition}
             AND (?2 IS NULL OR frames.timestamp >= ?2)
             AND (?3 IS NULL OR frames.timestamp <= ?3)
-            AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, ocr_text.text, '')) >= ?4)
-            AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, ocr_text.text, '')) <= ?5)
+            AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
+            AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
             AND (?6 IS NULL OR COALESCE(video_chunks.device_name, frames.device_name) LIKE '%' || ?6 || '%')
             AND (?7 IS NULL OR frames.machine_id = ?7)
             AND (?8 IS NULL OR frames.focused = ?8)
@@ -4582,8 +4571,8 @@ impl DatabaseManager {
         let result = sqlx::query_scalar::<_, Option<String>>(
             r#"
             SELECT text_json
-            FROM ocr_text
-            WHERE frame_id = ?1
+            FROM frames
+            WHERE id = ?1
             LIMIT 1
             "#,
         )
@@ -5360,12 +5349,10 @@ impl DatabaseManager {
         // OCR text is truncated to 200 chars for the timeline stream — full text
         // is fetched on-demand via /frames/{id}/ocr when needed. This reduces
         // data transfer from ~5MB to ~500KB for a full-day query (~2500 frames).
-        // Avoid LEFT JOIN ocr_text — it forces a scan of the entire ocr_text
-        // table for every frame, taking 60+ seconds on large DBs. Instead, use
-        // COALESCE with correlated subqueries: for event-driven frames the frame
-        // columns (accessibility_text, app_name, window_name) are non-null so
-        // COALESCE short-circuits and the subquery never executes. For legacy
-        // frames the subquery does a fast indexed lookup by frame_id.
+        // OCR text/metadata now lives on the frame: the ocr_text table was
+        // retired in 2026-06 and the 2026-06-13 migration backfilled full_text,
+        // app_name, and window_name onto every legacy frame, so the old
+        // correlated-subquery fallbacks are no longer needed.
         let frames_query = r#"
          SELECT
             f.id,
@@ -5373,17 +5360,10 @@ impl DatabaseManager {
             f.offset_index,
             COALESCE(
                 SUBSTR(f.full_text, 1, 200),
-                SUBSTR(f.accessibility_text, 1, 200),
-                (SELECT SUBSTR(ot.text, 1, 200) FROM ocr_text ot WHERE ot.frame_id = f.id LIMIT 1)
+                SUBSTR(f.accessibility_text, 1, 200)
             ) as text,
-            COALESCE(
-                f.app_name,
-                (SELECT ot.app_name FROM ocr_text ot WHERE ot.frame_id = f.id LIMIT 1)
-            ) as app_name,
-            COALESCE(
-                f.window_name,
-                (SELECT ot.window_name FROM ocr_text ot WHERE ot.frame_id = f.id LIMIT 1)
-            ) as window_name,
+            f.app_name as app_name,
+            f.window_name as window_name,
             COALESCE(vc.device_name, f.device_name) as screen_device,
             COALESCE(vc.file_path, f.snapshot_path) as video_path,
             COALESCE(vc.fps, 0.033) as chunk_fps,
@@ -6294,15 +6274,9 @@ impl DatabaseManager {
         .fetch_all(&mut **tx.conn())
         .await?;
 
-        // 3. Delete ocr_text (ocr_text_fts was dropped by migration)
-        let ocr_result = sqlx::query(
-            "DELETE FROM ocr_text WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
-        )
-        .bind(&start_str)
-        .bind(&end_str)
-        .execute(&mut **tx.conn())
-        .await?;
-        let ocr_deleted = ocr_result.rows_affected();
+        // 3. ocr_text was retired (2026-06); its rows are gone with the table.
+        //    Frame text lives on the frame and is removed by the frames delete.
+        let ocr_deleted = 0u64;
 
         // 4b. Migrate elements from anchor frames being deleted that are referenced
         // by frames outside the delete range. For each such anchor, move its elements
@@ -6499,15 +6473,8 @@ impl DatabaseManager {
         .fetch_all(&mut **tx.conn())
         .await?;
 
-        // 4. Delete ocr_text
-        let ocr_result = sqlx::query(
-            "DELETE FROM ocr_text WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
-        )
-        .bind(&start_str)
-        .bind(&end_str)
-        .execute(&mut **tx.conn())
-        .await?;
-        let ocr_deleted = ocr_result.rows_affected();
+        // 4. ocr_text was retired (2026-06); its rows are gone with the table.
+        let ocr_deleted = 0u64;
 
         // 5. Migrate elements from anchor frames being deleted
         let anchor_ids: Vec<i64> = sqlx::query_scalar(
@@ -6891,15 +6858,8 @@ impl DatabaseManager {
         .fetch_all(&mut **tx.conn())
         .await?;
 
-        // Delete ocr_text
-        let ocr_result = sqlx::query(
-            "DELETE FROM ocr_text WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
-        )
-        .bind(&start_str)
-        .bind(&end_str)
-        .execute(&mut **tx.conn())
-        .await?;
-        let ocr_deleted = ocr_result.rows_affected();
+        // ocr_text was retired (2026-06); its rows are gone with the table.
+        let ocr_deleted = 0u64;
 
         // Migrate elements from anchor frames
         let anchor_ids: Vec<i64> = sqlx::query_scalar(
@@ -7084,14 +7044,8 @@ impl DatabaseManager {
     ) -> Result<DeleteTimeRangeResult, sqlx::Error> {
         let mut tx = self.begin_immediate_with_retry().await?;
 
-        // 1. Delete ocr_text for frames from this machine
-        let ocr_result = sqlx::query(
-            "DELETE FROM ocr_text WHERE frame_id IN (SELECT id FROM frames WHERE machine_id = ?1)",
-        )
-        .bind(machine_id)
-        .execute(&mut **tx.conn())
-        .await?;
-        let ocr_deleted = ocr_result.rows_affected();
+        // 1. ocr_text was retired (2026-06); its rows are gone with the table.
+        let ocr_deleted = 0u64;
 
         // 2. Delete elements for frames from this machine (no CASCADE on FK)
         sqlx::query(
@@ -7576,8 +7530,8 @@ impl DatabaseManager {
             let query_lower = query.to_lowercase();
             format!(
                 r#"CASE
-                    WHEN LOWER(COALESCE(f.window_name, o.window_name)) LIKE '%{}%' THEN 3
-                    WHEN LOWER(COALESCE(f.app_name, o.app_name)) LIKE '%{}%' THEN 2
+                    WHEN LOWER(COALESCE(f.window_name, '')) LIKE '%{}%' THEN 3
+                    WHEN LOWER(COALESCE(f.app_name, '')) LIKE '%{}%' THEN 2
                     ELSE 1
                 END"#,
                 query_lower.replace("'", "''"),
@@ -7609,18 +7563,17 @@ SELECT id, timestamp, url, app_name, window_name, ocr_text, text_json, accessibi
         f.id,
         f.timestamp,
         f.browser_url as url,
-        COALESCE(f.app_name, o.app_name, '') as app_name,
-        COALESCE(f.window_name, o.window_name, '') as window_name,
-        COALESCE(f.full_text, o.text, f.accessibility_text, '') as ocr_text,
-        o.text_json,
+        COALESCE(f.app_name, '') as app_name,
+        COALESCE(f.window_name, '') as window_name,
+        COALESCE(f.full_text, f.accessibility_text, '') as ocr_text,
+        COALESCE(f.text_json, '') as text_json,
         f.accessibility_tree_json,
         f.text_source,
         ROW_NUMBER() OVER (
-            PARTITION BY COALESCE(f.app_name, o.app_name, '')
+            PARTITION BY COALESCE(f.app_name, '')
             ORDER BY f.timestamp {order_dir}, {relevance} DESC
         ) as app_rn
     FROM frames f
-    LEFT JOIN ocr_text o ON f.id = o.frame_id
     WHERE {where_clause}
 )
 WHERE app_rn <= {cap}
@@ -7639,14 +7592,13 @@ SELECT
     f.id,
     f.timestamp,
     f.browser_url as url,
-    COALESCE(f.app_name, o.app_name) as app_name,
-    COALESCE(f.window_name, o.window_name) as window_name,
-    COALESCE(f.full_text, o.text, f.accessibility_text, '') as ocr_text,
-    o.text_json,
+    COALESCE(f.app_name, '') as app_name,
+    COALESCE(f.window_name, '') as window_name,
+    COALESCE(f.full_text, f.accessibility_text, '') as ocr_text,
+    COALESCE(f.text_json, '') as text_json,
     f.accessibility_tree_json,
     f.text_source
 FROM frames f
-LEFT JOIN ocr_text o ON f.id = o.frame_id
 WHERE {}
 ORDER BY f.timestamp {}, {} DESC
 LIMIT ? OFFSET ?

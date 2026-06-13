@@ -82,6 +82,12 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
   // requiresGlobalEndpoint), so we pay the cheaper global tier — $1.50/$9
   // vs $1.65/$9.90 for regional.
   'gemini-3.5-flash': { input: 1.50, output: 9.00 },
+  // Flex tier — 50% off ($0.75/$4.50 per MTok), best-effort latency. The router
+  // tags background (pipe/summary) traffic with serviceTier='flex'; index.ts
+  // logs the served model as 'gemini-3.5-flash:flex' so this rate applies.
+  // cacheRead 0.10: flex cached input is $0.075/M = 0.10× the flex input rate
+  // (Vertex SKU-verified 2026-06). Keep this in sync with the standard entry.
+  'gemini-3.5-flash:flex': { input: 0.75, output: 4.50, cacheRead: 0.10 },
   'gemini-3.1-flash-lite': { input: 0.25, output: 1.50 },
   'gemini-1.5-flash': { input: 0.075, output: 0.30 },
   'gemini-1.5-pro': { input: 1.25, output: 5.00 },

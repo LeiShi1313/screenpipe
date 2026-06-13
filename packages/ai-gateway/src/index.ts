@@ -20,6 +20,7 @@ import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost
 import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { getModelWeight } from './services/usage-tracker';
 import { pruneModelHealth } from './services/model-health';
+import { resolveLatencyClass } from './utils/latency';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
 export { RateLimiter };
@@ -183,8 +184,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				})));
 			}
 
+			// Route latency-tolerant (background) traffic to the cheaper flex tier.
+			const latency = resolveLatencyClass(request, body, env);
+
 			// Add credit info header if paid via credits
-			let response = await handleChatCompletions(body, env);
+			let response = await handleChatCompletions(body, env, latency);
 
 			// Attribute cost to the model that actually served the request.
 			// 'auto' and fallback cascades resolve to a concrete model; the
@@ -192,6 +196,13 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			// "auto" had every such row priced by the $0.01 unknown-model
 			// fallback (most auto traffic is free Vertex MaaS = $0 real cost).
 			const servedModel = resolveServedModel(response, body.model);
+
+			// Flex-served Gemini bills at half rate. tryModel tags the response
+			// with x-screenpipe-served-tier=flex; price (and log) under the
+			// ':flex' MODEL_PRICING key so the dashboard reflects the discount.
+			const pricedModel = response.headers.get('x-screenpipe-served-tier') === 'flex'
+				? `${servedModel}:flex`
+				: servedModel;
 
 			// Log cost — for streaming, intercept SSE events to get real token counts
 			if (body.stream) {
@@ -202,12 +213,12 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					user_id: authResult.userId,
 					tier: authResult.tier,
 					provider: inferProvider(servedModel),
-					model: servedModel,
+					model: pricedModel,
 					input_tokens: u.input_tokens ?? null,
 					output_tokens: u.output_tokens ?? null,
 					cache_read_tokens: u.cache_read_input_tokens ?? null,
 					cache_creation_tokens: u.cache_creation_input_tokens ?? null,
-					estimated_cost_usd: getModelCost(servedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
+					estimated_cost_usd: getModelCost(pricedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
 						cache_read_tokens: u.cache_read_input_tokens,
 						cache_creation_tokens: u.cache_creation_input_tokens,
 					}),
@@ -230,12 +241,12 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 							user_id: authResult.userId,
 							tier: authResult.tier,
 							provider: inferProvider(servedModel),
-							model: servedModel,
+							model: pricedModel,
 							input_tokens: inputTokens,
 							output_tokens: outputTokens,
 							cache_read_tokens: cacheRead,
 							cache_creation_tokens: cacheCreation,
-							estimated_cost_usd: getModelCost(servedModel, inputTokens, outputTokens, {
+							estimated_cost_usd: getModelCost(pricedModel, inputTokens, outputTokens, {
 								cache_read_tokens: cacheRead,
 								cache_creation_tokens: cacheCreation,
 							}),

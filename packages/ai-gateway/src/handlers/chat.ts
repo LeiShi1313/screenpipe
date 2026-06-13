@@ -28,6 +28,24 @@ export const AUTO_WATERFALL_VISION = [
   'gemini-2.5-flash', // backup vision option
 ];
 
+// Background waterfall — for latency-tolerant traffic (pipes, daily summary,
+// suggestions) where no user is waiting. Leads with gemini-3.5-flash on the
+// FLEX tier: 50% off ($0.75/$4.50 per MTok) + implicit caching makes it land
+// BELOW glm-5 for screenpipe's input-heavy mix, at higher quality (AA 55 vs
+// 50). glm-5 + gemini-3-flash are standard-tier fallbacks for when flex is
+// throttled (best-effort tier 429s under load). Flex is applied per-request
+// by tryModel to the gemini entries only — glm-5 (MaaS) has no flex tier.
+export const AUTO_WATERFALL_BACKGROUND = [
+  'gemini-3.5-flash', // flex tier — cheapest input once flex+cache stack
+  'glm-5',            // MaaS fallback, standard tier
+  'gemini-3-flash',   // near-free safety net
+];
+
+/** Gemini is the only lane with a Vertex flex tier; glm/claude/etc. ignore it. */
+function isGeminiModel(model: string): boolean {
+  return model.toLowerCase().includes('gemini');
+}
+
 // Per-model fallback chains — when a user-selected model fails with a
 // transient/upstream error (524 timeout, 5xx, 429), we try comparable
 // alternatives instead of bouncing the user. Same-tier (free Vertex MaaS)
@@ -155,6 +173,18 @@ function addModelHeader(response: Response, model: string): Response {
 }
 
 /**
+ * Tag a response with the served tier so cost logging can price flex traffic
+ * correctly (index.ts appends ':flex' to the model key). No-op unless flex was
+ * actually applied, so standard requests carry no extra header.
+ */
+function tagServedTier(response: Response, usedFlex: boolean): Response {
+  if (!usedFlex) return response;
+  const tagged = new Response(response.body, response);
+  tagged.headers.set('x-screenpipe-served-tier', 'flex');
+  return tagged;
+}
+
+/**
  * Attempt one model. Returns the Response on success, throws on failure.
  *
  * The error path attaches `.status` (parsing the message for legacy
@@ -168,6 +198,7 @@ async function tryModel(
   body: RequestBody,
   env: Env,
   ctx: 'auto' | 'fallback' | 'explicit',
+  flexEligible: boolean = false,
 ): Promise<Response> {
   try {
     // Resolve legacy aliases (e.g. "deepseek/deepseek-chat" → "deepseek-v3.2")
@@ -182,17 +213,25 @@ async function tryModel(
       delete (reqBody as Partial<RequestBody>).tool_choice;
     }
 
+    // Flex tier applies only to the Vertex Gemini lane. Setting it on the body
+    // here (vs the shared request body) keeps it scoped to this attempt, so a
+    // cascade from flex-gemini → glm-5 runs glm-5 at standard tier.
+    const useFlex = flexEligible && isGeminiModel(model);
+    if (useFlex) {
+      (reqBody as RequestBody).serviceTier = 'flex';
+    }
+
     if (body.stream) {
       const stream = await provider.createStreamingCompletion(reqBody);
-      return new Response(stream, {
+      return tagServedTier(new Response(stream, {
         headers: {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
         },
-      });
+      }), useFlex);
     }
-    return await provider.createCompletion(reqBody);
+    return tagServedTier(await provider.createCompletion(reqBody), useFlex);
   } catch (error: any) {
     // Prefer error.status (UpstreamError, etc); fall back to parsing the
     // message for providers that throw plain Error("... 524 ..."). Defaults
@@ -284,13 +323,14 @@ async function runChain(
   body: RequestBody,
   env: Env,
   ctx: 'auto' | 'fallback',
+  flexEligible: boolean = false,
 ): Promise<{ response: Response; model: string } | { error: any; lastModel: string }> {
   let lastError: any = null;
   let lastModel = chain[0];
   for (const model of chain) {
     lastModel = model;
     try {
-      const response = await tryModel(model, body, env, ctx);
+      const response = await tryModel(model, body, env, ctx, flexEligible);
       logModelOutcome(env, { model, outcome: 'ok' }).catch(() => {});
       return { response, model };
     } catch (error: any) {
@@ -390,7 +430,11 @@ function errorResponse(body: RequestBody, status: number, message: string): Resp
  * captures fatal (non-transient) errors and any transient that isn't
  * already in SENTRY_SKIP_STATUSES (524/503/etc gateway noise).
  */
-export async function handleChatCompletions(body: RequestBody, env: Env): Promise<Response> {
+export async function handleChatCompletions(
+  body: RequestBody,
+  env: Env,
+  latency: 'interactive' | 'background' = 'interactive',
+): Promise<Response> {
   // A request with no messages at all can never complete: OpenAI would
   // answer the injected system hint below, and Anthropic 400s outright once
   // the system message is hoisted out (SCREENPIPE-AI-PROXY-1V). Reject it
@@ -401,10 +445,17 @@ export async function handleChatCompletions(body: RequestBody, env: Env): Promis
 
   body = ensureScreenpipeHint(body);
 
-  // Auto model: smart waterfall through curated chain.
+  // Background (latency-tolerant) traffic gets the flex Gemini lane.
+  const flexEligible = latency === 'background';
+
+  // Auto model: smart waterfall through curated chain. Background swaps to the
+  // flex-first chain; vision already leads with gemini-3.5-flash, so flex is
+  // applied to it via flexEligible without a separate chain.
   if (body.model === 'auto') {
-    const chain = hasImages(body) ? AUTO_WATERFALL_VISION : AUTO_WATERFALL;
-    const result = await runChain(chain, body, env, 'auto');
+    const chain = hasImages(body)
+      ? AUTO_WATERFALL_VISION
+      : (flexEligible ? AUTO_WATERFALL_BACKGROUND : AUTO_WATERFALL);
+    const result = await runChain(chain, body, env, 'auto', flexEligible);
     if ('response' in result) {
       return addCorsHeaders(addModelHeader(result.response, result.model));
     }
@@ -420,7 +471,7 @@ export async function handleChatCompletions(body: RequestBody, env: Env): Promis
   const fallbacks = MODEL_FALLBACKS[body.model];
   if (fallbacks?.length) {
     const chain = [body.model, ...fallbacks];
-    const result = await runChain(chain, body, env, 'fallback');
+    const result = await runChain(chain, body, env, 'fallback', flexEligible);
     if ('response' in result) {
       return addCorsHeaders(addModelHeader(result.response, result.model));
     }
@@ -435,7 +486,7 @@ export async function handleChatCompletions(body: RequestBody, env: Env): Promis
   // Single attempt — but still translate gateway errors to friendlier
   // messages instead of leaking raw "524 error code: 524" to the user.
   try {
-    const response = await tryModel(body.model, body, env, 'explicit');
+    const response = await tryModel(body.model, body, env, 'explicit', flexEligible);
     logModelOutcome(env, { model: body.model, outcome: 'ok' }).catch(() => {});
     return addCorsHeaders(addModelHeader(response, body.model));
   } catch (error: any) {

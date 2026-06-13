@@ -852,7 +852,13 @@ async fn execute_batch(
         None => {
             let e = last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut);
             warn!("write_queue: BEGIN IMMEDIATE exhausted retries: {}", e);
-            let fatal = should_recycle_sqlite_connection(&e);
+            // A nested-transaction error that survived all retries means a
+            // pooled connection is stuck with an orphaned transaction that
+            // per-attempt ROLLBACK didn't clear within the budget. Treating it
+            // as Healthy would leave the wedge in place (writes silently fail,
+            // SCREENPIPE-CLI-RC) — escalate to FatalConnection so the drain
+            // loop's pool reopen recovers it, same as for IOERR/CANTOPEN.
+            let fatal = should_recycle_sqlite_connection(&e) || is_nested_transaction_error(&e);
             send_error_to_all(batch, e);
             return if fatal {
                 BatchOutcome::FatalConnection
@@ -1816,11 +1822,14 @@ fn should_recycle_sqlite_connection(e: &sqlx::Error) -> bool {
 }
 
 fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
+    let needle = "cannot start a transaction within a transaction";
     match e {
-        sqlx::Error::Database(db_err) => db_err
-            .message()
-            .to_lowercase()
-            .contains("cannot start a transaction within a transaction"),
+        // The live BEGIN IMMEDIATE failure surfaces as a Database error;
+        // Protocol is matched too because the error gets re-wrapped as it
+        // propagates (and so the predicate is unit-testable the same way the
+        // other classifiers are).
+        sqlx::Error::Database(db_err) => db_err.message().to_lowercase().contains(needle),
+        sqlx::Error::Protocol(msg) => msg.to_lowercase().contains(needle),
         _ => false,
     }
 }
@@ -2552,6 +2561,29 @@ mod tests {
         assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
             "no such table: foo".into()
         )));
+    }
+
+    #[test]
+    fn persistent_stuck_transaction_escalates_to_fatal_on_exhausted_retries() {
+        let stuck = sqlx::Error::Protocol(
+            "error returned from database: (code: 1) cannot start a transaction within a transaction"
+                .into(),
+        );
+        // Detected as a nested-transaction error in both wrapper forms.
+        assert!(is_nested_transaction_error(&stuck));
+
+        // The exhausted-retries decision escalates it to FatalConnection
+        // (so the drain loop reopens the pool) even though it is NOT in the
+        // plain recycle set — that's the gap this guards.
+        assert!(!should_recycle_sqlite_connection(&stuck));
+        assert!(should_recycle_sqlite_connection(&stuck) || is_nested_transaction_error(&stuck));
+
+        // A genuinely benign per-row error must stay non-fatal.
+        let benign = sqlx::Error::Protocol("no such table: foo".into());
+        assert!(!is_nested_transaction_error(&benign));
+        assert!(
+            !(should_recycle_sqlite_connection(&benign) || is_nested_transaction_error(&benign))
+        );
     }
 
     /// `Database` errors flow through `is_fatal_sqlite_message`: a

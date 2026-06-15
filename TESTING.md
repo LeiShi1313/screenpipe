@@ -520,7 +520,7 @@ Note: `"terminal"` matches `WindowsTerminal.exe` but NOT `cmd.exe` or `powershel
 - [ ] **Failed OCR = no noise** — if OCR fails for a terminal, the frame should have NULL text, not chrome like "System Minimize Restore Close".
 - [ ] **Non-terminal chrome-only** — rare case where a normal app returns only chrome from accessibility. stored as-is (acceptable, no OCR fallback triggered).
 - [ ] **Empty accessibility + empty OCR** — app with no tree text and OCR failure. frame stored with NULL text. no crash.
-- [ ] **ocr_text table populated** — `SELECT COUNT(*) FROM ocr_text` should be non-zero after a few minutes of use on Windows.
+- [ ] **OCR text persisted on frames** — `SELECT COUNT(*) FROM frames WHERE full_text IS NOT NULL AND full_text != ''` should be non-zero after a few minutes of use on Windows. (The `ocr_text` table was retired; OCR text now lives in `frames.full_text`, per-word boxes in `frames.text_json`.)
 
 #### Windows text extraction — untested / unknown apps
 

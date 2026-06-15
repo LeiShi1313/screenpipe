@@ -69,9 +69,12 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile ort.zip
           Expand-Archive -Path ort.zip -DestinationPath ort-dl -Force
           $dir = (Get-ChildItem ort-dl -Directory | Select-Object -First 1).FullName
+          # ort-sys `system` strategy needs the dir DIRECTLY containing
+          # onnxruntime.lib — the `lib` subdir, not the extract root.
+          $libDir = Join-Path $dir 'lib'
           "ORT_STRATEGY=system"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "ORT_LIB_LOCATION=$dir"      | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$dir\lib"                   | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "ORT_LIB_LOCATION=$libDir"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$libDir"                    | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       # Intel mac: ort uses load-dynamic — provide an x86_64 libonnxruntime.dylib.
       - name: Set up ONNX Runtime (macOS Intel)

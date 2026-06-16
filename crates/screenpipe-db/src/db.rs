@@ -420,6 +420,16 @@ impl DatabaseManager {
         // (which used to spin a CPU core retrying a malformed DB).
         db_manager.spawn_startup_integrity_check(Arc::from(database_path));
 
+        // Periodic WAL checkpoint so the write-ahead log can't grow unbounded
+        // when passive auto-checkpoint is blocked by long-lived readers. An
+        // oversized WAL (observed at 650MB on a heavy 24/7 install) is the main
+        // driver of the WAL-index / `-shm` desync that corrupts the DB. Started
+        // here in `new()` — next to the integrity check — so EVERY caller gets
+        // it: the desktop app runs the engine in-process and previously never
+        // started it (only the standalone `screenpipe-engine` CLI did), so app
+        // users got no periodic checkpointing at all.
+        db_manager.start_wal_maintenance();
+
         Ok(db_manager)
     }
 

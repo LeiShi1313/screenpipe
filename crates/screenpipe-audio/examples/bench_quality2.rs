@@ -275,6 +275,7 @@ fn transcribe_full(model: &mut audiopipe::Model, audio: &[f32], sr: u32) -> Stri
     let opts = audiopipe::TranscribeOptions {
         language: None,
         word_timestamps: false,
+        ..Default::default()
     };
     model
         .transcribe_with_sample_rate(audio, sr, opts)
@@ -305,6 +306,7 @@ fn transcribe_fixed_chunks(
         let opts = audiopipe::TranscribeOptions {
             language: None,
             word_timestamps: false,
+            ..Default::default()
         };
         let text = model
             .transcribe_with_sample_rate(chunk, sr, opts)
@@ -356,6 +358,7 @@ fn transcribe_vad_segments(
         let opts = audiopipe::TranscribeOptions {
             language: None,
             word_timestamps: false,
+            ..Default::default()
         };
         let text = model
             .transcribe_with_sample_rate(chunk, sr, opts)
@@ -474,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
         let opts = audiopipe::TranscribeOptions {
             language: None,
             word_timestamps: false,
+            ..Default::default()
         };
         match model.transcribe(chunk, opts) {
             Ok(r) => {

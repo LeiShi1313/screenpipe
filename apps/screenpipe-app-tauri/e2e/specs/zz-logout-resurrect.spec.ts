@@ -40,7 +40,13 @@
 
 import { existsSync } from "node:fs";
 import { saveScreenshot } from "../helpers/screenshot-utils.js";
-import { openHomeWindow, waitForAppReady, waitForTestId, t } from "../helpers/test-utils.js";
+import {
+  openHomeWindow,
+  reloadAndWaitForHome,
+  waitForAppReady,
+  waitForTestId,
+  t,
+} from "../helpers/test-utils.js";
 
 const FAKE_TOKEN = "e2e-fake-token-logout-resurrect";
 const FAKE_EMAIL = "e2e-logout@screenpipe.test";
@@ -276,16 +282,7 @@ describe("Logout is not resurrected by an in-flight loadUser", function () {
       // best-effort
     }
     await restoreFetchAllWindows().catch(() => {});
-    await browser.execute(() => window.location.reload());
-    await browser
-      .waitUntil(
-        async () =>
-          (await browser.execute(
-            () => !!document.querySelector('[data-testid="home-page"]'),
-          )) as boolean,
-        { timeout: t(30_000), interval: 500, timeoutMsg: "home did not re-render after reload" },
-      )
-      .catch(() => {});
+    await reloadAndWaitForHome().catch(() => {});
   });
 
   it("stays logged out after one click even when a slow loadUser resolves afterwards", async () => {
@@ -324,9 +321,12 @@ describe("Logout is not resurrected by an in-flight loadUser", function () {
     const logoutBtn = await waitForTestId("account-logout-button", 8_000);
     await logoutBtn.click();
 
-    // Logout clears the session immediately.
+    // Logout clears the session immediately. Generous timeout: under CI load the
+    // logout click -> updateSettings -> React re-render of the header can take a
+    // few seconds, and an 8s ceiling intermittently tripped ("logout did not
+    // clear the session").
     await browser.waitUntil(async () => (await loginStatusText()).includes("not logged in"), {
-      timeout: t(8_000),
+      timeout: t(15_000),
       interval: 200,
       timeoutMsg: "logout did not clear the session",
     });

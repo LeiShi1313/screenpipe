@@ -244,6 +244,17 @@ export function AccountSection() {
                 <UserCog className="w-4 h-4 mr-1.5" />
                 manage
               </Button>
+              {/* Opens the web billing page, where an existing plan is
+                  upgraded in place (Basic → Business → Team/Enterprise)
+                  without starting a second subscription. */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => openUrl("https://screenpipe.com/billing")}
+              >
+                change plan
+                <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
+              </Button>
               <Button
                 variant="outline"
                 size="sm"

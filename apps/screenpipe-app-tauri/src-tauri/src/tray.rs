@@ -733,9 +733,23 @@ fn create_dynamic_menu(
                 .enabled(false)
                 .build(app)?,
         );
-        // Anyone without cloud (Free, Basic, or Lifetime-only) can move up to
-        // Business to add cloud sync, cloud AI, and integrations.
-        if !has_cloud {
+        // Existing subscribers (any paid tier) get a "change plan" item that
+        // opens the web billing page, where the upgrade happens in place on
+        // their current subscription — swapping the price, no second checkout.
+        // Truly-free users (no plan) keep the fresh-checkout "upgrade to
+        // Business" path. Splitting on the paid-plan check avoids sending a
+        // paying Basic user through a NEW checkout (the duplicate-sub trap).
+        let has_paid_plan = matches!(
+            data.subscription_plan
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("standard" | "pro" | "team" | "enterprise" | "lifetime")
+        );
+        if has_paid_plan {
+            menu_builder = menu_builder
+                .item(&MenuItemBuilder::with_id("change_plan", "⤴ change plan").build(app)?);
+        } else if !has_cloud {
             menu_builder = menu_builder
                 .item(&MenuItemBuilder::with_id("upgrade", "⚡ Upgrade to Business").build(app)?);
         }
@@ -1240,6 +1254,17 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 }
                 .show(&app);
                 let _ = app.emit("tray-upgrade", ());
+            });
+        }
+        "change_plan" => {
+            // Open the web billing page, where an existing subscription is
+            // upgraded in place (Basic → Business → Team/Enterprise). /billing
+            // redirects to /account/billing on the website.
+            let app = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                let _ = app
+                    .opener()
+                    .open_url("https://screenpipe.com/billing", None::<&str>);
             });
         }
         "releases" => {

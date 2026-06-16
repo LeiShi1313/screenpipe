@@ -26,7 +26,13 @@
     "ai",
     "screen-recording",
     "ocr",
-    "audio-transcription"
+    "audio-transcription",
+    "rewind",
+    "local-first",
+    "ai-memory",
+    "second-brain",
+    "recall",
+    "agent"
   ],
   "author": "Screenpipe",
   "license": "SEE LICENSE IN LICENSE.md",

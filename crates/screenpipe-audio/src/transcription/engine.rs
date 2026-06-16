@@ -110,6 +110,27 @@ pub enum TranscriptionEngine {
     Disabled,
 }
 
+/// Merge extra keyterm phrases (e.g. live-meeting attendee names) into a
+/// vocabulary as biasing-only entries (no replacement), de-duplicated against
+/// words already present. Returns the base unchanged when `extra` is empty.
+fn merge_keyterms(base: &[VocabularyEntry], extra: &[String]) -> Vec<VocabularyEntry> {
+    if extra.is_empty() {
+        return base.to_vec();
+    }
+    let existing: std::collections::HashSet<&str> = base.iter().map(|v| v.word.as_str()).collect();
+    let mut out = base.to_vec();
+    for w in extra {
+        let w = w.trim();
+        if !w.is_empty() && !existing.contains(w) {
+            out.push(VocabularyEntry {
+                word: w.to_string(),
+                replacement: None,
+            });
+        }
+    }
+    out
+}
+
 /// Build keyterm phrases from the configured vocabulary for Parakeet contextual
 /// biasing (audiopipe shallow fusion). Prefers the replacement spelling when set
 /// and caps at 100, matching the Deepgram keyterm path.
@@ -400,6 +421,17 @@ impl TranscriptionEngine {
     /// `TranscriptionSession` holds `WhisperState` which is `!Send`, so it must
     /// stay on the thread that created it.
     pub fn create_session(&self) -> Result<TranscriptionSession> {
+        self.create_session_with_keyterms(&[])
+    }
+
+    /// Like [`Self::create_session`], but appends `extra_keyterms` (e.g. a live
+    /// meeting's calendar attendee names) to the session's vocabulary so they
+    /// bias transcription on top of the user's configured vocabulary — across
+    /// every engine (Whisper initial_prompt, Parakeet/Deepgram keyterms).
+    pub fn create_session_with_keyterms(
+        &self,
+        extra_keyterms: &[String],
+    ) -> Result<TranscriptionSession> {
         match self {
             Self::Whisper {
                 context,
@@ -415,23 +447,23 @@ impl TranscriptionEngine {
                     context: context.clone(),
                     config: config.clone(),
                     languages: languages.clone(),
-                    vocabulary: vocabulary.clone(),
+                    vocabulary: merge_keyterms(vocabulary, extra_keyterms),
                 })
             }
             #[cfg(feature = "qwen3-asr")]
             Self::Qwen3Asr { model, vocabulary } => Ok(TranscriptionSession::Qwen3Asr {
                 model: model.clone(),
-                vocabulary: vocabulary.clone(),
+                vocabulary: merge_keyterms(vocabulary, extra_keyterms),
             }),
             #[cfg(feature = "parakeet")]
             Self::Parakeet { model, vocabulary } => Ok(TranscriptionSession::Parakeet {
                 model: model.clone(),
-                vocabulary: vocabulary.clone(),
+                vocabulary: merge_keyterms(vocabulary, extra_keyterms),
             }),
             #[cfg(feature = "parakeet-mlx")]
             Self::ParakeetMlx { model, vocabulary } => Ok(TranscriptionSession::ParakeetMlx {
                 model: model.clone(),
-                vocabulary: vocabulary.clone(),
+                vocabulary: merge_keyterms(vocabulary, extra_keyterms),
             }),
             Self::Deepgram {
                 config,
@@ -440,7 +472,7 @@ impl TranscriptionEngine {
             } => Ok(TranscriptionSession::Deepgram {
                 config: config.clone(),
                 languages: languages.clone(),
-                vocabulary: vocabulary.clone(),
+                vocabulary: merge_keyterms(vocabulary, extra_keyterms),
             }),
             Self::OpenAICompatible {
                 endpoint,
@@ -457,7 +489,7 @@ impl TranscriptionEngine {
                 model: model.clone(),
                 client: client.clone(),
                 languages: languages.clone(),
-                vocabulary: vocabulary.clone(),
+                vocabulary: merge_keyterms(vocabulary, extra_keyterms),
                 headers: headers.clone(),
                 raw_audio: *raw_audio,
             }),
@@ -843,5 +875,31 @@ impl TranscriptionSession {
             }
             err => err,
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_keyterms_tests {
+    use super::*;
+
+    fn v(word: &str) -> VocabularyEntry {
+        VocabularyEntry {
+            word: word.to_string(),
+            replacement: None,
+        }
+    }
+
+    #[test]
+    fn appends_new_keyterms_and_dedups() {
+        let base = vec![v("Screenpipe"), v("Whisper")];
+        let merged = merge_keyterms(&base, &["Arvind".into(), "Whisper".into(), "  ".into()]);
+        let words: Vec<&str> = merged.iter().map(|e| e.word.as_str()).collect();
+        assert_eq!(words, vec!["Screenpipe", "Whisper", "Arvind"]); // Whisper not duped, blank dropped
+    }
+
+    #[test]
+    fn empty_extra_returns_base_unchanged() {
+        let base = vec![v("Screenpipe")];
+        assert_eq!(merge_keyterms(&base, &[]).len(), 1);
     }
 }

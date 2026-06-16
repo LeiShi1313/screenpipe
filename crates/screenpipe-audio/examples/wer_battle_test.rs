@@ -18,6 +18,7 @@
 //! baseline to compare changes against, not a vendor-comparable WER.
 
 use screenpipe_audio::core::engine::AudioTranscriptionEngine;
+use screenpipe_audio::transcription::VocabularyEntry;
 use screenpipe_audio::TranscriptionEngine;
 use screenpipe_core::Language;
 use std::collections::BTreeMap;
@@ -78,14 +79,36 @@ async fn main() -> anyhow::Result<()> {
         _ => AudioTranscriptionEngine::default(),
     };
     let engine_label = format!("{engine_enum:?}");
-    eprintln!("engine: {engine_label}   corpus: {}", corpus.display());
+
+    // Optional vocabulary biasing (Whisper initial_prompt / Deepgram keyterms),
+    // e.g. WER_VOCAB="screenpipe,Deepgram,Arvind,Vercel". Lets us A/B test whether
+    // seeding domain/proper-noun terms (the planned calendar-name seeding) lowers
+    // WER on the names/product categories.
+    let vocab: Vec<VocabularyEntry> = std::env::var("WER_VOCAB")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|w| w.trim().to_string())
+                .filter(|w| !w.is_empty())
+                .map(|word| VocabularyEntry {
+                    word,
+                    replacement: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "engine: {engine_label}   corpus: {}   vocab_terms: {}",
+        corpus.display(),
+        vocab.len()
+    );
 
     let engine = TranscriptionEngine::new(
         Arc::new(engine_enum),
         None,
         None,
         vec![Language::English],
-        vec![],
+        vocab,
     )
     .await?;
 

@@ -268,9 +268,11 @@ pub struct PipelineHealthInfo {
     pub frames_dropped_timeout: u64,
     /// Frames dropped because the capture op errored (subset of frames_dropped).
     pub frames_dropped_error: u64,
-    /// capture_attempts - frames_db_written - dedup_skips: real lost-frame count.
+    /// Residual loss canary: attempts - written - dedup - dropped. ~0 normally;
+    /// non-zero = a frame-loss path nothing counts. Use frames_dropped_* for the
+    /// actionable loss numbers.
     pub silent_loss: u64,
-    /// silent_loss / (capture_attempts - dedup_skips). The fleet's true stall rate.
+    /// silent_loss / (capture_attempts - dedup_skips). Should stay ~0.
     pub silent_loss_rate: f64,
     /// Total capture cycles attempted (loop heartbeat). Flat while uptime climbs
     /// = trigger starvation (no capture events firing — the meeting-gap case).

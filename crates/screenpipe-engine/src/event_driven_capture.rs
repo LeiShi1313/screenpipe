@@ -1976,7 +1976,9 @@ async fn do_capture(
                 let duration_ms = snap.walk_duration.as_millis() as u64;
                 let node_count = snap.node_count as u64;
                 let max_depth = snap.max_depth_reached as u64;
-                let text_chars = snap.text_content.chars().count() as u64;
+                // UTF-8 byte length (O(1)) as a cheap text-volume proxy —
+                // avoids an O(n) char-count scan on the capture path.
+                let text_chars = snap.text_content.len() as u64;
                 let truncated = snap.truncated;
                 let truncated_timeout = matches!(snap.truncation_reason, TruncationReason::Timeout);
                 let truncated_max_nodes =

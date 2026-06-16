@@ -286,19 +286,23 @@ impl PipelineMetrics {
         let ocr_completed = self.ocr_completed.load(Ordering::Relaxed);
         let uptime_secs = self.started_at.elapsed().as_secs_f64();
 
-        // Silent loss = capture cycles that ran but produced no frame and were
-        // NOT an expected dedup skip. `attempts - persisted - dedup_skips`.
-        // This is the real "lost screen data" signal: when the loop keeps
-        // attempting captures (heartbeat alive) but nothing reaches the DB and
-        // it isn't a static-screen dedup, frames are vanishing. The legacy
-        // `frame_drop_rate` (1 - written/captured) is structurally ~0 because
-        // `frames_captured` is only bumped alongside `frames_db_written`, so it
-        // never surfaced this — `silent_loss_rate` does.
+        // Loss accounting. Every counted capture attempt resolves to exactly
+        // one of: persisted (frames_db_written), a static-screen dedup
+        // (dedup_skips), or an explicit drop (frames_dropped = timeout+error).
+        // `silent_loss` is therefore the RESIDUAL — attempts we can't attribute
+        // to any of those. It should sit at ~0; a growing residual means a
+        // frame-loss path exists that nothing counts (a regression canary, not
+        // a headline). The actionable loss numbers are `frames_dropped_timeout`
+        // / `frames_dropped_error` (and `frame_drop_rate`, their share of
+        // terminal outcomes). The legacy `1 - written/captured` drop rate was
+        // structurally ~0 because frames_captured only bumps alongside a write.
         let capture_attempts = self.capture_attempts.load(Ordering::Relaxed);
         let dedup_skips = self.dedup_skips.load(Ordering::Relaxed);
+        let frames_dropped = self.frames_dropped.load(Ordering::Relaxed);
         let silent_loss = capture_attempts
             .saturating_sub(frames_db_written)
-            .saturating_sub(dedup_skips);
+            .saturating_sub(dedup_skips)
+            .saturating_sub(frames_dropped);
         // Denominator = cycles that intended to write (attempts minus the
         // expected static-screen dedups). Guard against divide-by-zero.
         let write_intent = capture_attempts.saturating_sub(dedup_skips);
@@ -324,7 +328,7 @@ impl PipelineMetrics {
             },
             frames_video_written: self.frames_video_written.load(Ordering::Relaxed),
             frames_db_written,
-            frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            frames_dropped,
             frames_dropped_timeout: self.frames_dropped_timeout.load(Ordering::Relaxed),
             frames_dropped_error: self.frames_dropped_error.load(Ordering::Relaxed),
             silent_loss,
@@ -355,10 +359,9 @@ impl PipelineMetrics {
             // write, so it never surfaced loss. See `silent_loss_rate` for the
             // broader attempts-based view that also catches trigger starvation.
             frame_drop_rate: {
-                let dropped = self.frames_dropped.load(Ordering::Relaxed);
-                let terminal = dropped + frames_db_written;
+                let terminal = frames_dropped + frames_db_written;
                 if terminal > 0 {
-                    dropped as f64 / terminal as f64
+                    frames_dropped as f64 / terminal as f64
                 } else {
                     0.0
                 }
@@ -412,10 +415,12 @@ pub struct MetricsSnapshot {
     pub frames_dropped_timeout: u64,
     /// Frames dropped because the capture op errored (subset of frames_dropped).
     pub frames_dropped_error: u64,
-    /// capture_attempts - frames_db_written - dedup_skips. The real count of
-    /// capture cycles that lost their frame and weren't an expected dedup skip.
+    /// Residual loss canary: attempts - written - dedup_skips - frames_dropped.
+    /// ~0 in steady state (every attempt is accounted for); a growing value
+    /// means a frame-loss path exists that nothing counts. For the actionable
+    /// loss numbers use frames_dropped_timeout/error.
     pub silent_loss: u64,
-    /// silent_loss / (capture_attempts - dedup_skips). 0.0 = healthy.
+    /// silent_loss / (capture_attempts - dedup_skips). Should stay ~0.
     pub silent_loss_rate: f64,
     pub avg_db_latency_ms: f64,
     /// 0.0 = no drops, 1.0 = all dropped (drops / (drops + writes))
@@ -442,9 +447,43 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn silent_loss_and_drop_rate_reflect_real_loss() {
+    fn silent_loss_is_unaccounted_residual_and_drop_rate_is_real() {
         let m = PipelineMetrics::new();
-        // 10 attempts: 6 persisted, 2 dedup skips, 2 dropped (1 timeout, 1 error).
+        // 11 attempts: 6 persisted, 2 dedup, 2 dropped (1 timeout, 1 error) =
+        // 10 accounted. The 11th attempt recorded NO outcome — simulating an
+        // uninstrumented loss path. The residual canary should catch it.
+        for _ in 0..11 {
+            m.record_capture_attempt();
+        }
+        for _ in 0..6 {
+            m.record_db_write(Duration::from_millis(5));
+        }
+        for _ in 0..2 {
+            m.record_dedup_skip();
+        }
+        m.record_drop_timeout();
+        m.record_drop_error();
+
+        let s = m.snapshot();
+        assert_eq!(s.capture_attempts, 11);
+        assert_eq!(s.frames_db_written, 6);
+        assert_eq!(s.dedup_skips, 2);
+        assert_eq!(s.frames_dropped, 2);
+        assert_eq!(s.frames_dropped_timeout, 1);
+        assert_eq!(s.frames_dropped_error, 1);
+        // residual = attempts - written - dedup - dropped = 11 - 6 - 2 - 2 = 1
+        assert_eq!(s.silent_loss, 1);
+        // silent_loss_rate = residual / (attempts - dedup) = 1 / 9
+        assert!((s.silent_loss_rate - (1.0 / 9.0)).abs() < 1e-9);
+        // frame_drop_rate = dropped / (dropped + written) = 2 / 8 = 0.25
+        // (the old `1 - written/captured` formula would have reported ~0 here)
+        assert!((s.frame_drop_rate - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fully_accounted_pipeline_has_zero_residual() {
+        let m = PipelineMetrics::new();
+        // Every attempt resolves to a known outcome → residual is 0.
         for _ in 0..10 {
             m.record_capture_attempt();
         }
@@ -458,19 +497,8 @@ mod tests {
         m.record_drop_error();
 
         let s = m.snapshot();
-        assert_eq!(s.capture_attempts, 10);
-        assert_eq!(s.frames_db_written, 6);
-        assert_eq!(s.dedup_skips, 2);
-        assert_eq!(s.frames_dropped, 2);
-        assert_eq!(s.frames_dropped_timeout, 1);
-        assert_eq!(s.frames_dropped_error, 1);
-        // silent_loss = attempts - written - dedup = 10 - 6 - 2 = 2
-        assert_eq!(s.silent_loss, 2);
-        // silent_loss_rate = silent_loss / (attempts - dedup) = 2 / 8 = 0.25
-        assert!((s.silent_loss_rate - 0.25).abs() < 1e-9);
-        // frame_drop_rate = dropped / (dropped + written) = 2 / 8 = 0.25
-        // (the old `1 - written/captured` formula would have reported ~0 here)
-        assert!((s.frame_drop_rate - 0.25).abs() < 1e-9);
+        assert_eq!(s.silent_loss, 0);
+        assert_eq!(s.silent_loss_rate, 0.0);
     }
 
     #[test]

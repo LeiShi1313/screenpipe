@@ -738,9 +738,8 @@ impl TranscriptionSession {
                 // The per-model mutex here just prevents concurrent Rust access
                 // to the same Model instance.
                 let mut engine = model.lock().map_err(|e| anyhow!("stt model lock: {}", e))?;
-                // Keyterms for contextual biasing. The MLX decoder ignores them
-                // today (biasing lives in the ONNX Parakeet path); passing them
-                // is a harmless no-op until MLX biasing lands.
+                // Keyterms for contextual biasing — honored by the MLX decoder
+                // as of audiopipe#14 (shallow fusion, same as the ONNX path).
                 let keyterms = parakeet_keyterms(vocabulary);
 
                 // Chunk to 30s like the CPU Parakeet path above. The Metal backend

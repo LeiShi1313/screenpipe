@@ -256,11 +256,30 @@ export const RECOMMENDED_SERVERS: RegistryServer[] = [
     remotes: [{ type: "streamable-http", url: "https://mcp.notion.com/mcp" }],
   },
   {
+    name: "com.atlassian/atlassian-mcp-server",
+    title: "Atlassian",
+    description: "Jira issues and Confluence pages across your Atlassian site. OAuth sign-in.",
+    repository: { url: "https://www.atlassian.com/platform/remote-mcp-server" },
+    remotes: [{ type: "streamable-http", url: "https://mcp.atlassian.com/v1/mcp" }],
+  },
+  {
     name: "app.linear/linear",
     title: "Linear",
     description: "Create and manage Linear issues, projects and cycles. OAuth sign-in.",
     repository: { url: "https://linear.app/docs/mcp" },
     remotes: [{ type: "sse", url: "https://mcp.linear.app/sse" }],
+  },
+  {
+    name: "com.monday/monday.com",
+    title: "Monday.com",
+    description: "Boards, items and updates in monday.com work management. OAuth sign-in.",
+    remotes: [{ type: "streamable-http", url: "https://mcp.monday.com/mcp" }],
+  },
+  {
+    name: "com.airtable/mcp",
+    title: "Airtable",
+    description: "Read and update Airtable bases, tables and records. OAuth sign-in.",
+    remotes: [{ type: "streamable-http", url: "https://mcp.airtable.com/mcp" }],
   },
   {
     name: "com.stripe/mcp",
@@ -275,26 +294,5 @@ export const RECOMMENDED_SERVERS: RegistryServer[] = [
     description: "Read Figma files, frames and design context for your designs.",
     repository: { url: "https://help.figma.com/hc/en-us/articles/32132100833559" },
     remotes: [{ type: "streamable-http", url: "https://mcp.figma.com/mcp" }],
-  },
-  {
-    name: "co.huggingface/hf-mcp-server",
-    title: "Hugging Face",
-    description: "Search models, datasets and Spaces on the Hugging Face Hub.",
-    repository: { url: "https://github.com/evalstate/hf-mcp-server" },
-    remotes: [{ type: "streamable-http", url: "https://huggingface.co/mcp?login" }],
-  },
-  {
-    name: "io.github.getsentry/sentry-mcp",
-    title: "Sentry",
-    description: "Inspect Sentry issues, events and releases. Runs locally via npx.",
-    repository: { url: "https://github.com/getsentry/sentry-mcp" },
-    packages: [
-      {
-        registryType: "npm",
-        identifier: "@sentry/mcp-server",
-        runtimeHint: "npx",
-        transport: { type: "stdio" },
-      },
-    ],
   },
 ];

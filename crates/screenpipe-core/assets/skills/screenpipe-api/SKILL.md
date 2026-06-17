@@ -562,6 +562,48 @@ curl -X POST http://localhost:11435/notify \
 
 Returns `{"success": true, "message": "Notification sent successfully"}`.
 
+### Ask the user a question — and wait for the answer
+
+When you need a decision or confirmation **before acting** (send this email? which contact? approve this post?), don't just notify — *ask*, and block until the user answers. This is the interactive `/asks` flow on the main API (port 3030). Each option becomes a notification button that records the answer, so there's no extra UI. Always offer a decline/skip option, and pick a **safe default** for unattended runs (when nobody's there to answer).
+
+```bash
+# 1. register the question -> {"id":"..."}
+ID=$(curl -s -X POST http://localhost:3030/asks \
+  -H "Content-Type: application/json" \
+  -d '{"message":"A lead has not replied in 5 days. Send the follow-up I drafted?","pipe":"followup-pipe","options":[{"label":"Send it","value":"send"},{"label":"Edit first","value":"edit"},{"label":"Do not send","value":"skip"}]}' | jq -r .id)
+
+# 2. surface it as an actionable notification — each option is an api button
+#    that POSTs the answer back to /asks/$ID/answer (the panel runs api actions)
+curl -s -X POST http://localhost:11435/notify \
+  -H "Content-Type: application/json" \
+  -d "{\"title\":\"followup-pipe needs you\",\"body\":\"A lead has not replied in 5 days. Send the follow-up?\",\"timeout\":300000,\"actions\":[
+        {\"id\":\"a-send\",\"label\":\"Send it\",\"type\":\"api\",\"url\":\"/asks/$ID/answer\",\"method\":\"POST\",\"body\":{\"answer\":\"send\"}},
+        {\"id\":\"a-edit\",\"label\":\"Edit first\",\"type\":\"api\",\"url\":\"/asks/$ID/answer\",\"method\":\"POST\",\"body\":{\"answer\":\"edit\"}},
+        {\"id\":\"a-skip\",\"label\":\"Do not send\",\"type\":\"api\",\"url\":\"/asks/$ID/answer\",\"method\":\"POST\",\"body\":{\"answer\":\"skip\"}}]}"
+
+# 3. poll until answered, with your own timeout -> fall back to a safe default
+ANSWER=skip
+for i in $(seq 1 150); do            # 150 * 2s = 5 min
+  R=$(curl -s http://localhost:3030/asks/$ID)
+  if [ "$(echo "$R" | jq -r .status)" = "answered" ]; then
+    ANSWER=$(echo "$R" | jq -r .answer); break
+  fi
+  sleep 2
+done
+# now act on "$ANSWER" (send / edit / skip)
+```
+
+Endpoints (port 3030, auth-exempt like `/notify`):
+
+| Method | Path | Body / returns |
+|--------|------|----------------|
+| POST | `/asks` | `{message, options:[{label,value}], pipe?}` → `{id}` |
+| GET | `/asks/:id` | → `{status:"pending"\|"answered", answer}` |
+| POST | `/asks/:id/answer` | `{answer}` (the option buttons call this) |
+| GET | `/asks` | list pending (unanswered) asks |
+
+The ask lives only as long as your run is waiting on it (in-memory, in-session). For unattended/scheduled runs always default to the safe choice (usually `skip` / don't-act) when no answer arrives in time. (External MCP clients have an equivalent `ask_user` tool.)
+
 ---
 
 ## 13. Other Endpoints

@@ -2466,9 +2466,10 @@ fn format_browser_description(natural_desc: &str, id: &str) -> String {
         "{natural_desc}\n\n\
          Control:\n\
          - POST /connections/browsers/{id}/navigate {{\"url\": \"https://...\"}}  → open a URL.\n\
-         - GET  /connections/browsers/{id}/snapshot                              → accessibility outline of the page (title, url, headings, links, buttons, form fields). Use this to read the page; almost always preferable to writing your own JS.\n\
+         - GET  /connections/browsers/{id}/snapshot                              → compact, token-efficient page outline. Interactive elements carry a stable ref like #e7; headings/landmarks give structure. Read the page AND get refs to act on, here.\n\
+         - POST /connections/browsers/{id}/act      {{\"ref\": \"e7\", \"action\": \"click\"}}  → act on a snapshot element by ref. action ∈ click | fill (+\"value\") | clear | check | uncheck | select (+\"value\") | hover | focus. Re-snapshot first if refs may be stale. Prefer this over hand-written JS.\n\
          - GET  /connections/browsers/{id}/status                                → ready check.\n\
-         - POST /connections/browsers/{id}/eval     {{\"code\": \"...\"}}            → escape hatch: run JS when navigate + snapshot aren't enough."
+         - POST /connections/browsers/{id}/eval     {{\"code\": \"...\"}}            → escape hatch: run JS when navigate + snapshot + act aren't enough."
     )
 }
 
@@ -2607,16 +2608,31 @@ async fn browser_run_navigate(
 
 /// JS injected by /snapshot. Walks the live DOM and produces a compact,
 /// accessibility-style outline of the page — the kind of thing the agent
-/// can reason about without writing its own selector-based scraper.
+/// can reason about (and act on) without writing its own selector scraper.
 ///
-/// Output: `{ title, url, tree, truncated }`. `tree` is plain text, capped
-/// at MAX_LINES so a giant page doesn't blow the agent's context.
+/// Output: `{ title, url, tree, count, truncated }`. `tree` is plain text,
+/// capped at MAX_LINES so a giant page doesn't blow the agent's context;
+/// `count` is the number of actionable refs assigned.
+///
+/// Element refs (Playwright-MCP / Skyvern style): every *actionable* element
+/// is stamped with a fresh `data-sp-ref="eN"` attribute and rendered with a
+/// `#eN` tag in the tree. `POST /act {ref, action}` then resolves that
+/// attribute server-side — so the model targets `e7` instead of hand-writing
+/// a brittle querySelector through /eval. Refs are cleared and re-numbered on
+/// every snapshot, so they always match the latest call.
+///
+/// Token efficiency: refs only go on things you can act on; headings and
+/// named landmarks are kept for structure but carry no ref. Zero-size,
+/// fully-transparent, and negatively-offscreen (visually-hidden) nodes are
+/// dropped; below-the-fold content is kept (a Submit button under the fold
+/// is still real). State is inlined — `(disabled)`, `(checked)`,
+/// `(expanded)` — so the model needn't probe with follow-up evals.
 ///
 /// Skip rules: hidden elements (display:none / visibility:hidden / aria-
-/// hidden), script/style/noscript, presentation-only roles, password
-/// inputs (the value field would leak the user's secret), `<label>` (its
-/// text gets duplicated on the associated input — extra noise), anchors
-/// with non-navigable hrefs (`javascript:`, empty, `#`).
+/// hidden), script/style/noscript, presentation-only roles, hidden inputs;
+/// password inputs are surfaced (so the agent can fill them) but their
+/// `value` is never emitted (it would leak the user's secret); anchors with
+/// non-navigable hrefs (`javascript:`, empty, `#`) appear as buttons.
 ///
 /// Page-load race: if the user calls /snapshot right after /navigate,
 /// `document.readyState` may still be `loading`; we wait up to 5s for it
@@ -2635,16 +2651,19 @@ async function waitReady(maxMs) {
 await waitReady(5000);
 
 const MAX_LINES = 250;
-const MAX_DEPTH = 8;
+const MAX_DEPTH = 12;
 const out = [];
-const interesting = new Set([
-    'h1','h2','h3','h4','h5','h6','a','button','input','textarea','select',
-    'nav','main','article','section','form','fieldset','legend',
-    'summary','dialog','header','footer','aside'
+// Non-interactive tags kept for structure/context (only when they carry an
+// accessible name — a bare unnamed landmark is pure noise).
+const structural = new Set([
+    'h1','h2','h3','h4','h5','h6','nav','main','article','section',
+    'form','fieldset','legend','summary','dialog','header','footer','aside'
 ]);
 const interactiveRoles = new Set([
-    'button','link','checkbox','menuitem','option','radio','switch','tab','textbox','combobox'
+    'button','link','checkbox','menuitem','menuitemcheckbox','menuitemradio',
+    'option','radio','switch','tab','textbox','combobox','searchbox','slider','spinbutton'
 ]);
+const formTags = new Set(['input','textarea','select']);
 
 function clip(s, n) {
     s = (s || '').replace(/\s+/g, ' ').trim();
@@ -2661,6 +2680,77 @@ function navigableHref(el) {
     return h;
 }
 
+// Rendered + roughly on-screen. Keep below-the-fold elements (legit form
+// fields / submit buttons); drop zero-size, fully transparent, and nodes
+// pushed entirely off the top/left (the classic visually-hidden trick).
+function isRendered(el, style) {
+    let rect;
+    try { rect = el.getBoundingClientRect(); } catch (_) { return true; }
+    if (rect.width < 2 || rect.height < 2) return false;
+    if (rect.bottom < 0 || rect.right < 0) return false;
+    if (style && parseFloat(style.opacity) === 0) return false;
+    return true;
+}
+
+function accessibleName(el, tag, role) {
+    const aria = el.getAttribute('aria-label');
+    if (aria) return aria;
+    const labelledby = el.getAttribute('aria-labelledby');
+    if (labelledby) {
+        const txt = labelledby.split(/\s+/).map((id) => {
+            const n = document.getElementById(id);
+            return n ? n.innerText : '';
+        }).join(' ');
+        if (txt.trim()) return txt;
+    }
+    if (tag === 'input') return el.getAttribute('placeholder') || el.getAttribute('name') || el.type || 'input';
+    if (formTags.has(tag)) return el.getAttribute('placeholder') || el.getAttribute('name') || tag;
+    if (tag === 'a' || tag === 'button' || /^h[1-6]$/.test(tag) || interactiveRoles.has(role)) {
+        return clip(el.innerText, 120);
+    }
+    return clip(el.getAttribute('name') || el.getAttribute('title') || '', 80);
+}
+
+// What the model can actually act on. Beyond semantic tags/roles we detect
+// onclick handlers, contenteditable, tabindex, and cursor:pointer leaves
+// (the div/span "buttons" SPA frameworks love) — but guard cursor:pointer so
+// wrapper elements don't each get a redundant ref.
+function isInteractive(el, tag, role, style) {
+    if (interactiveRoles.has(role)) return true;
+    if (tag === 'button' || tag === 'select' || tag === 'textarea' || tag === 'a') return true;
+    if (tag === 'input') return el.type !== 'hidden';
+    if (el.isContentEditable) return true;
+    if (el.hasAttribute('onclick')) return true;
+    const ti = el.getAttribute('tabindex');
+    if (ti !== null && ti !== '-1' && parseInt(ti, 10) >= 0) return true;
+    if ((tag === 'div' || tag === 'span' || tag === 'li' || tag === 'td')
+        && style && style.cursor === 'pointer'
+        && (el.innerText || '').trim()
+        && !el.querySelector('a,button,input,select,textarea,[role],[onclick],[tabindex]')) {
+        return true;
+    }
+    return false;
+}
+
+function stateFlags(el, tag) {
+    const flags = [];
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') flags.push('disabled');
+    const ariaChecked = el.getAttribute('aria-checked');
+    const nativeChecked = (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) ? el.checked : null;
+    if (ariaChecked === 'true' || nativeChecked === true) flags.push('checked');
+    const expanded = el.getAttribute('aria-expanded');
+    if (expanded === 'true') flags.push('expanded');
+    else if (expanded === 'false') flags.push('collapsed');
+    if (el.getAttribute('aria-selected') === 'true') flags.push('selected');
+    if (el.required || el.getAttribute('aria-required') === 'true') flags.push('required');
+    return flags;
+}
+
+// Fresh refs every snapshot: clear last call's stamps so eN always matches
+// the tree we're returning now.
+let refCounter = 0;
+try { document.querySelectorAll('[data-sp-ref]').forEach((n) => n.removeAttribute('data-sp-ref')); } catch (_) {}
+
 function walk(el, depth) {
     if (out.length >= MAX_LINES) return true; // signal: caller can stop
     if (!el || el.nodeType !== 1) return false;
@@ -2672,45 +2762,51 @@ function walk(el, depth) {
     if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
     const role = el.getAttribute('role');
     if (role === 'presentation' || role === 'none') return false;
-    // Password inputs: a row with a value would leak the user's secret.
-    // Skip the input entirely — even an empty-value row implies "there's a
-    // password field here" which is fine, but emitting `el.value` is not.
-    if (tag === 'input' && (el.type === 'password' || el.type === 'hidden')) return false;
-    // <label> duplicates its associated input's text; the input row already
-    // surfaces it via aria-labelledby/innerText. Drop the label rows to
-    // keep the tree compact.
+    // Hidden inputs carry no UI; password inputs are actionable (login flows)
+    // but their value must never be emitted.
+    if (tag === 'input' && el.type === 'hidden') return false;
+    const isPassword = tag === 'input' && el.type === 'password';
+    // <label> duplicates its associated input's text; drop the label row but
+    // keep walking its children so a wrapped control still surfaces.
     if (tag === 'label') {
-        for (const child of el.children) {
-            if (walk(child, depth)) return true;
-        }
+        for (const child of el.children) { if (walk(child, depth)) return true; }
         return false;
     }
-    const aria = el.getAttribute('aria-label');
-    const isInteractive = interactiveRoles.has(role) || aria;
-    const include = interesting.has(tag) || isInteractive;
+    // Unrendered wrapper: don't emit it, but a zero-size node can still hold
+    // visible children, so keep descending at the same depth.
+    if (!isRendered(el, style)) {
+        for (const child of el.children) { if (walk(child, depth)) return true; }
+        return false;
+    }
+
+    const interactive = isInteractive(el, tag, role, style);
+    const name = accessibleName(el, tag, role);
+    // Structural tags only earn a line if they're named — keeps the tree dense.
+    const include = interactive || (structural.has(tag) && name);
     if (include) {
-        // Anchors without a navigable href aren't useful as links — but
-        // they CAN be interactive (onclick handlers). Surface them as
-        // [button] in that case so the agent knows they're clickable.
-        let tagOrRole;
+        let kind;
         if (tag === 'a') {
-            const h = navigableHref(el);
-            tagOrRole = role || (h ? 'a' : 'button');
+            kind = role || (navigableHref(el) ? 'link' : 'button');
+        } else if (interactive && !interactiveRoles.has(role)
+                   && (tag === 'div' || tag === 'span' || tag === 'li' || tag === 'td')) {
+            kind = 'button';
         } else {
-            tagOrRole = role || tag;
-        }
-        let label = aria || '';
-        if (!label) {
-            if (tag === 'input') label = el.getAttribute('placeholder') || el.type || 'input';
-            else if (tag === 'a' || tag === 'button') label = clip(el.innerText, 80);
-            else if (/^h[1-6]$/.test(tag)) label = clip(el.innerText, 120);
-            else label = clip(el.getAttribute('name') || el.getAttribute('title') || '', 60);
+            kind = role || tag;
         }
         const href = tag === 'a' ? navigableHref(el) : '';
-        const isFormField = tag === 'input' || tag === 'textarea' || tag === 'select';
-        const value = isFormField ? clip(el.value, 60) : '';
-        let line = '  '.repeat(Math.min(depth, MAX_DEPTH)) + '[' + tagOrRole + ']';
-        if (label) line += ' ' + clip(label, 100);
+        const value = (formTags.has(tag) && !isPassword) ? clip(el.value, 60) : '';
+        const flags = interactive ? stateFlags(el, tag) : [];
+
+        let ref = '';
+        if (interactive) {
+            ref = 'e' + (++refCounter);
+            try { el.setAttribute('data-sp-ref', ref); } catch (_) {}
+        }
+
+        let line = '  '.repeat(Math.min(depth, MAX_DEPTH)) + kind;
+        if (name) line += ' "' + clip(name, 100) + '"';
+        if (ref) line += ' #' + ref;
+        if (flags.length) line += ' (' + flags.join(',') + ')';
         if (href) line += ' → ' + clip(href, 80);
         if (value) line += ' = ' + value;
         out.push(line);
@@ -2726,6 +2822,7 @@ return {
     title: document.title || '',
     url: location.href,
     tree: out.join('\n'),
+    count: refCounter,
     truncated: out.length >= MAX_LINES
 };
 "#;
@@ -2765,6 +2862,182 @@ async fn browser_run_snapshot(
         Err(e @ EvalError::Timeout(_)) => (
             StatusCode::GATEWAY_TIMEOUT,
             Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Actions `/act` understands. Kept in one place so the route validator and
+/// the help text can't drift from the JS switch in [`browser_act_script`].
+const ACT_ACTIONS: [&str; 9] = [
+    "click", "fill", "type", "clear", "check", "uncheck", "select", "hover", "focus",
+];
+
+/// Build the JS that `/act` injects to perform one action on a ref-stamped
+/// element. The ref/action/value are JSON-encoded into the script (never
+/// string-concatenated) so a page value like `"); evil()` can't break out of
+/// the literal. The element is resolved by the `data-sp-ref` attribute that
+/// [`SNAPSHOT_SCRIPT`] stamped — i.e. the model acts on what it just saw,
+/// with no selector of its own.
+///
+/// `fill`/`clear`/`select` go through the native value setter + `input`/
+/// `change` events so React/Vue controlled inputs actually register the
+/// change (assigning `.value` alone is silently dropped by their synthetic
+/// event layer).
+fn browser_act_script(ref_id: &str, action: &str, value: Option<&str>) -> String {
+    let ref_json = serde_json::to_string(ref_id).unwrap_or_else(|_| "\"\"".to_string());
+    let action_json = serde_json::to_string(action).unwrap_or_else(|_| "\"\"".to_string());
+    let value_json = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+    format!(
+        r#"
+const REF = {ref_json};
+const ACTION = {action_json};
+const VALUE = {value_json};
+const el = document.querySelector('[data-sp-ref="' + CSS.escape(REF) + '"]');
+if (!el) {{
+    return {{ ok: false, error: "ref '" + REF + "' not found — call /snapshot again to get fresh refs" }};
+}}
+try {{ el.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+const tag = el.tagName.toLowerCase();
+
+function setNativeValue(node, val) {{
+    const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(node, val); else node.value = val;
+    node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+}}
+
+try {{
+    if (ACTION === 'click') {{
+        el.click();
+    }} else if (ACTION === 'fill' || ACTION === 'type') {{
+        el.focus();
+        setNativeValue(el, VALUE == null ? '' : String(VALUE));
+    }} else if (ACTION === 'clear') {{
+        el.focus();
+        setNativeValue(el, '');
+    }} else if (ACTION === 'check' || ACTION === 'uncheck') {{
+        const want = ACTION === 'check';
+        if (typeof el.checked !== 'boolean') el.click();
+        else if (el.checked !== want) el.click();
+    }} else if (ACTION === 'select') {{
+        if (tag === 'select') {{
+            const want = VALUE == null ? '' : String(VALUE);
+            let matched = false;
+            for (const opt of el.options) {{
+                if (opt.value === want || (opt.textContent || '').trim() === want) {{ el.value = opt.value; matched = true; break; }}
+            }}
+            if (!matched) return {{ ok: false, error: "no <option> matching '" + want + "'" }};
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }} else {{ el.click(); }}
+    }} else if (ACTION === 'hover') {{
+        ['mouseover','mouseenter','mousemove'].forEach((t) => el.dispatchEvent(new MouseEvent(t, {{ bubbles: true }})));
+    }} else if (ACTION === 'focus') {{
+        el.focus();
+    }} else {{
+        return {{ ok: false, error: "unknown action '" + ACTION + "'" }};
+    }}
+}} catch (e) {{
+    return {{ ok: false, error: String((e && e.message) || e) }};
+}}
+return {{ ok: true, ref: REF, action: ACTION, tag: tag, url: location.href }};
+"#
+    )
+}
+
+#[derive(Deserialize)]
+struct BrowserActBody {
+    /// Element ref from a prior `/snapshot` (e.g. `"e7"`), with or without
+    /// the `#` the tree renders.
+    #[serde(rename = "ref")]
+    ref_id: String,
+    action: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// POST /connections/browsers/:id/act — perform one deterministic action on a
+/// snapshot element by ref. This is the actuation half of the snapshot/act
+/// loop: the model decides *which* ref and *what* action; the tool just
+/// executes. No model calls, no heuristics — keep the smarts in the pipe.
+async fn browser_run_act(
+    State(state): State<ConnectionsState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<BrowserActBody>,
+) -> (StatusCode, Json<Value>) {
+    let action = body.action.trim().to_lowercase();
+    if !ACT_ACTIONS.contains(&action.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("unknown action '{}' — use one of {:?}", body.action, ACT_ACTIONS),
+            })),
+        );
+    }
+    // Tolerate the model passing the rendered `#e7` form.
+    let ref_id = body.ref_id.trim().trim_start_matches('#');
+    if ref_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "missing 'ref' — get one from /snapshot (e.g. \"e7\")" })),
+        );
+    }
+
+    let owner = headers
+        .get("x-screenpipe-session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let browser = match state.browser_registry.get(&id).await {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("no browser registered with id '{id}'") })),
+            );
+        }
+    };
+
+    let script = browser_act_script(ref_id, &action, body.value.as_deref());
+    let timeout = std::time::Duration::from_secs(body.timeout_secs.unwrap_or(15).min(60));
+    match browser.eval_with_owner(&script, None, timeout, owner).await {
+        Ok(r) if r.ok => {
+            // The script itself returns {ok:false} for ref-not-found / no
+            // matching option — surface that as 422, success as 200.
+            let inner_ok = r
+                .result
+                .as_ref()
+                .and_then(|v| v.get("ok"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let status = if inner_ok {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            (status, Json(r.result.unwrap_or_else(|| json!({ "ok": false }))))
+        }
+        Ok(r) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "error": r.error })),
+        ),
+        Err(EvalError::NotConnected) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": EvalError::NotConnected.to_string() })),
+        ),
+        Err(e @ EvalError::SendFailed(_)) | Err(e @ EvalError::Disconnected) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e @ EvalError::Timeout(_)) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "ok": false, "error": e.to_string() })),
         ),
     }
 }
@@ -2864,6 +3137,7 @@ where
         .route("/browsers/:id/status", get(browser_get_status))
         .route("/browsers/:id/navigate", post(browser_run_navigate))
         .route("/browsers/:id/snapshot", get(browser_run_snapshot))
+        .route("/browsers/:id/act", post(browser_run_act))
         .route("/browsers/:id/eval", post(browser_run_eval))
         // Browser extension pairing — unauthenticated start/status are still
         // loopback + extension-origin gated; approve/pending use normal API auth.
@@ -3768,6 +4042,94 @@ mod tests {
                 "snapshot script lost field '{field}' from return shape"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_script_stamps_actionable_refs() {
+        // The whole point of the ref scheme: actionable elements get a
+        // `data-sp-ref` attribute that /act resolves, and the count is
+        // returned so the agent knows how many it can target.
+        assert!(
+            SNAPSHOT_SCRIPT.contains("data-sp-ref"),
+            "snapshot no longer stamps element refs"
+        );
+        assert!(
+            SNAPSHOT_SCRIPT.contains("count"),
+            "snapshot no longer reports the ref count"
+        );
+        // Refs must be re-numbered each call so eN matches the latest tree.
+        assert!(
+            SNAPSHOT_SCRIPT.contains("removeAttribute('data-sp-ref')"),
+            "snapshot must clear stale refs before re-stamping"
+        );
+    }
+
+    #[test]
+    fn snapshot_script_filters_unrendered_nodes() {
+        // Zero-size / offscreen / transparent nodes are dropped via geometry,
+        // not just the display/visibility CSS checks.
+        assert!(
+            SNAPSHOT_SCRIPT.contains("getBoundingClientRect"),
+            "snapshot lost geometry-based visibility filtering"
+        );
+    }
+
+    #[test]
+    fn snapshot_script_detects_spa_clickables() {
+        // div/span "buttons" are how most SPA frameworks ship interactivity;
+        // missing them makes the snapshot useless on real apps.
+        assert!(SNAPSHOT_SCRIPT.contains("isContentEditable"));
+        assert!(SNAPSHOT_SCRIPT.contains("cursor"));
+        assert!(SNAPSHOT_SCRIPT.contains("onclick"));
+    }
+
+    // -- /act script -------------------------------------------------------
+
+    #[test]
+    fn act_script_resolves_by_ref_attribute() {
+        let s = browser_act_script("e7", "click", None);
+        assert!(s.contains("data-sp-ref"), "act must resolve elements by ref");
+        assert!(s.contains("\"e7\""), "act must embed the requested ref");
+        assert!(s.contains("CSS.escape"), "act selector must be escaped");
+    }
+
+    #[test]
+    fn act_script_fill_uses_native_setter_and_events() {
+        // Assigning .value alone is dropped by React's synthetic event layer;
+        // the native setter + input/change is what actually registers.
+        let s = browser_act_script("e3", "fill", Some("hello"));
+        assert!(s.contains("setNativeValue"));
+        assert!(s.contains("'input'") && s.contains("'change'"));
+        assert!(s.contains("\"hello\""));
+    }
+
+    #[test]
+    fn act_script_json_encodes_value_no_breakout() {
+        // A page-supplied value must not be able to break out of the JS
+        // string literal and inject code.
+        let evil = "\"); alert(1); (\"";
+        let s = browser_act_script("e1", "fill", Some(evil));
+        let encoded = serde_json::to_string(evil).unwrap();
+        assert!(
+            s.contains(&encoded),
+            "value must be JSON-encoded into the script"
+        );
+        assert!(
+            !s.contains("alert(1); (\"\n"),
+            "raw value leaked into script body"
+        );
+    }
+
+    #[test]
+    fn browser_description_advertises_act_by_ref() {
+        let s = format_browser_description("base", "owned-default");
+        assert!(s.contains("/act"), "description must teach the /act endpoint");
+        assert!(s.contains("ref"), "description must mention element refs");
+        // /act sits between snapshot and the eval escape hatch.
+        let snap = s.find("/snapshot").unwrap();
+        let act = s.find("/act").unwrap();
+        let eval_pos = s.find("/eval").unwrap();
+        assert!(snap < act && act < eval_pos, "act ordering regressed: {s}");
     }
 
     /// Records the owner each `eval_with_owner` call receives so the route test

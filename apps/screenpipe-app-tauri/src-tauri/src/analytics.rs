@@ -129,7 +129,9 @@ impl AnalyticsManager {
     /// Send a $create_alias event so PostHog merges the email-based identity
     /// (used by the website download endpoint) with this app's analytics UUID.
     pub async fn send_alias(&self, alias: &str) {
-        if !*self.enabled.lock().await || alias.is_empty() {
+        // PostHog rejects events without a non-empty distinct_id (400). Skip
+        // rather than firing a malformed request when analytics_id isn't set.
+        if !*self.enabled.lock().await || alias.is_empty() || self.distinct_id.is_empty() {
             return;
         }
         let url = format!("{}/capture/", self.api_host);
@@ -150,6 +152,14 @@ impl AnalyticsManager {
         properties: Option<serde_json::Value>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !*self.enabled.lock().await {
+            return Ok(());
+        }
+
+        // PostHog rejects events without a non-empty distinct_id (400 Bad
+        // Request). This happens when analytics_id isn't populated yet at boot
+        // — skip rather than firing a malformed request that just logs an error.
+        if self.distinct_id.is_empty() {
+            warn!("analytics: skipping '{event}' event — distinct_id (analytics_id) is empty");
             return Ok(());
         }
 

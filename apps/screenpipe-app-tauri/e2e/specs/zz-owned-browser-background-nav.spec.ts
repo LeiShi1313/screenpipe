@@ -113,6 +113,7 @@ const OWN_CHAT = "33333333-cccc-cccc-cccc-cccccccccccc";
 const FOREIGN_OWNER = "pipe:e2e-background-poster";
 const CHATS_DIR = join(homedir(), ".screenpipe", "chats");
 const FOREIGN_URL = "https://example.com/e2e-foreign-pipe";
+const OWN_URL = "https://example.com/e2e-own-chat";
 const BROWSER_CHAT_A = "44444444-dddd-dddd-dddd-dddddddddddd";
 const BROWSER_CHAT_B = "55555555-eeee-eeee-eeee-eeeeeeeeeeee";
 const PLAIN_CHAT = "66666666-ffff-ffff-ffff-ffffffffffff";
@@ -408,6 +409,50 @@ describe("Owned browser — per-chat navigation ownership", function () {
       await browser.pause(t(2_500));
       expect(await invokeOrThrow<boolean>("e2e_owned_browser_visible")).toBe(
         false,
+      );
+    },
+  );
+
+  // Positive counterpart: the reported reveal bug. A navigation tagged with the
+  // ON-SCREEN chat's own owner MUST reveal the browser — the agent navigated but
+  // the sidebar never opened. Drives from the search window because revealing
+  // attaches the native child to `home` (which destroys home's WebDriver handle);
+  // visibility is read via the global `e2e_owned_browser_visible` probe.
+  (canDriveOwnedBrowser ? it : it.skip)(
+    "reveals the on-screen chat's own agent navigation",
+    async () => {
+      await installSessionCapture();
+      await seedChat(OWN_CHAT, "(e2e) owned-browser reveal probe");
+      await browser.pause(t(200));
+      await loadChatIntoHome(OWN_CHAT);
+      await waitForActiveConversation(OWN_CHAT);
+
+      await showWindow({ Search: { query: null } });
+      await waitForWindowHandle("search", t(10_000));
+      await browser.switchToWindow("search");
+      await browser.pause(t(800));
+
+      // Hidden baseline.
+      await invokeOrThrow("owned_browser_hide");
+      expect(await invokeOrThrow<boolean>("e2e_owned_browser_visible")).toBe(
+        false,
+      );
+
+      // Navigate tagged with OWN_CHAT — the agent of the chat on screen. The
+      // ownership gate must let it through and reveal the panel.
+      const { port, key } = await getLocalApiConfig();
+      const status = await postNavigateAs(port, key, OWN_URL, OWN_CHAT);
+      expect(status).toBe(200);
+
+      // Reveal is async (event → setState → ResizeObserver → set_bounds), so poll.
+      await browser.waitUntil(
+        async () =>
+          (await invokeOrThrow<boolean>("e2e_owned_browser_visible")) === true,
+        {
+          timeout: t(10_000),
+          interval: 300,
+          timeoutMsg: "owned browser did not reveal for its own chat's navigation",
+        },
       );
     },
   );

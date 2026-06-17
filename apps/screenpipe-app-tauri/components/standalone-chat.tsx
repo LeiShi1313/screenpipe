@@ -10118,6 +10118,10 @@ export function StandaloneChat({
           positioned over the placeholder div inside this component. */}
       <BrowserSidebar
         conversationId={conversationId}
+        // Session id the agent process runs under (the value tagged as the
+        // navigation `owner` via x-screenpipe-session). Lets the sidebar reveal
+        // this chat's own agent navigations even if `conversationId` state lags.
+        agentSessionId={piSessionIdRef.current}
         filePreview={filePreview}
         onCloseFilePreview={closeFilePreview}
         onReplaceFilePreviewPath={openFilePreview}

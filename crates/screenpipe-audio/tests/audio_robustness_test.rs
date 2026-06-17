@@ -122,7 +122,10 @@ fn resample_common_device_rates_stay_finite() {
         match resample(&input, from, SR) {
             Ok(out) => {
                 assert!(!out.is_empty(), "resample {from}->{SR} produced empty");
-                assert!(all_finite(&out), "resample {from}->{SR} produced non-finite");
+                assert!(
+                    all_finite(&out),
+                    "resample {from}->{SR} produced non-finite"
+                );
             }
             Err(e) => panic!("resample {from}->{SR} errored on valid audio: {e}"),
         }

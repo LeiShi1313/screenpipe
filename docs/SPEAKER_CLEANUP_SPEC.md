@@ -120,9 +120,115 @@ inbox-zero state so the screen isn't a wall of unknowns.
 | typed ignore (media / background / noise) | **extend** | generalize the `hallucination` flag into a category |
 | reassign + propagate, undo, merge, similar, mark-noise | **exists** | reuse as-is |
 
+---
+
+## ai-assisted identify — map speakers from screen context
+
+audio-only diarization can't tell alex from a youtube host from a barista — they're
+just voice vectors. but screenpipe has the **screen frame at the same timestamp**, and
+the screen usually names the speaker outright (zoom's active-speaker tile), flags media
+(a youtube video playing), or flags background (no meeting app focused). an **✦ identify
+with AI** button — or a background pipe — turns that context into names. this is the part
+no audio-only tool can copy, because they don't have the frames.
+
+### tiered, so it stays cheap and private
+1. **text first (no model call)** — at each clip's timestamp, read `accessibility_text`
+   of the focused window (zoom/meet/teams tiles already contain participant names),
+   `is_input_device`, app + window title, and calendar attendees. resolves the easy
+   majority deterministically.
+2. **VLM for the rest** — only ambiguous clips go to **gemma4-e4b** (the private video
+   model already running in the tinfoil enclave / locally — the same one `vision-clone`
+   uses). it *looks* at the frame: who's highlighted, is this a video, is this even a
+   meeting.
+3. **confirm, don't auto-apply** — output is a proposal with the resolved name, a
+   one-line "why", an **evidence frame**, and a match score. the human rubber-stamps;
+   everything is undoable. runs as a background pipe → only the unsure ones surface.
+   that's the scalable part: labeling stops being manual.
+
+### before → after
+
+| before (today) | after (AI-mapped) |
+|---|---|
+| ![before](https://raw.githubusercontent.com/screenpipe/screenpipe/assets/speaker-cleanup-mockups/proto-before.png) | ![after](https://raw.githubusercontent.com/screenpipe/screenpipe/assets/speaker-cleanup-mockups/proto-after.png) |
+
+one stuck "unknown #7 · 29 clips" with only rename/merge → 2 people named from the zoom
+tile + calendar, media & room split off, each carrying the frame it was inferred from.
+
+### walkthrough
+
+![walkthrough](https://raw.githubusercontent.com/screenpipe/screenpipe/assets/speaker-cleanup-mockups/walkthrough.gif)
+
+(also as [mp4](https://raw.githubusercontent.com/screenpipe/screenpipe/assets/speaker-cleanup-mockups/walkthrough.mp4))
+
+### privacy
+frames are the most sensitive surface screenpipe has — this never ships them to a third
+party. gemma4-e4b runs in the tinfoil enclave or fully local, matching the local-first
+promise the enterprise ICP buys on.
+
+### what it needs
+- the tiered resolver as a pipe: clip timestamp → frame/a11y join (exists: `frames`,
+  `accessibility_text`, `get-frame-elements`) → name proposal
+- the selected AI preset drives which model runs (cloud / ollama / enclave)
+- reuses `/speakers/split`, `reassign`, typed-ignore from the manual flow — the AI just
+  pre-fills the same confirm screen
+
+---
+
 ## build order
 
 1. `/speakers/split` + per-row split (#2) + multi-select (#5) — answers #4251 directly, smallest surface.
 2. typed ignore + source-aware "ignore as media" (#a) — kills the noise that causes the over-cluster.
 3. auto-split proposal (#3) — the high-value step once split exists.
 4. surface match distance → outliers (#b) + confidence sorting.
+5. ✦ identify-with-AI pipe (tiered text→VLM) feeding the same confirm screen — the scalable endgame.
+
+---
+
+## testing
+
+the interactive prototype of the AI flow is driven **end-to-end with playwright** — 16
+assertions, all green. it's the proof the flow hangs together before any app code ships:
+
+```
+✓ before: mixed 29-clip group is shown
+✓ before: "identify with AI" button present
+✓ identify: shows reading-screen-context state
+✓ identify: surfaces the privacy guarantee
+✓ after: resolved a real name (alex rivera) from the zoom tile
+✓ after: used a calendar attendee as a name source
+✓ after: flagged the media/youtube group to ignore
+✓ after: flagged café/background as room noise
+✓ after: per-group actions present (×4)
+✓ done: 2 people named automatically · result is undoable · media hidden
+```
+
+when the real UI lands, the app-level WDIO spec mirrors the existing
+[`e2e/specs/settings-sections.spec.ts`](../apps/screenpipe-app-tauri/e2e/specs/settings-sections.spec.ts)
+— `data-testid`-driven so copy changes never break it — plus a `coverage-map.json` entry
+(a new spec without one reds the coverage report on every platform):
+
+```ts
+// e2e/specs/speakers-cleanup.spec.ts
+describe('speaker cleanup', () => {
+  before(async () => { await waitForAppReady(); await openHomeWindow(); await openSettings(); });
+
+  it('splits an over-merged group into a new speaker', async () => {
+    await (await $('[data-testid="settings-nav-speakers"]')).click();
+    await (await $('[data-testid="cluster-unknown"] [data-testid="select-clip"]')).click();
+    await (await $('[data-testid="bulk-split"]')).click();
+    expect(await $('[data-testid="speaker-new"]')).toBeExisting();
+  });
+
+  it('identify-with-AI proposes names + evidence, applies on confirm', async () => {
+    await (await $('[data-testid="btn-identify"]')).click();
+    await (await $('[data-testid="panel-after"]')).waitForExist({ timeout: 15_000 });
+    await (await $('[data-testid="btn-apply"]')).click();
+    expect(await $('[data-testid="panel-done"]')).toBeExisting();
+  });
+
+  it('undo restores the original grouping', async () => {
+    await (await $('[data-testid="undo"]')).click();
+    expect(await $('[data-testid="cluster-unknown"]')).toBeExisting();
+  });
+});
+```

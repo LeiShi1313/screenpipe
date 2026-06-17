@@ -47,6 +47,7 @@ import {
   waitForTestId,
   t,
 } from "../helpers/test-utils.js";
+import { invoke } from "../helpers/tauri.js";
 
 const FAKE_TOKEN = "e2e-fake-token-logout-resurrect";
 const FAKE_EMAIL = "e2e-logout@screenpipe.test";
@@ -190,6 +191,36 @@ async function restoreFetchAllWindows(): Promise<void> {
   if (start) await browser.switchToWindow(start).catch(() => {});
 }
 
+/** After logout, kill every PEER-window path that could re-hydrate the fake
+ *  token and 200-resurrect the session, WITHOUT touching the home window's slow
+ *  /api/user mock (that in-flight loadUser is the thing under test).
+ *
+ *  The all-windows mock (before/establishStableLogin) makes non-home windows
+ *  answer /api/user 200. So a peer's bounded auto-refresh loadUser — if it fires
+ *  a beat after the logout broadcast — writes the fake user back and the session
+ *  reappears. That is the macOS/webkit-only flake at the final assertion
+ *  (Linux/Windows happen to land the peer fetch outside the wait window).
+ *
+ *  Clear the secret-store token so peers re-hydrate null (no loadUser fires at
+ *  all), and restore real fetch on every non-home window so any already-in-flight
+ *  peer loadUser 401s (reinforcing logout) instead of resurrecting. Home keeps
+ *  its slow mock, so its pending loadUser still resolves and must be rejected by
+ *  the auth-generation guard — the actual regression this spec covers. */
+async function neutralizePeerResurrection(): Promise<void> {
+  await invoke("set_cloud_token", { token: null }).catch(() => {});
+  const home = await browser.getWindowHandle().catch(() => null);
+  for (const handle of await browser.getWindowHandles().catch(() => [] as string[])) {
+    if (handle === home) continue;
+    try {
+      await browser.switchToWindow(handle);
+      await restoreFetch();
+    } catch {
+      // window may have closed mid-iteration; best-effort
+    }
+  }
+  if (home) await browser.switchToWindow(home).catch(() => {});
+}
+
 async function userFetchCalls(): Promise<number> {
   return (await browser.execute(
     () => ((window as unknown as Record<string, unknown>).__E2E_USER_CALLS as number) || 0,
@@ -330,6 +361,14 @@ describe("Logout is not resurrected by an in-flight loadUser", function () {
       interval: 200,
       timeoutMsg: "logout did not clear the session",
     });
+
+    // Logout cleared the session. Before waiting out the slow fetch, remove the
+    // PEER-window resurrection sources (secret token + non-home mocks) so the
+    // only thing that can still flip the session is home's guarded slow
+    // loadUser — exactly what this spec asserts must NOT write back. Without
+    // this, a peer's 200 re-hydration intermittently resurrected the session on
+    // macOS/webkit and reded the final assertion.
+    await neutralizePeerResurrection();
 
     // Wait past the slow fetch so the in-flight loadUser resolves. THE core
     // assertion: it must not write the user back. On the buggy build this

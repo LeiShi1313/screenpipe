@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use screenpipe_redact::{
     adapters::regex::RegexRedactor,
+    pipeline::Pipeline,
     worker::{TargetTable, Worker, WorkerConfig, ALL_TARGET_TABLES},
-    Redactor,
+    Pseudonymizer, Redactor,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
@@ -309,4 +310,80 @@ async fn worker_redacts_frames_full_text_search_surface() {
         redacted
     );
     assert!(when.is_some(), "full_text_redacted_at must be stamped");
+}
+
+/// Issue #4206 (part A): with the consistent-pseudonym pipeline wired
+/// in, the worker overwrites each PII span with a stable per-install
+/// token. The same secret in two rows must yield the *same* token (so it
+/// stays correlatable), a different secret a different token, and the
+/// raw value must be gone — no `token -> value` mapping is stored.
+#[tokio::test]
+async fn worker_writes_consistent_pseudonym_tokens() {
+    let pool = setup_db().await;
+    // Rows 1 & 2 share a secret; row 3 has a different one.
+    sqlx::query(
+        "INSERT INTO audio_transcriptions (transcription) VALUES ('key is sk-proj-AbCdEf123456GhIjKlMnOp today')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audio_transcriptions (transcription) VALUES ('reuse sk-proj-AbCdEf123456GhIjKlMnOp again')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audio_transcriptions (transcription) VALUES ('other sk-proj-ZyXwVu987654TsRqPoNmLk now')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Regex-only pipeline (no model needed: secrets are caught
+    // deterministically) with pseudonyms enabled via a fixed key.
+    let pseudo = Arc::new(Pseudonymizer::from_key([42u8; 32]));
+    let pipeline = Pipeline::regex_only().with_pseudonyms(Some(pseudo));
+    let redactor = Arc::new(pipeline) as Arc<dyn Redactor>;
+    let cfg = WorkerConfig {
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::AudioTranscription],
+        ..Default::default()
+    };
+    let worker = Worker::new(pool.clone(), redactor, cfg);
+    let handle = worker.clone().spawn();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let texts: Vec<String> =
+        sqlx::query("SELECT transcription FROM audio_transcriptions ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>(0))
+            .collect();
+    assert_eq!(texts.len(), 3);
+
+    // No raw secret survives anywhere.
+    for t in &texts {
+        assert!(
+            !t.contains("sk-proj-AbCdEf123456GhIjKlMnOp")
+                && !t.contains("sk-proj-ZyXwVu987654TsRqPoNmLk"),
+            "raw secret survived: {t:?}"
+        );
+    }
+
+    let tok = |s: &str| {
+        let start = s.find("[SECRET_").expect("a pseudonym token");
+        let end = s[start..].find(']').expect("token close") + start + 1;
+        s[start..end].to_string()
+    };
+    let t1 = tok(&texts[0]);
+    let t2 = tok(&texts[1]);
+    let t3 = tok(&texts[2]);
+    assert_eq!(t1, t2, "same secret must map to the same token across rows");
+    assert_ne!(t1, t3, "different secrets must map to different tokens");
 }

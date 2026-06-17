@@ -2749,6 +2749,16 @@ piiBackend?: string;
  */
 piiRedactionLabels?: string[];
 /**
+ * Render redacted PII as **consistent pseudonyms** instead of static
+ * `[LABEL]` tags when `asyncPiiRedaction` is on. Same value → same
+ * stable token (e.g. `[PERSON_1a2b3c4d]`), so the timeline stays
+ * correlatable without exposing the value. Irreversible: a one-way
+ * keyed hash with a random per-install key, no `token -> value`
+ * store. Off by default. See issue #4206 and `screenpipe-redact`'s
+ * `Pseudonymizer`.
+ */
+piiRedactionPseudonyms?: boolean;
+/**
  * Screenpipe cloud user ID. Empty string means not logged in.
  * Kept as String (not Option) to match existing store.bin schema.
  */

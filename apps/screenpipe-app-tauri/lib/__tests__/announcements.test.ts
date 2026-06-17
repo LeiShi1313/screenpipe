@@ -9,6 +9,7 @@ import {
   loadDismissedIds,
   markDismissed,
   parseAnnouncement,
+  pickAnnouncement,
   saveDismissedIds,
   selectAnnouncement,
 } from "@/lib/announcements";
@@ -132,6 +133,38 @@ describe("selectAnnouncement", () => {
   });
   it("returns null for an invalid payload", () => {
     expect(selectAnnouncement({ id: "x" }, [], NOW)).toBeNull();
+  });
+});
+
+describe("pickAnnouncement (source priority)", () => {
+  const triggered = parseAnnouncement({ ...VALID, id: "triggered", surface: "card" });
+  const preview = parseAnnouncement({ ...VALID, id: "preview", surface: "banner" });
+  const flagRaw = { ...VALID, id: "flag" };
+
+  it("prefers triggered over preview and flag", () => {
+    expect(pickAnnouncement(triggered, preview, flagRaw, [], NOW)?.id).toBe("triggered");
+  });
+  it("prefers preview over flag when nothing is triggered", () => {
+    expect(pickAnnouncement(null, preview, flagRaw, [], NOW)?.id).toBe("preview");
+  });
+  it("falls back to the flag when nothing is triggered or previewed", () => {
+    expect(pickAnnouncement(null, null, flagRaw, [], NOW)?.id).toBe("flag");
+  });
+  it("triggered bypasses the dismissed set (explicit push always shows)", () => {
+    expect(pickAnnouncement(triggered, null, flagRaw, ["triggered"], NOW)?.id).toBe("triggered");
+  });
+  it("preview bypasses the dismissed set", () => {
+    expect(pickAnnouncement(null, preview, flagRaw, ["preview"], NOW)?.id).toBe("preview");
+  });
+  it("the flag honors the dismissed set", () => {
+    expect(pickAnnouncement(null, null, flagRaw, ["flag"], NOW)).toBeNull();
+  });
+  it("an expired triggered push suppresses lower sources (no fall-through)", () => {
+    const expiredTriggered = parseAnnouncement({ ...VALID, id: "t", expiresAt: "2026-06-17T11:00:00.000Z" });
+    expect(pickAnnouncement(expiredTriggered, preview, flagRaw, [], NOW)).toBeNull();
+  });
+  it("returns null when every source is empty", () => {
+    expect(pickAnnouncement(null, null, null, [], NOW)).toBeNull();
   });
 });
 

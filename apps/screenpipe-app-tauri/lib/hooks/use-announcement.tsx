@@ -14,7 +14,7 @@ import {
   loadPreviewAnnouncement,
   markDismissed,
   parseAnnouncement,
-  selectAnnouncement,
+  pickAnnouncement,
 } from "@/lib/announcements";
 
 /**
@@ -113,15 +113,12 @@ export function useAnnouncement(): UseAnnouncementResult {
     return () => unlisten?.();
   }, []);
 
-  const announcement = useMemo(() => {
-    const now = Date.now();
-    // An explicit runtime push (POST /notify) wins and bypasses the dismissed
-    // set so the trigger is reliable. A QA preview override (localStorage) is
-    // next. Otherwise fall back to the PostHog flag, which honors dismissal.
-    if (triggered) return selectAnnouncement(triggered, [], now);
-    if (preview) return selectAnnouncement(preview, [], now);
-    return selectAnnouncement(payload, dismissedIds, now);
-  }, [triggered, preview, payload, dismissedIds]);
+  // Priority (triggered > preview > flag) lives in pickAnnouncement so it's
+  // pure + unit-tested; the hook just feeds it the three sources.
+  const announcement = useMemo(
+    () => pickAnnouncement(triggered, preview, payload, dismissedIds, Date.now()),
+    [triggered, preview, payload, dismissedIds],
+  );
 
   // Fire `announcement_shown` once per id.
   useEffect(() => {

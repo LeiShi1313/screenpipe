@@ -185,6 +185,31 @@ export function selectAnnouncement(
   return announcement;
 }
 
+/**
+ * Pick which source's announcement to show, in priority order:
+ *   1. `triggered` — an explicit runtime push (POST /notify)
+ *   2. `preview`   — a QA localStorage override
+ *   3. `flag`      — the remote PostHog payload
+ *
+ * The explicit/dev sources (1, 2) bypass the dismissed set so they always
+ * surface; only the remote flag (3) honors per-id dismissal. A present-but-
+ * unshowable source (expired/invalid) resolves to `null` and does NOT fall
+ * through to a lower-priority source — an explicit push intentionally
+ * suppresses the flag while it is active. Pure, so the hook stays a thin
+ * state wiring around this.
+ */
+export function pickAnnouncement(
+  triggered: Announcement | null,
+  preview: Announcement | null,
+  flag: unknown,
+  dismissedIds: readonly string[],
+  now: number,
+): Announcement | null {
+  if (triggered) return selectAnnouncement(triggered, [], now);
+  if (preview) return selectAnnouncement(preview, [], now);
+  return selectAnnouncement(flag, dismissedIds, now);
+}
+
 // ── dismissal persistence (localStorage, SSR/Tauri-static-export safe) ──────
 
 export function loadDismissedIds(): string[] {

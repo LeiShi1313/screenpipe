@@ -8,9 +8,11 @@ import { Clock, Lightbulb, Megaphone, X, type LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
+import { useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -19,6 +21,7 @@ import { notificationUrlTransform } from "@/components/markdown";
 import { cn } from "@/lib/utils";
 import { type Announcement, type AnnouncementKind } from "@/lib/announcements";
 import { useAnnouncement } from "@/lib/hooks/use-announcement";
+import { isPrimaryWindow } from "@/lib/utils/is-primary-window";
 
 const KIND_META: Record<AnnouncementKind, { icon: LucideIcon; label: string }> = {
   // grayscale, differentiated by shape not color (DESIGN.md).
@@ -114,6 +117,11 @@ function AnnouncementModal({
           <KindChip kind={announcement.kind} />
           <DialogTitle>{announcement.title}</DialogTitle>
         </DialogHeader>
+        {/* screen-reader description (and silences radix's missing-description
+            warning); the visible body carries the same content. */}
+        <DialogDescription className="sr-only">
+          {announcement.kind} announcement: {announcement.title}
+        </DialogDescription>
         <AnnouncementBody body={announcement.body} />
         <DialogFooter className="mt-2 gap-2 sm:justify-start">
           {cta && (
@@ -152,6 +160,8 @@ function AnnouncementBanner({
 }) {
   const { icon: Icon, label } = KIND_META[announcement.kind];
   const { dismissible, cta } = announcement;
+  // never trap the user: keep the close affordance unless there's a cta to act on.
+  const showClose = dismissible || !cta;
   const atBottom = announcement.position === "bottom";
   return (
     <div
@@ -186,7 +196,7 @@ function AnnouncementBanner({
             {cta.label}
           </Button>
         )}
-        {dismissible && (
+        {showClose && (
           <button
             type="button"
             aria-label="dismiss"
@@ -225,6 +235,7 @@ function AnnouncementCard({
   onCta: () => void;
 }) {
   const { dismissible, cta } = announcement;
+  const showClose = dismissible || !cta;
   const pos = CARD_POSITION_CLASS[announcement.position ?? "bottom-right"];
   return (
     <div
@@ -238,7 +249,7 @@ function AnnouncementCard({
     >
       <div className="mb-2 flex items-start justify-between gap-2">
         <KindChip kind={announcement.kind} />
-        {dismissible && (
+        {showClose && (
           <button
             type="button"
             aria-label="dismiss"
@@ -272,12 +283,30 @@ function AnnouncementCard({
 
 /**
  * Global host for remote announcements. Reads the current announcement (from
- * the PostHog `app-announcement` flag) and renders it as a centered modal, a
- * full-width banner (top/bottom), or a corner card — driven by the payload's
- * `surface` + `position`. Mounted once in app/layout.tsx. Renders nothing when
- * there is no undismissed announcement, so it is free when idle.
+ * the PostHog `app-announcement` flag, a `POST /notify` push, or a QA preview)
+ * and renders it as a centered modal, a full-width banner (top/bottom), or a
+ * corner card — driven by the payload's `surface` + `position`. Mounted once in
+ * app/layout.tsx.
+ *
+ * Only the primary window participates: the root layout also mounts in the
+ * `chat` and hidden `notification-panel` webviews, so rendering everywhere
+ * would show duplicate modals and multi-count `announcement_shown`. Gating
+ * here (rather than inside the hook) keeps the hook — its event listener and
+ * analytics — from running at all in secondary windows. Renders nothing when
+ * idle, so it is free.
  */
 export function AnnouncementHost() {
+  const [primary, setPrimary] = useState(false);
+  useEffect(() => {
+    // window label is client-only; check after mount (static export safe).
+    setPrimary(isPrimaryWindow());
+  }, []);
+
+  if (!primary) return null;
+  return <AnnouncementHostInner />;
+}
+
+function AnnouncementHostInner() {
   const { announcement, dismiss, activateCta } = useAnnouncement();
   if (!announcement) return null;
 

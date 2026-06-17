@@ -16,6 +16,7 @@ import {
   Trash2,
   ChevronDown,
   ChevronRight,
+  Clock,
   RefreshCw,
   Loader2,
   ExternalLink,
@@ -23,6 +24,7 @@ import {
   MoreHorizontal,
   Plus,
   ArrowRight,
+  GitFork,
   Search,
   Share2,
   Link,
@@ -304,6 +306,20 @@ after analyzing, show me the improved pipe.md and explain what you changed and w
 
 function buildOptimizeDisplayLabel(pipeName: string): string {
   return `Optimize pipe: ${pipeName.trim()}`;
+}
+
+// "remix" = make your own version of an existing pipe. We don't mutate the
+// original — the agent reads it and creates a NEW customized pipe. Framing
+// authoring as "customize a working thing" is the lever that turns installers
+// into creators (see Replit remix / Notion duplicate).
+function buildRemixPrompt(pipeName: string): string {
+  return `i want to remix my existing pipe "${pipeName}" into a new one.
+
+## your task
+1. read the original pipe: ~/.screenpipe/pipes/${pipeName}/pipe.md
+2. ask me what i want to change or do differently
+3. create a NEW pipe (a new name + folder) with those changes — do NOT modify or overwrite "${pipeName}"
+4. install and enable the new pipe, then tell me what it does.`;
 }
 
 function parsePipeError(stderr: string): {
@@ -2059,7 +2075,7 @@ export function PipesSection() {
                       <button
                         key={ex.label}
                         onClick={() => startPipeGeneration(ex.prompt, "empty_state_example")}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border border-border bg-muted/50 text-xs hover:bg-muted transition-colors"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 border border-border bg-muted/50 text-xs hover:bg-muted transition-colors"
                       >
                         {ex.label}
                       </button>
@@ -2072,7 +2088,7 @@ export function PipesSection() {
                       detail: { tab: 'discover' }
                     }));
                   }}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-md border border-border text-sm font-medium hover:bg-muted transition-colors"
+                  className="inline-flex items-center gap-2 px-4 py-2 border border-border text-sm font-medium hover:bg-muted transition-colors"
                 >
                   or browse the pipe store →
                 </button>
@@ -2081,7 +2097,7 @@ export function PipesSection() {
           </CardContent>
         </Card>
       ) : (
-        <div className="border border-border rounded-md divide-y divide-border">
+        <div className="flex flex-col gap-2">
           {filteredPipes.map((pipe) => {
             const recentExecs = pipeExecutions[pipe.config.name] || [];
             const isRunning = pipe.is_running || runningPipe === pipe.config.name;
@@ -2109,20 +2125,39 @@ export function PipesSection() {
                     : "idle";
 
             return (
-            <div key={pipe.config.name} className={cn("group", !pipe.config.enabled && "opacity-50")}>
-              {/* Table row */}
-              <div className="flex items-center gap-3 px-4 py-2.5 hover:bg-accent/50 transition-colors">
-                {/* Status indicator — monochrome, brand-aligned */}
-                <span
-                  className={cn(
-                    "h-1.5 w-1.5 shrink-0",
-                    lastStatus === "ok" && "bg-foreground",
-                    lastStatus === "running" && "bg-foreground animate-pulse",
-                    lastStatus === "error" && "border border-foreground bg-transparent",
-                    lastStatus === "idle" && "bg-muted-foreground/30",
-                  )}
-                  title={lastStatus}
-                />
+            <div key={pipe.config.name} className={cn("group border border-border hover:bg-accent/40 transition-colors", !pipe.config.enabled && "opacity-60")}>
+              {/* Card top line — the whole row is the expand affordance:
+                  click anywhere (except the star / badges) to open runs,
+                  config and logs. Keyboard-operable via role=button. */}
+              <div
+                role="button"
+                tabIndex={0}
+                aria-expanded={expanded === pipe.config.name}
+                onClick={() => toggleExpand(pipe.config.name)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    toggleExpand(pipe.config.name);
+                  }
+                }}
+                title={expanded === pipe.config.name ? "collapse" : "open — runs, config, logs"}
+                className="flex items-center gap-2.5 px-4 pt-3 pb-1 cursor-pointer select-none focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                {/* Disclosure chevron — the row's "you can open this" cue.
+                    Doubles as a status tint: red when the last run failed,
+                    pulses while running. Replaces the old standalone dot so
+                    status lives in one obvious place, not a mystery square. */}
+                {expanded === pipe.config.name ? (
+                  <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-colors" />
+                ) : (
+                  <ChevronRight
+                    className={cn(
+                      "h-4 w-4 shrink-0 text-muted-foreground/50 group-hover:text-foreground transition-colors",
+                      lastStatus === "error" && "text-destructive group-hover:text-destructive",
+                      lastStatus === "running" && "text-foreground animate-pulse",
+                    )}
+                  />
+                )}
 
                 {/* Favorite toggle — per-machine preference persisted via /pipes/favorites */}
                 <button
@@ -2148,13 +2183,18 @@ export function PipesSection() {
                   />
                 </button>
 
-                {/* Pipe name — click to expand */}
-                <button
-                  onClick={() => toggleExpand(pipe.config.name)}
-                  className="text-sm font-medium truncate text-left min-w-0 flex-1 hover:underline"
-                >
-                  {pipe.config.name}
-                </button>
+                {/* Pipe name + description */}
+                <div className="flex flex-col min-w-0 flex-1 gap-0.5">
+                  <span className="text-sm font-medium truncate" title={pipe.config.name}>
+                    {pipe.config.name}
+                  </span>
+                  {typeof pipe.config.description === "string" &&
+                    (pipe.config.description as string).trim() && (
+                      <span className="text-xs text-muted-foreground truncate">
+                        {(pipe.config.description as string).trim()}
+                      </span>
+                    )}
+                </div>
 
                 {/* Team sharing badges */}
                 {sharedByMe.has(pipe.config.name) && (
@@ -2234,9 +2274,11 @@ export function PipesSection() {
                   </button>
                 )}
 
-                {/* Schedule + triggers */}
+                {/* Schedule + triggers — the Clock icon marks this as the
+                    cadence (e.g. "4h" = runs every 4h), so it can't be misread
+                    as the last-run time in the column beside it. */}
                 <span
-                  className="text-xs text-muted-foreground shrink-0 text-right font-mono truncate max-w-[180px]"
+                  className="inline-flex items-center justify-end gap-1 text-xs text-muted-foreground shrink-0 text-right font-mono truncate max-w-[180px]"
                   title={[
                     pipe.config.trigger?.events?.length || pipe.config.trigger?.custom?.length
                       ? `triggers: ${[...(pipe.config.trigger?.events || []), ...(pipe.config.trigger?.custom || [])].join(", ")}`
@@ -2244,9 +2286,16 @@ export function PipesSection() {
                     pipe.config.schedule && pipe.config.schedule !== "manual" ? `schedule: ${humanizeSchedule(pipe.config.schedule)}` : "",
                   ].filter(Boolean).join(" | ") || "manual"}
                 >
-                  {(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0) > 0
-                    ? `› ${(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)} trigger${((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 1 ? "s" : ""}`
-                    : humanizeSchedule(pipe.config.schedule)}
+                  {(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0) > 0 ? (
+                    `› ${(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)} trigger${((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 1 ? "s" : ""}`
+                  ) : pipe.config.schedule && pipe.config.schedule !== "manual" ? (
+                    <>
+                      <Clock className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+                      {humanizeSchedule(pipe.config.schedule)}
+                    </>
+                  ) : (
+                    "manual"
+                  )}
                   {(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0) > 0 && pipe.config.schedule && pipe.config.schedule !== "manual" ? (
                     <span className="text-muted-foreground/50"> + {humanizeSchedule(pipe.config.schedule)}</span>
                   ) : null}
@@ -2271,12 +2320,60 @@ export function PipesSection() {
                   ) : lastExec?.started_at ? (
                     relativeTime(lastExec.started_at)
                   ) : (
-                    "—"
+                    <span className="text-muted-foreground/50">never run</span>
                   )}
                 </span>
+              </div>
 
-                {/* Hover-reveal actions */}
-                <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+              {/* Action bar — always visible, brand-aligned (sharp, monochrome).
+                  edit + remix are the install->create lever. */}
+              <div className="flex items-center gap-1 px-3 pb-2.5 pt-0.5">
+                {/* edit with ai — opens a chat to tweak this pipe in plain english */}
+                {!isReceivedTeamPipe(pipe) && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 gap-1.5 px-2 shrink-0 text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      posthog.capture("pipe_edit_started", { source: "row_button" });
+                      navigateHomeAndPrefill({
+                        context: "the user wants to edit their pipe",
+                        prompt: buildOptimizePrompt(pipe.config.name),
+                        displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
+                        autoSend: true,
+                      });
+                    }}
+                    title="edit this pipe with ai — describe what you want to change"
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    edit
+                  </Button>
+                )}
+
+                {/* remix — create a NEW pipe based on this one and customize it */}
+                {!isReceivedTeamPipe(pipe) && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 gap-1.5 px-2 shrink-0 text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      posthog.capture("pipe_remix_started", { source: "row_button" });
+                      navigateHomeAndPrefill({
+                        context: "the user wants to remix their pipe into a new one",
+                        prompt: buildRemixPrompt(pipe.config.name),
+                        displayLabel: `Remix pipe: ${pipe.config.name}`,
+                        autoSend: true,
+                      });
+                    }}
+                    title="remix — create a new pipe based on this one and customize it"
+                  >
+                    <GitFork className="h-3.5 w-3.5" />
+                    remix
+                  </Button>
+                )}
+
+                {/* run + overflow */}
+                <div className="flex items-center gap-0.5 shrink-0">
                   {/* Run / Stop button */}
                   {isRunning ? (
                     <Button
@@ -2314,20 +2411,6 @@ export function PipesSection() {
                     </Button>
                   )}
 
-                  {/* Publish button — not for received team pipes (someone
-                      else's work; fork first) */}
-                  {!isReceivedTeamPipe(pipe) && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7"
-                      onClick={() => setPublishPipeName(pipe.config.name)}
-                      title="publish to store"
-                    >
-                      <Upload className="h-3.5 w-3.5" />
-                    </Button>
-                  )}
-
                   {/* Overflow menu */}
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -2336,21 +2419,7 @@ export function PipesSection() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      {!isReceivedTeamPipe(pipe) && (
-                        <DropdownMenuItem
-                          onClick={() => {
-                            navigateHomeAndPrefill({
-                              context: "the user wants to optimize their pipe",
-                              prompt: buildOptimizePrompt(pipe.config.name),
-                              displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
-                              autoSend: true,
-                            });
-                          }}
-                        >
-                          <Sparkles className="h-3.5 w-3.5 mr-2" />
-                          optimize with ai
-                        </DropdownMenuItem>
-                      )}
+                      {/* "edit with ai" lives on the row as a visible button now */}
 
                       {/* Team sharing — own pipes can be shared, updated,
                           unshared; received team pipes are read-only and can
@@ -2450,12 +2519,12 @@ export function PipesSection() {
                   </DropdownMenu>
                 </div>
 
-                {/* Toggle — only visible on hover.
+                {/* Enable toggle — always visible, pushed to the far right.
                     Missing connections block ENABLING (can't run), but never
                     block DISABLING — a stuck-on pipe with broken deps must
                     always be turn-off-able. */}
                 <div
-                  className="opacity-0 group-hover:opacity-100 transition-opacity"
+                  className="ml-auto flex items-center"
                   title={
                     hasMissingConnections && !pipe.config.enabled
                       ? "configure required connections before enabling auto-run"

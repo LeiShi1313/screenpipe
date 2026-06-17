@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Rect, Size, Webview,
-    WebviewUrl, Window, Wry,
+    WebviewUrl, Window, WindowBuilder, Wry,
 };
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -650,14 +650,16 @@ impl TauriOwnedHandle {
             prepare_navigation(&self.app, &self.state, parsed, owner, true).await;
         }
 
+        // If no child webview is attached — e.g. a background/scheduled pipe
+        // whose browser sidebar panel was never opened — create a hidden,
+        // offscreen one on demand instead of failing. The navigate/eval logic
+        // below already runs against a hidden webview, so this never paints over
+        // whatever the user is currently looking at. When the sidebar later
+        // mounts, `ensure_child_bounds` adopts this same child and positions it
+        // into the panel — a seamless handoff.
         let active = match self.state.active().await {
             Some(child) => child,
-            None if target_url.is_some() => {
-                wait_for_active_child(&self.state, timeout.min(Duration::from_secs(10)))
-                    .await
-                    .ok_or_else(|| "owned-browser child webview not attached".to_string())?
-            }
-            None => return Err("owned-browser child webview not attached".to_string()),
+            None => ensure_background_child(&self.app, &self.state).await?,
         };
 
         // Background reads (snapshot / code-only eval) must NOT reveal the
@@ -743,7 +745,14 @@ impl TauriOwnedHandle {
         let start = Instant::now();
         let result_json = loop {
             if start.elapsed() >= timeout {
-                if shown_for_eval && url.is_none() {
+                // Restore hidden whenever we revealed the webview *only* to run
+                // a background eval (`shown_for_eval` is set only on Windows and
+                // only when it wasn't already visible). This must fire for the
+                // navigate-and-scrape URL path too — otherwise a headless pipe's
+                // eval-with-url would leave the webview painted over the user's
+                // current view on Windows. macOS evals while hidden, so
+                // `shown_for_eval` is always false there and this is a no-op.
+                if shown_for_eval {
                     let _ = active.hide();
                     self.state.set_visible(false).await;
                 }
@@ -829,6 +838,15 @@ impl OwnedWebviewHandle for TauriOwnedHandle {
         self.eval_inner(code, url, timeout, owner).await
     }
 
+    /// Serviceable if a child webview is already attached, or the app's GUI is
+    /// up so `ensure_background_child` can lazily create the off-screen host +
+    /// child. Returns `false` only during cold start before any app window
+    /// exists — so the owned browser is never advertised as ready while an eval
+    /// would still fail.
+    async fn is_ready(&self) -> bool {
+        self.state.active().await.is_some() || !self.app.webview_windows().is_empty()
+    }
+
     /// Native fire-and-forget navigate. Bypasses the eval round-trip so
     /// the HTTP caller doesn't sit in a 30s polling loop waiting for a
     /// `document.title` marker that real-world pages clobber with their
@@ -848,24 +866,30 @@ impl OwnedWebviewHandle for TauriOwnedHandle {
         prepare_navigation(&self.app, &self.state, &parsed, owner, true).await;
         inject_cookies_for_url(&self.app, &parsed).await;
 
-        if let Some(active) = self.state.active().await {
-            // Do NOT force the native webview visible here. Whether the panel is
-            // on screen is a frontend concern — the chat layer that hosts
-            // `<BrowserSidebar />` is `display:none` whenever the user is on
-            // Meeting notes / Timeline / Settings / etc. The sidebar reveals and
-            // positions the webview via `owned_browser_set_bounds` only when its
-            // host is actually visible, and hides it otherwise (the
-            // `offsetParent === null` guard in browser-sidebar.tsx). A
-            // background agent/pipe navigate that called `show()` here would pop
-            // the native browser over whatever the user is looking at. The
-            // navigate still loads while hidden, so the page is ready when the
-            // sidebar next reveals it.
-            active
-                .navigate(parsed)
-                .map_err(|e| format!("webview.navigate failed: {e}"))?;
-            self.state.clear_pending_url().await;
-        } else {
-            debug!("owned-browser navigate queued until sidebar attaches child webview");
+        // Attach a hidden offscreen child on demand if none exists, so a
+        // background/scheduled pipe can navigate without the sidebar ever being
+        // opened. Do NOT force the native webview visible here. Whether the
+        // panel is on screen is a frontend concern — the chat layer that hosts
+        // `<BrowserSidebar />` is `display:none` whenever the user is on Meeting
+        // notes / Timeline / Settings / etc. The sidebar reveals and positions
+        // the webview via `owned_browser_set_bounds` only when its host is
+        // actually visible, and hides it otherwise (the `offsetParent === null`
+        // guard in browser-sidebar.tsx). A background agent/pipe navigate that
+        // called `show()` here would pop the native browser over whatever the
+        // user is looking at. The navigate still loads while hidden, so the page
+        // is ready when the sidebar next reveals it.
+        match ensure_background_child(&self.app, &self.state).await {
+            Ok(active) => {
+                active
+                    .navigate(parsed)
+                    .map_err(|e| format!("webview.navigate failed: {e}"))?;
+                self.state.clear_pending_url().await;
+            }
+            // No window to host a webview yet (cold start). Keep the pending URL
+            // queued so the sidebar consumes it once it mounts, as before.
+            Err(e) => {
+                debug!("owned-browser navigate queued (no webview yet): {e}");
+            }
         }
 
         // Brief wait so the navigation has time to *commit* before we
@@ -1047,20 +1071,88 @@ async fn prepare_navigation(
     state.store_pending_url(parsed.clone()).await;
 }
 
-async fn wait_for_active_child(
-    state: &OwnedBrowserState,
-    timeout: Duration,
-) -> Option<Webview<Wry>> {
-    let start = Instant::now();
-    loop {
-        if let Some(child) = state.active().await {
-            return Some(child);
-        }
-        if start.elapsed() >= timeout {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+/// Label of the dedicated, off-screen window that hosts the owned-browser child
+/// webview during background / headless use (no sidebar open).
+///
+/// Why a separate window instead of parenting to `home`: a background pipe must
+/// not commandeer the chat window's native layer, and `Window::add_child` tears
+/// down the WebDriver context of whatever window it parents to — parenting the
+/// background child to `home` would break the e2e harness mid-run. Hosting it
+/// here keeps `home` untouched until the user actually reveals the browser, at
+/// which point `ensure_child_bounds` reparents this same child onto `home`.
+const BACKGROUND_HOST_LABEL: &str = "owned-browser-bg-host";
+
+/// Far-off-screen origin for the background host window. The window is tiny,
+/// undecorated, off the taskbar, and never focused, so it never paints on any
+/// real monitor. It is created **visible** (not `.visible(false)`) on purpose:
+/// Windows/WebView2 will not run script in a webview whose host window is
+/// hidden, so off-screen-but-visible is what gives us headless eval on every
+/// platform without the user ever seeing it. macOS evaluates fine either way.
+const BG_HOST_OFFSCREEN: f64 = -32000.0;
+
+/// Get-or-create the off-screen window that parents the owned-browser child
+/// during headless background use. Idempotent — reused across background calls.
+async fn background_host_window(app: &AppHandle) -> Result<Window<Wry>, String> {
+    if let Some(window) = app.get_window(BACKGROUND_HOST_LABEL) {
+        return Ok(window);
     }
+    WindowBuilder::new(app, BACKGROUND_HOST_LABEL)
+        .inner_size(1.0, 1.0)
+        .position(BG_HOST_OFFSCREEN, BG_HOST_OFFSCREEN)
+        .visible(true)
+        .focused(false)
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .title("")
+        .build()
+        .map_err(|e| format!("owned-browser background host window failed: {e}"))
+}
+
+/// Lazily create the owned-browser child webview parented to the off-screen
+/// background host window, so a background/scheduled pipe — or any agent call
+/// that arrives before the sidebar mounts — can drive the browser headlessly
+/// instead of failing with "child webview not attached".
+///
+/// The child lives off-screen and is never painted over the user's current
+/// view. When the sidebar later mounts, `ensure_child_bounds` finds this same
+/// child (guarded by the same `state.inner` lock) and reparents it from the
+/// host window onto the visible chat window, repositioning and showing it.
+async fn ensure_background_child(
+    app: &AppHandle,
+    state: &OwnedBrowserState,
+) -> Result<Webview<Wry>, String> {
+    // Fast path: already attached (by the sidebar or a previous background eval).
+    if let Some(child) = state.active().await {
+        return Ok(child);
+    }
+
+    let host = background_host_window(app).await?;
+    let host_label = host.label().to_string();
+
+    // Hold `inner` across creation so a concurrent sidebar `ensure_child_bounds`
+    // can't race us into two webviews sharing WEBVIEW_LABEL.
+    let mut inner = state.inner.lock().await;
+    if let Some(child) = inner.child.clone() {
+        return Ok(child);
+    }
+    let blank: url::Url = "about:blank"
+        .parse()
+        .map_err(|e: url::ParseError| e.to_string())?;
+    let builder = child_webview_builder(app, WEBVIEW_LABEL, WebviewUrl::External(blank));
+    let child = host
+        .add_child(
+            builder,
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(1.0, 1.0),
+        )
+        .map_err(|e| format!("owned-browser background child attach failed: {e}"))?;
+    inner.child = Some(child.clone());
+    inner.child_parent = Some(host_label);
+    // `visible` stays false: the child rides an off-screen window, so the
+    // sidebar/visibility paths must keep treating it as not-on-screen.
+    info!("owned-browser: background child webview attached on off-screen host (headless)");
+    Ok(child)
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,7 +1394,10 @@ pub async fn owned_browser_clear_browsing_data(app: AppHandle) -> Result<(), Str
     let _ = app;
     let state = browser_state();
     let Some(active) = state.active().await else {
-        return Err("owned-browser child webview not attached".to_string());
+        return Err(
+            "owned browser has no active webview to clear (open the browser panel first)"
+                .to_string(),
+        );
     };
     active
         .clear_all_browsing_data()
@@ -1323,6 +1418,37 @@ pub async fn e2e_owned_browser_visible() -> bool {
         return false;
     }
     browser_state().is_visible().await
+}
+
+/// E2E-only: detach and close the owned-browser child webview, resetting the
+/// singleton to its "no child attached" state. Lets
+/// `zzz-owned-browser-headless.spec.ts` establish a deterministic baseline so it
+/// can prove that a *fresh* background (headless) eval actually creates a
+/// working webview — not merely reuse one a prior spec left attached. Mirrors
+/// `e2e_owned_browser_visible`'s gating: a no-op in production binaries, only
+/// active under the `e2e` feature.
+#[specta::specta]
+#[tauri::command]
+pub async fn e2e_owned_browser_detach() -> Result<(), String> {
+    if !cfg!(feature = "e2e") {
+        return Ok(());
+    }
+    let state = browser_state();
+    let child = {
+        let mut inner = state.inner.lock().await;
+        inner.child_parent = None;
+        inner.pending_url = None;
+        inner.visible = false;
+        inner.child.take()
+    };
+    if let Some(child) = child {
+        let _ = child.hide();
+        let _ = child.close();
+        // Give Tauri a beat to tear the webview down and free WEBVIEW_LABEL
+        // before the next background attach re-creates a child under it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Ok(())
 }
 
 /// Cross-platform cookie pre-navigate hook. Resolves the URL's host,

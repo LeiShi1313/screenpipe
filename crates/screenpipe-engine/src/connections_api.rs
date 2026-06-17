@@ -1775,6 +1775,13 @@ fn resolve_auth(
             username_key,
             password_key,
         } => {
+            // An OAuth access token (Zendesk's multi-tenant flow) authenticates
+            // as Bearer and takes precedence over the manual email/token Basic
+            // credentials. Zendesk is currently the only integration pairing a
+            // BasicAuth proxy with OAuth, so this is inert for every other one.
+            if let Some(token) = oauth_token {
+                return ResolvedAuth::Header("Authorization".into(), format!("Bearer {}", token));
+            }
             if let Some(c) = creds {
                 let user = c
                     .get(*username_key)
@@ -2459,9 +2466,10 @@ fn format_browser_description(natural_desc: &str, id: &str) -> String {
         "{natural_desc}\n\n\
          Control:\n\
          - POST /connections/browsers/{id}/navigate {{\"url\": \"https://...\"}}  → open a URL.\n\
-         - GET  /connections/browsers/{id}/snapshot                              → accessibility outline of the page (title, url, headings, links, buttons, form fields). Use this to read the page; almost always preferable to writing your own JS.\n\
+         - GET  /connections/browsers/{id}/snapshot                              → compact, token-efficient page outline. Interactive elements carry a stable ref like #e7; headings/landmarks give structure. Read the page AND get refs to act on, here.\n\
+         - POST /connections/browsers/{id}/act      {{\"ref\": \"e7\", \"action\": \"click\"}}  → act on a snapshot element by ref. action ∈ click | fill (+\"value\") | clear | check | uncheck | select (+\"value\") | hover | focus. Re-snapshot first if refs may be stale. Prefer this over hand-written JS.\n\
          - GET  /connections/browsers/{id}/status                                → ready check.\n\
-         - POST /connections/browsers/{id}/eval     {{\"code\": \"...\"}}            → escape hatch: run JS when navigate + snapshot aren't enough."
+         - POST /connections/browsers/{id}/eval     {{\"code\": \"...\"}}            → escape hatch: run JS when navigate + snapshot + act aren't enough."
     )
 }
 
@@ -2598,130 +2606,15 @@ async fn browser_run_navigate(
     }
 }
 
-/// JS injected by /snapshot. Walks the live DOM and produces a compact,
-/// accessibility-style outline of the page — the kind of thing the agent
-/// can reason about without writing its own selector-based scraper.
-///
-/// Output: `{ title, url, tree, truncated }`. `tree` is plain text, capped
-/// at MAX_LINES so a giant page doesn't blow the agent's context.
-///
-/// Skip rules: hidden elements (display:none / visibility:hidden / aria-
-/// hidden), script/style/noscript, presentation-only roles, password
-/// inputs (the value field would leak the user's secret), `<label>` (its
-/// text gets duplicated on the associated input — extra noise), anchors
-/// with non-navigable hrefs (`javascript:`, empty, `#`).
-///
-/// Page-load race: if the user calls /snapshot right after /navigate,
-/// `document.readyState` may still be `loading`; we wait up to 5s for it
-/// to flip to interactive/complete before walking the DOM, so the agent
-/// gets the new page's outline rather than `about:blank`.
-const SNAPSHOT_SCRIPT: &str = r#"
-async function waitReady(maxMs) {
-    if (document.readyState !== 'loading') return;
-    await new Promise((resolve) => {
-        let done = false;
-        const finish = () => { if (!done) { done = true; resolve(); } };
-        document.addEventListener('DOMContentLoaded', finish, { once: true });
-        setTimeout(finish, maxMs);
-    });
-}
-await waitReady(5000);
-
-const MAX_LINES = 250;
-const MAX_DEPTH = 8;
-const out = [];
-const interesting = new Set([
-    'h1','h2','h3','h4','h5','h6','a','button','input','textarea','select',
-    'nav','main','article','section','form','fieldset','legend',
-    'summary','dialog','header','footer','aside'
-]);
-const interactiveRoles = new Set([
-    'button','link','checkbox','menuitem','option','radio','switch','tab','textbox','combobox'
-]);
-
-function clip(s, n) {
-    s = (s || '').replace(/\s+/g, ' ').trim();
-    return s.length > n ? s.slice(0, n) + '…' : s;
-}
-
-function navigableHref(el) {
-    const h = el.getAttribute('href');
-    if (!h) return '';
-    const trimmed = h.trim();
-    if (!trimmed) return '';
-    if (trimmed === '#') return '';
-    if (trimmed.toLowerCase().startsWith('javascript:')) return '';
-    return h;
-}
-
-function walk(el, depth) {
-    if (out.length >= MAX_LINES) return true; // signal: caller can stop
-    if (!el || el.nodeType !== 1) return false;
-    const tag = el.tagName.toLowerCase();
-    if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'template') return false;
-    if (el.getAttribute('aria-hidden') === 'true') return false;
-    let style;
-    try { style = getComputedStyle(el); } catch (_) { style = null; }
-    if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
-    const role = el.getAttribute('role');
-    if (role === 'presentation' || role === 'none') return false;
-    // Password inputs: a row with a value would leak the user's secret.
-    // Skip the input entirely — even an empty-value row implies "there's a
-    // password field here" which is fine, but emitting `el.value` is not.
-    if (tag === 'input' && (el.type === 'password' || el.type === 'hidden')) return false;
-    // <label> duplicates its associated input's text; the input row already
-    // surfaces it via aria-labelledby/innerText. Drop the label rows to
-    // keep the tree compact.
-    if (tag === 'label') {
-        for (const child of el.children) {
-            if (walk(child, depth)) return true;
-        }
-        return false;
-    }
-    const aria = el.getAttribute('aria-label');
-    const isInteractive = interactiveRoles.has(role) || aria;
-    const include = interesting.has(tag) || isInteractive;
-    if (include) {
-        // Anchors without a navigable href aren't useful as links — but
-        // they CAN be interactive (onclick handlers). Surface them as
-        // [button] in that case so the agent knows they're clickable.
-        let tagOrRole;
-        if (tag === 'a') {
-            const h = navigableHref(el);
-            tagOrRole = role || (h ? 'a' : 'button');
-        } else {
-            tagOrRole = role || tag;
-        }
-        let label = aria || '';
-        if (!label) {
-            if (tag === 'input') label = el.getAttribute('placeholder') || el.type || 'input';
-            else if (tag === 'a' || tag === 'button') label = clip(el.innerText, 80);
-            else if (/^h[1-6]$/.test(tag)) label = clip(el.innerText, 120);
-            else label = clip(el.getAttribute('name') || el.getAttribute('title') || '', 60);
-        }
-        const href = tag === 'a' ? navigableHref(el) : '';
-        const isFormField = tag === 'input' || tag === 'textarea' || tag === 'select';
-        const value = isFormField ? clip(el.value, 60) : '';
-        let line = '  '.repeat(Math.min(depth, MAX_DEPTH)) + '[' + tagOrRole + ']';
-        if (label) line += ' ' + clip(label, 100);
-        if (href) line += ' → ' + clip(href, 80);
-        if (value) line += ' = ' + value;
-        out.push(line);
-    }
-    for (const child of el.children) {
-        if (walk(child, depth + 1)) return true; // bubble the stop-signal up
-    }
-    return false;
-}
-walk(document.body, 0);
-
-return {
-    title: document.title || '',
-    url: location.href,
-    tree: out.join('\n'),
-    truncated: out.length >= MAX_LINES
-};
-"#;
+/// JS injected by GET /connections/browsers/:id/snapshot. The full source is
+/// `browser_scripts/snapshot.js` — a real file so it can be linted and run in
+/// the jsdom unit tests, not a 200-line string buried in this module. It walks
+/// the DOM (piercing open shadow roots + same-origin iframes), stamps every
+/// actionable element with a stable `data-sp-ref="eN"`, and returns
+/// `{ title, url, tree, count, truncated }`. `POST /act {ref, action}` resolves
+/// those refs server-side so the model never hand-writes a selector. See the
+/// file's header comment for the full contract, skip rules, and limits.
+const SNAPSHOT_SCRIPT: &str = include_str!("browser_scripts/snapshot.js");
 
 /// GET /connections/browsers/:id/snapshot — return a compact accessibility
 /// outline of the current page. Lets the agent answer "what's on the page?"
@@ -2758,6 +2651,129 @@ async fn browser_run_snapshot(
         Err(e @ EvalError::Timeout(_)) => (
             StatusCode::GATEWAY_TIMEOUT,
             Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Actions `/act` understands. Kept in one place so the route validator and
+/// the help text can't drift from the JS switch in [`browser_act_script`].
+const ACT_ACTIONS: [&str; 9] = [
+    "click", "fill", "type", "clear", "check", "uncheck", "select", "hover", "focus",
+];
+
+/// Build the JS that `/act` injects. The ref/action/value are JSON-encoded
+/// into three `const` declarations (never string-concatenated) so a page value
+/// like `"); evil()` can't break out of the literal; the rest of the logic
+/// lives in `browser_scripts/act.js` (a real file, linted + jsdom-tested). It
+/// resolves the `data-sp-ref` that [`SNAPSHOT_SCRIPT`] stamped (piercing open
+/// shadow roots + same-origin iframes) and performs one type-aware action.
+fn browser_act_script(ref_id: &str, action: &str, value: Option<&str>) -> String {
+    let ref_json = serde_json::to_string(ref_id).unwrap_or_else(|_| "\"\"".to_string());
+    let action_json = serde_json::to_string(action).unwrap_or_else(|_| "\"\"".to_string());
+    let value_json = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+    format!(
+        "const REF = {ref_json};\nconst ACTION = {action_json};\nconst VALUE = {value_json};\n{body}",
+        body = include_str!("browser_scripts/act.js"),
+    )
+}
+
+#[derive(Deserialize)]
+struct BrowserActBody {
+    /// Element ref from a prior `/snapshot` (e.g. `"e7"`), with or without
+    /// the `#` the tree renders.
+    #[serde(rename = "ref")]
+    ref_id: String,
+    action: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// POST /connections/browsers/:id/act — perform one deterministic action on a
+/// snapshot element by ref. This is the actuation half of the snapshot/act
+/// loop: the model decides *which* ref and *what* action; the tool just
+/// executes. No model calls, no heuristics — keep the smarts in the pipe.
+async fn browser_run_act(
+    State(state): State<ConnectionsState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<BrowserActBody>,
+) -> (StatusCode, Json<Value>) {
+    let action = body.action.trim().to_lowercase();
+    if !ACT_ACTIONS.contains(&action.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("unknown action '{}' — use one of {:?}", body.action, ACT_ACTIONS),
+            })),
+        );
+    }
+    // Tolerate the model passing the rendered `#e7` form.
+    let ref_id = body.ref_id.trim().trim_start_matches('#');
+    if ref_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "ok": false, "error": "missing 'ref' — get one from /snapshot (e.g. \"e7\")" }),
+            ),
+        );
+    }
+
+    let owner = headers
+        .get("x-screenpipe-session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let browser = match state.browser_registry.get(&id).await {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("no browser registered with id '{id}'") })),
+            );
+        }
+    };
+
+    let script = browser_act_script(ref_id, &action, body.value.as_deref());
+    let timeout = std::time::Duration::from_secs(body.timeout_secs.unwrap_or(15).min(60));
+    match browser.eval_with_owner(&script, None, timeout, owner).await {
+        Ok(r) if r.ok => {
+            // The script itself returns {ok:false} for ref-not-found / no
+            // matching option — surface that as 422, success as 200.
+            let inner_ok = r
+                .result
+                .as_ref()
+                .and_then(|v| v.get("ok"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let status = if inner_ok {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            (
+                status,
+                Json(r.result.unwrap_or_else(|| json!({ "ok": false }))),
+            )
+        }
+        Ok(r) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "error": r.error })),
+        ),
+        Err(EvalError::NotConnected) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": EvalError::NotConnected.to_string() })),
+        ),
+        Err(e @ EvalError::SendFailed(_)) | Err(e @ EvalError::Disconnected) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e @ EvalError::Timeout(_)) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "ok": false, "error": e.to_string() })),
         ),
     }
 }
@@ -2857,6 +2873,7 @@ where
         .route("/browsers/:id/status", get(browser_get_status))
         .route("/browsers/:id/navigate", post(browser_run_navigate))
         .route("/browsers/:id/snapshot", get(browser_run_snapshot))
+        .route("/browsers/:id/act", post(browser_run_act))
         .route("/browsers/:id/eval", post(browser_run_eval))
         // Browser extension pairing — unauthenticated start/status are still
         // loopback + extension-origin gated; approve/pending use normal API auth.
@@ -3451,6 +3468,44 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_auth_basic_oauth_token_takes_precedence() {
+        // Zendesk: manual mode is email/token Basic, OAuth mode is Bearer. When
+        // an OAuth token is present it must win over any manual Basic creds so a
+        // single proxy config serves both modes.
+        let auth_cfg = ProxyAuth::BasicAuth {
+            username_key: "email",
+            password_key: "api_token",
+        };
+        let mut creds = Map::new();
+        creds.insert("email".into(), json!("user@example.com"));
+        creds.insert("api_token".into(), json!("secret123"));
+        match resolve_auth(&auth_cfg, Some(&creds), Some("oauth-access-token"), None) {
+            ResolvedAuth::Header(name, value) => {
+                assert_eq!(name, "Authorization");
+                assert_eq!(value, "Bearer oauth-access-token");
+            }
+            _ => panic!("expected Bearer header from OAuth token"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_auth_basic_oauth_only_no_creds() {
+        // An OAuth-only Zendesk connection has no manual Basic creds — the OAuth
+        // token alone must still authenticate.
+        let auth_cfg = ProxyAuth::BasicAuth {
+            username_key: "email",
+            password_key: "api_token",
+        };
+        match resolve_auth(&auth_cfg, None, Some("oauth-access-token"), None) {
+            ResolvedAuth::Header(name, value) => {
+                assert_eq!(name, "Authorization");
+                assert_eq!(value, "Bearer oauth-access-token");
+            }
+            _ => panic!("expected Bearer header from OAuth token"),
+        }
+    }
+
+    #[test]
     fn test_resolve_auth_none() {
         let auth_cfg = ProxyAuth::None;
         assert!(matches!(
@@ -3723,6 +3778,109 @@ mod tests {
                 "snapshot script lost field '{field}' from return shape"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_script_stamps_actionable_refs() {
+        // The whole point of the ref scheme: actionable elements get a
+        // `data-sp-ref` attribute that /act resolves, and the count is
+        // returned so the agent knows how many it can target.
+        assert!(
+            SNAPSHOT_SCRIPT.contains("data-sp-ref"),
+            "snapshot no longer stamps element refs"
+        );
+        assert!(
+            SNAPSHOT_SCRIPT.contains("count"),
+            "snapshot no longer reports the ref count"
+        );
+        // Refs must be re-numbered each call so eN matches the latest tree.
+        assert!(
+            SNAPSHOT_SCRIPT.contains("removeAttribute('data-sp-ref')"),
+            "snapshot must clear stale refs before re-stamping"
+        );
+    }
+
+    #[test]
+    fn snapshot_script_filters_unrendered_nodes() {
+        // Zero-size / offscreen / transparent nodes are dropped via geometry,
+        // not just the display/visibility CSS checks.
+        assert!(
+            SNAPSHOT_SCRIPT.contains("getBoundingClientRect"),
+            "snapshot lost geometry-based visibility filtering"
+        );
+    }
+
+    #[test]
+    fn snapshot_script_detects_spa_clickables() {
+        // div/span "buttons" are how most SPA frameworks ship interactivity;
+        // missing them makes the snapshot useless on real apps.
+        assert!(SNAPSHOT_SCRIPT.contains("isContentEditable"));
+        assert!(SNAPSHOT_SCRIPT.contains("cursor"));
+        assert!(SNAPSHOT_SCRIPT.contains("onclick"));
+    }
+
+    #[test]
+    fn snapshot_script_guards_occlusion_and_pointer_events() {
+        // Ported from the established harnesses (Skyvern/browser-use idea, our
+        // own impl): don't offer to click an element covered by an overlay, and
+        // skip pointer-events:none nodes that clicks pass straight through.
+        assert!(SNAPSHOT_SCRIPT.contains("elementFromPoint"));
+        assert!(SNAPSHOT_SCRIPT.contains("pointerEvents"));
+    }
+
+    // -- /act script -------------------------------------------------------
+
+    #[test]
+    fn act_script_resolves_by_ref_attribute() {
+        let s = browser_act_script("e7", "click", None);
+        assert!(
+            s.contains("data-sp-ref"),
+            "act must resolve elements by ref"
+        );
+        assert!(s.contains("\"e7\""), "act must embed the requested ref");
+        assert!(s.contains("CSS.escape"), "act selector must be escaped");
+    }
+
+    #[test]
+    fn act_script_fill_uses_native_setter_and_events() {
+        // Assigning .value alone is dropped by React's synthetic event layer;
+        // the native setter + input/change is what actually registers.
+        let s = browser_act_script("e3", "fill", Some("hello"));
+        assert!(s.contains("setNativeValue"));
+        assert!(s.contains("'input'") && s.contains("'change'"));
+        assert!(s.contains("\"hello\""));
+    }
+
+    #[test]
+    fn act_script_json_encodes_value_no_breakout() {
+        // A page-supplied value must not be able to break out of the JS
+        // string literal and inject code.
+        let evil = "\"); alert(1); (\"";
+        let s = browser_act_script("e1", "fill", Some(evil));
+        let encoded = serde_json::to_string(evil).unwrap();
+        assert!(
+            s.contains(&encoded),
+            "value must be JSON-encoded into the script"
+        );
+        assert!(
+            !s.contains("alert(1); (\"\n"),
+            "raw value leaked into script body"
+        );
+    }
+
+    #[test]
+    fn browser_description_advertises_act_by_ref() {
+        let s = format_browser_description("base", "owned-default");
+        assert!(
+            s.contains("/act"),
+            "description must teach the /act endpoint"
+        );
+        assert!(s.contains("ref"), "description must mention element refs");
+        // /act sits between snapshot and the eval escape hatch.
+        let snap = s.find("/snapshot").unwrap();
+        let act = s.find("/act").unwrap();
+        let eval_pos = s.find("/eval").unwrap();
+        assert!(snap < act && act < eval_pos, "act ordering regressed: {s}");
     }
 
     /// Records the owner each `eval_with_owner` call receives so the route test

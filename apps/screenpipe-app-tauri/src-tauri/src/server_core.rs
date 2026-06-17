@@ -573,6 +573,11 @@ impl ServerCore {
                 let mut sub =
                     screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
                 while let Some(event) = sub.next().await {
+                    // Clear the event-tracked meeting flag so the capture loop
+                    // stops bypassing dedup for visual changes once the call ends.
+                    // (This controller has no detector handle in the app, so the
+                    // flag is the only meeting signal it has — see set_in_meeting.)
+                    controller.set_in_meeting(false);
                     let meeting_id = event
                         .data
                         .get("meeting_id")
@@ -602,6 +607,11 @@ impl ServerCore {
                         .and_then(|v| v.as_i64())
                         .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
                     let Some(id) = meeting_id else { continue };
+
+                    // Mark the call active so the capture loop bypasses AX-hash
+                    // dedup for visual changes (slides, screen-share) for its
+                    // duration. Independent of the HD-session default mode below.
+                    controller.set_in_meeting(true);
 
                     controller.try_upgrade_pending_to_meeting(id);
 
@@ -709,8 +719,31 @@ impl ServerCore {
             use screenpipe_redact::adapters::tinfoil::{TinfoilConfig, TinfoilRedactor};
             use screenpipe_redact::pipeline::{Pipeline, PipelineConfig};
             use screenpipe_redact::worker::{Worker, WorkerConfig, ALL_TARGET_TABLES};
+            use screenpipe_redact::Pseudonymizer;
             use screenpipe_redact::Redactor;
             use screenpipe_redact::TextRedactionPolicy;
+
+            // Consistent-pseudonym tokens (issue #4206), opt-in. Loads (or
+            // creates on first run) the per-install key under the data dir.
+            // On any IO error we log and fall back to static `[LABEL]`
+            // tags. No effect on the tinfoil backend (span-less output).
+            let pseudonymizer: Option<Arc<Pseudonymizer>> = if config.pii_redaction_pseudonyms {
+                match Pseudonymizer::load_or_create(&config.data_dir) {
+                    Ok(p) => {
+                        info!("text-PII redaction: consistent pseudonyms ON (issue #4206)");
+                        Some(Arc::new(p))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "couldn't load pseudonym key ({e}); rendering static [LABEL] tags \
+                             instead"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             // Backend selection for the text "AI" step:
             //   - "local"   → on-device candle OPF v3 (opf-rs). First
@@ -744,7 +777,8 @@ impl ServerCore {
                         policy: TextRedactionPolicy::from_labels(&pii_labels),
                         ..Default::default()
                     },
-                );
+                )
+                .with_pseudonyms(pseudonymizer.clone());
                 let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
                 let cfg = WorkerConfig {
                     tables: ALL_TARGET_TABLES.to_vec(),
@@ -760,6 +794,7 @@ impl ServerCore {
                 let pool = db.pool.clone();
                 let shutdown = redact_shutdown.clone();
                 let labels = pii_labels.clone();
+                let pseudonymizer = pseudonymizer.clone();
                 tokio::spawn(async move {
                     let policy = TextRedactionPolicy::from_labels(&labels);
                     // Prefer the local ONNX text redactor (~278 MB INT8,
@@ -826,6 +861,8 @@ impl ServerCore {
                             }
                         }
                     };
+                    // Opt-in pseudonym tokens (no-op when None).
+                    let pipeline = pipeline.with_pseudonyms(pseudonymizer);
                     let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
                     let cfg = WorkerConfig {
                         tables: ALL_TARGET_TABLES.to_vec(),

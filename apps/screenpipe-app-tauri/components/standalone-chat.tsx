@@ -9375,7 +9375,7 @@ export function StandaloneChat({
       </div> {/* End of main content area with history sidebar */}
 
       {/* Input */}
-      <div ref={inputSectionRef} className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
+      <div ref={inputSectionRef} className="relative bg-gradient-to-t from-background via-background/80 to-transparent">
         <div className={CHAT_RAIL_CLASS}>
         {/* Prefill, filters, suggestions first; then attached images in gap; then agent bar; then form */}
         {/* Prefill context indicator from search */}
@@ -9763,8 +9763,8 @@ export function StandaloneChat({
 
           <div
             className={cn(
-              "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
-              "bg-background/50 border-border/50",
+              "flex flex-col rounded-xl border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
+              "bg-background/80 border-border/50 shadow-lg shadow-black/5",
               disabledReason && "border-muted-foreground/30"
             )}
           >

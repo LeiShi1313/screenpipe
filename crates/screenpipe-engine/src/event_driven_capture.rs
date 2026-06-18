@@ -792,6 +792,10 @@ pub async fn event_driven_capture_loop(
                         "startup capture for monitor {}: frame_id={}, dur={}ms",
                         monitor_id, result.frame_id, result.duration_ms
                     );
+                } else if let Some(kind) = output.corrupt {
+                    // Frame rejected as corrupt (black / green band) — distinct
+                    // counter, not a dedup. Both tick the stall clock.
+                    vision_metrics.record_corrupt_skip(matches!(kind, CorruptKind::GreenBand));
                 } else {
                     // Symmetry with the live loop — startup capture rarely
                     // hits dedup (no prior hash on first frame) but if it
@@ -1467,17 +1471,24 @@ pub async fn event_driven_capture_loop(
                                 monitor_id
                             );
                         } else {
-                            // Content dedup or window filter — capture skipped.
-                            // Tick last_db_write_ts anyway so the health check
-                            // doesn't flag a stall just because the screen is
-                            // static. The pipeline IS healthy; there's just
-                            // nothing new worth writing. Without this, sitting
-                            // on a Zoom call / slide deck / IDE waiting for
-                            // 60+ seconds emits a false-alarm "vision DB
-                            // writes stalled" WARN and (if the user has
-                            // showRestartNotifications enabled) a Tauri
-                            // notification claiming screen capture is broken.
-                            vision_metrics.record_dedup_skip();
+                            // Capture skipped — content dedup, window filter, or
+                            // a corrupt (black / green-band) frame. Either way
+                            // tick last_db_write_ts (record_* both do) so the
+                            // health check doesn't flag a stall just because the
+                            // screen is static / momentarily unusable. The
+                            // pipeline IS healthy; there's nothing worth writing.
+                            // Without this, sitting on a Zoom call / slide deck /
+                            // IDE for 60+ seconds emits a false-alarm "vision DB
+                            // writes stalled" WARN and (if showRestartNotifications
+                            // is enabled) a Tauri notification claiming capture is
+                            // broken. Corrupt frames get their own counter so a
+                            // spike is visible instead of inflating dedup_skips.
+                            if let Some(kind) = output.corrupt {
+                                vision_metrics
+                                    .record_corrupt_skip(matches!(kind, CorruptKind::GreenBand));
+                            } else {
+                                vision_metrics.record_dedup_skip();
+                            }
                             debug!(
                                 "capture skipped DB write for monitor {} (trigger={})",
                                 monitor_id,
@@ -1669,6 +1680,10 @@ struct CaptureOutput {
     image: image::DynamicImage,
     /// Whether elements were deduped (referenced another frame's elements).
     elements_deduped: bool,
+    /// Set when `result` is `None` because the frame was rejected as corrupt
+    /// (rather than skipped by content dedup). Lets the caller record the right
+    /// telemetry counter. `None` on every non-corruption path.
+    corrupt: Option<CorruptKind>,
 }
 
 fn resolve_capture_metadata(
@@ -1910,16 +1925,26 @@ async fn do_capture(
     // Storing either wastes the tree walk, OCR, and DB write and surfaces an
     // ugly frame in the timeline.  Detect cheaply by sampling pixels, skip the
     // write, but still return the image so the frame comparer stays updated
-    // (prevents re-triggering on the same bad frame).
-    if is_frame_corrupt(&image) {
-        debug!(
-            "captured frame is corrupt (black or green decode-garbage band) on monitor {} — skipping DB write",
-            params.monitor_id
-        );
+    // (prevents re-triggering on the same bad frame). The caller records the
+    // matching telemetry counter from `corrupt`.
+    if let Some(kind) = frame_corruption(&image) {
+        match kind {
+            // Green is the notable, rarer signal — surface it at warn so it
+            // shows up in shared logs. Black is common (DRM / excluded window).
+            CorruptKind::GreenBand => warn!(
+                "captured frame has a green decode-garbage band on monitor {} — skipping DB write",
+                params.monitor_id
+            ),
+            CorruptKind::Black => debug!(
+                "captured frame is mostly black on monitor {} — skipping DB write",
+                params.monitor_id
+            ),
+        }
         return Ok(CaptureOutput {
             result: None,
             image,
             elements_deduped: false,
+            corrupt: Some(kind),
         });
     }
 
@@ -1966,6 +1991,7 @@ async fn do_capture(
                     result: None,
                     image,
                     elements_deduped: false,
+                    corrupt: None,
                 });
             }
         }
@@ -1988,6 +2014,7 @@ async fn do_capture(
                 result: None,
                 image,
                 elements_deduped: false,
+                corrupt: None,
             });
         } else if !decision.walk {
             debug!(
@@ -2093,6 +2120,7 @@ async fn do_capture(
                 result: None,
                 image,
                 elements_deduped: false,
+                corrupt: None,
             });
         }
         TreeWalkResult::NotFound => None,
@@ -2119,6 +2147,7 @@ async fn do_capture(
                     result: None,
                     image,
                     elements_deduped: false,
+                    corrupt: None,
                 });
             }
         }
@@ -2144,6 +2173,7 @@ async fn do_capture(
                             result: None,
                             image,
                             elements_deduped: false,
+                            corrupt: None,
                         });
                     }
                 }
@@ -2170,6 +2200,7 @@ async fn do_capture(
                 result: None,
                 image,
                 elements_deduped: false,
+                corrupt: None,
             });
         } else if crate::sleep_monitor::screen_is_locked() {
             // Screen was marked locked but now a real app is focused — unlock
@@ -2191,6 +2222,7 @@ async fn do_capture(
             result: None,
             image,
             elements_deduped: false,
+            corrupt: None,
         });
     }
 
@@ -2215,6 +2247,7 @@ async fn do_capture(
                 result: None,
                 image,
                 elements_deduped: false,
+                corrupt: None,
             });
         }
     }
@@ -2231,6 +2264,7 @@ async fn do_capture(
             result: None,
             image,
             elements_deduped: false,
+            corrupt: None,
         });
     }
 
@@ -2262,6 +2296,7 @@ async fn do_capture(
         result: Some(result),
         image,
         elements_deduped: deduped,
+        corrupt: None,
     })
 }
 
@@ -2490,13 +2525,37 @@ fn sample_frame_corruption(image: &image::DynamicImage) -> FrameCorruption {
     }
 }
 
-/// A captured frame is "corrupt" — unusable for indexing — if it is near-all-
-/// black (an excluded/ignored window, sleeping monitor, or DRM-protected
-/// surface that SCK returns as black) or carries a flat green decode-garbage
-/// band. One cheap pass computes both; see [`sample_frame_corruption`].
-fn is_frame_corrupt(image: &image::DynamicImage) -> bool {
+/// Why a captured frame is unusable for indexing. Surfaced to telemetry so a
+/// spike in black vs green skips is distinguishable (and not folded into the
+/// dedup-skip counter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorruptKind {
+    /// Near-all-black: an excluded/ignored window covering the monitor, a
+    /// sleeping display, or a DRM-protected surface SCK returns as black.
+    Black,
+    /// A flat green decode-garbage band — a truncated / partially-written
+    /// capture. The signal behind the "bottom of my screenshot is green" reports.
+    GreenBand,
+}
+
+/// Classify a captured frame's corruption, if any. One cheap pass computes both
+/// signals (see [`sample_frame_corruption`]); black takes precedence as the
+/// cheaper, more certain signal.
+fn frame_corruption(image: &image::DynamicImage) -> Option<CorruptKind> {
     let s = sample_frame_corruption(image);
-    s.black_ratio > 0.95 || s.green_band
+    if s.black_ratio > 0.95 {
+        Some(CorruptKind::Black)
+    } else if s.green_band {
+        Some(CorruptKind::GreenBand)
+    } else {
+        None
+    }
+}
+
+/// Convenience predicate used by tests.
+#[cfg(test)]
+fn is_frame_corrupt(image: &image::DynamicImage) -> bool {
+    frame_corruption(image).is_some()
 }
 
 #[cfg(test)]
@@ -3319,6 +3378,20 @@ mod tests {
         }
         let img = image::DynamicImage::ImageRgba8(buf);
         assert!(is_frame_corrupt(&img));
+    }
+
+    #[test]
+    fn frame_corruption_reports_kind_for_telemetry() {
+        // Black and green resolve to distinct kinds so the caller bumps the
+        // right counter; clean and full-green frames classify as None.
+        assert_eq!(
+            frame_corruption(&solid(1920, 1080, [0, 0, 0])),
+            Some(CorruptKind::Black)
+        );
+        let green = frame_with_bottom_band(1920, 1080, 648, [120, 130, 140], [0, 150, 0]);
+        assert_eq!(frame_corruption(&green), Some(CorruptKind::GreenBand));
+        assert_eq!(frame_corruption(&solid(1920, 1080, [120, 130, 140])), None);
+        assert_eq!(frame_corruption(&solid(1920, 1080, [0, 160, 0])), None);
     }
 
     #[test]

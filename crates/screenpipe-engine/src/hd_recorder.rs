@@ -418,6 +418,15 @@ mod macos {
     /// JPEG has no alpha (dropped); the pipe stays small vs raw RGBA. CPU-heavy
     /// — always run on a blocking thread.
     fn encode_jpeg(frame: image::RgbaImage, target_w: u32, target_h: u32) -> Result<Vec<u8>> {
+        // A 0-dimension frame can't be resized or encoded — drop it rather than
+        // feed garbage into the pipe. The caller logs and keeps recording.
+        if frame.width() == 0 || frame.height() == 0 {
+            anyhow::bail!(
+                "empty hd frame {}x{} — skipping",
+                frame.width(),
+                frame.height()
+            );
+        }
         let frame = if target_w > 0
             && target_h > 0
             && (frame.width() != target_w || frame.height() != target_h)
@@ -499,6 +508,14 @@ mod macos {
             let frame = image::RgbaImage::new(640, 480);
             let bytes = encode_jpeg(frame, 0, 0).unwrap();
             assert_eq!(jpeg_dims(&bytes), (640, 480));
+        }
+
+        #[test]
+        fn encode_jpeg_rejects_empty_frame() {
+            // A 0-dimension frame is dropped (Err) rather than resized into
+            // garbage; the recorder logs and keeps going.
+            let frame = image::RgbaImage::new(0, 0);
+            assert!(encode_jpeg(frame, 640, 480).is_err());
         }
     }
 }

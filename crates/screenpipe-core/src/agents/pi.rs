@@ -65,6 +65,132 @@ fn is_rate_limit_error(text: &str) -> bool {
         || lower.contains("\"reset_in\"")
 }
 
+/// Detect a malformed terminal Pi transcript where the model stopped with
+/// `toolUse` but Pi emitted no tool call/result/content before exiting 0.
+/// The process succeeded, but the pipe did no useful work; treating this as
+/// completed makes the Runs tab green while no sidebar conversation can exist.
+fn empty_tool_use_transcript(stdout: &str) -> bool {
+    let mut saw_agent_end = false;
+    let mut terminal_tool_use = false;
+    let mut saw_assistant_content = false;
+    let mut saw_tool_call = false;
+    let mut saw_tool_result = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+            continue;
+        }
+        let Ok(evt) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+
+        match evt.get("type").and_then(|t| t.as_str()) {
+            Some("message_update") => {
+                if let Some(ae) = evt.get("assistantMessageEvent") {
+                    match ae.get("type").and_then(|t| t.as_str()) {
+                        Some("text_delta")
+                            if ae
+                                .get("delta")
+                                .and_then(|d| d.as_str())
+                                .is_some_and(|d| !d.trim().is_empty()) =>
+                        {
+                            saw_assistant_content = true;
+                        }
+                        Some("toolcall_start") | Some("toolcall_delta") | Some("toolcall_end") => {
+                            saw_tool_call = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("message_start") | Some("message_end") | Some("turn_end") => {
+                if let Some(message) = evt.get("message") {
+                    if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        if message.get("stopReason").and_then(|r| r.as_str()) == Some("toolUse") {
+                            terminal_tool_use = true;
+                        }
+                        if content_has_text_or_tool_call(message.get("content")) {
+                            if content_has_text(message.get("content")) {
+                                saw_assistant_content = true;
+                            }
+                            if content_has_tool_call(message.get("content")) {
+                                saw_tool_call = true;
+                            }
+                        }
+                    }
+                }
+                if evt
+                    .get("toolResults")
+                    .and_then(|r| r.as_array())
+                    .is_some_and(|r| !r.is_empty())
+                {
+                    saw_tool_result = true;
+                }
+            }
+            Some("tool_execution_start") => saw_tool_call = true,
+            Some("tool_execution_end") => saw_tool_result = true,
+            Some("agent_end") => {
+                saw_agent_end = true;
+                if evt
+                    .get("toolResults")
+                    .and_then(|r| r.as_array())
+                    .is_some_and(|r| !r.is_empty())
+                {
+                    saw_tool_result = true;
+                }
+                if let Some(messages) = evt.get("messages").and_then(|m| m.as_array()) {
+                    for message in messages {
+                        if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                            continue;
+                        }
+                        if message.get("stopReason").and_then(|r| r.as_str()) == Some("toolUse") {
+                            terminal_tool_use = true;
+                        }
+                        if content_has_text(message.get("content")) {
+                            saw_assistant_content = true;
+                        }
+                        if content_has_tool_call(message.get("content")) {
+                            saw_tool_call = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    saw_agent_end
+        && terminal_tool_use
+        && !saw_assistant_content
+        && !saw_tool_call
+        && !saw_tool_result
+}
+
+fn content_has_text_or_tool_call(content: Option<&serde_json::Value>) -> bool {
+    content_has_text(content) || content_has_tool_call(content)
+}
+
+fn content_has_text(content: Option<&serde_json::Value>) -> bool {
+    content.and_then(|c| c.as_array()).is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            block.get("type").and_then(|t| t.as_str()) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|text| !text.trim().is_empty())
+        })
+    })
+}
+
+fn content_has_tool_call(content: Option<&serde_json::Value>) -> bool {
+    content.and_then(|c| c.as_array()).is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("toolCall"))
+    })
+}
+
 /// Fetch the model catalog from the Cloudflare Worker gateway and convert
 /// it into the format Pi's `models.json` expects.
 ///
@@ -1458,6 +1584,7 @@ impl PiExecutor {
 
         // If the process exited cleanly but the LLM returned an error
         // (e.g. 429 credits_exhausted), treat it as a failure.
+        let empty_tool_use = empty_tool_use_transcript(&stdout_buf);
         let success = if let Some(ref err) = llm_error {
             if stderr.is_empty() {
                 stderr = err.clone();
@@ -1465,6 +1592,16 @@ impl PiExecutor {
                 stderr.push_str(&format!("\nLLM error: {}", err));
             }
             warn!("pi exited 0 but LLM returned error: {}", err);
+            false
+        } else if status.success() && empty_tool_use {
+            let err =
+                "pi exited 0 after stopReason=toolUse but emitted no tool call, tool result, or assistant content";
+            if stderr.is_empty() {
+                stderr = err.to_string();
+            } else {
+                stderr.push_str(&format!("\n{}", err));
+            }
+            warn!("{}", err);
             false
         } else {
             status.success()
@@ -3263,6 +3400,30 @@ mod tests {
         assert!(is_rate_limit_error(r#"{"reset_in":12}"#));
         assert!(!is_rate_limit_error("model not found"));
         assert!(!is_rate_limit_error("credits_exhausted"));
+    }
+
+    #[test]
+    fn detects_empty_tool_use_transcript() {
+        let stdout = r#"{"type":"session","version":3}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"run pipe"}]}}
+{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"run pipe"}]}}
+{"type":"message_start","message":{"role":"assistant","content":[],"stopReason":"stop"}}
+{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"toolUse"}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"toolUse"},"toolResults":[]}
+{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"run pipe"}]},{"role":"assistant","content":[],"stopReason":"toolUse"}],"willRetry":false}"#;
+
+        assert!(empty_tool_use_transcript(stdout));
+    }
+
+    #[test]
+    fn non_empty_tool_use_transcript_is_not_empty() {
+        let with_tool_call = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"toolCall","name":"search","arguments":{}}],"stopReason":"toolUse"}],"willRetry":false}"#;
+        let with_text = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}],"willRetry":false}"#;
+
+        assert!(!empty_tool_use_transcript(with_tool_call));
+        assert!(!empty_tool_use_transcript(with_text));
     }
 
     #[tokio::test]

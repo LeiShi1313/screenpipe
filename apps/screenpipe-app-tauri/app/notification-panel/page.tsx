@@ -168,11 +168,27 @@ export default function NotificationPanelPage() {
             }
             case "api": {
               if (actionObj.url) {
-                await localFetch(actionObj.url, {
+                const res = await localFetch(actionObj.url, {
                   method: actionObj.method || "POST",
                   headers: { "Content-Type": "application/json" },
                   body: actionObj.body ? JSON.stringify(actionObj.body) : undefined,
                 });
+                // "open note + HD": the meeting-start HD action embeds the
+                // live-note deeplink so a single click both starts HD capture
+                // (this api call) and opens the note. Without this the note
+                // never opens — the button only starts HD. Gated on res.ok so
+                // a failed start doesn't navigate. Mirrors the native handler
+                // in components/notification-handler.tsx.
+                const noteUrl = actionObj.deeplinkUrl || actionObj.deeplink_url;
+                if (
+                  res.ok &&
+                  typeof noteUrl === "string" &&
+                  noteUrl.startsWith("screenpipe://")
+                ) {
+                  await commands.showWindowActivated(windowForDeeplink(noteUrl));
+                  await new Promise((r) => setTimeout(r, 150));
+                  await emit("deep-link-received", noteUrl);
+                }
               }
               break;
             }

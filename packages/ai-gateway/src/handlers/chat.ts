@@ -6,6 +6,7 @@ import { createProvider, resolveModelAlias } from '../providers';
 import { addCorsHeaders } from '../utils/cors';
 import { logModelOutcome } from '../services/model-health';
 import { isFlexEligible } from '../utils/latency';
+import { routeTier, TIER_HEAD } from './difficulty-router';
 import { captureException } from '@sentry/cloudflare';
 
 // Auto model waterfall (INTERACTIVE) — leads with glm-5. Interactive is
@@ -467,9 +468,17 @@ export async function handleChatCompletions(
   const useBackgroundChain = latency === 'background';
 
   if (body.model === 'auto') {
-    const chain = hasImages(body)
+    let chain = hasImages(body)
       ? AUTO_WATERFALL_VISION
       : (useBackgroundChain ? AUTO_WATERFALL_BACKGROUND : AUTO_WATERFALL);
+    // Difficulty router (interactive text only). No-op when ROUTER_MODE=off →
+    // routeTier returns 'normal' → chain unchanged → identical to today. When
+    // enabled, it promotes a tier head (e.g. opus for hard, gpt-5-nano for trivial)
+    // and keeps the existing waterfall as the cascade fallback.
+    if (!hasImages(body) && !useBackgroundChain) {
+      const tier = await routeTier(body.messages, env);
+      if (tier !== 'normal') chain = [TIER_HEAD[tier], ...chain.filter((m) => m !== TIER_HEAD[tier])];
+    }
     const result = await runChain(chain, body, env, 'auto', flexEligible);
     if ('response' in result) {
       return addCorsHeaders(addModelHeader(result.response, result.model));

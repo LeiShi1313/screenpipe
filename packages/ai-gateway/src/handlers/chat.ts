@@ -223,25 +223,35 @@ async function tryModel(
       delete (reqBody as Partial<RequestBody>).tool_choice;
     }
 
-    // Flex tier applies only to the Vertex Gemini lane. Setting it on the body
-    // here (vs the shared request body) keeps it scoped to this attempt, so a
-    // cascade from flex-gemini → glm-5 runs glm-5 at standard tier.
+    // Flex tier applies only to the Vertex Gemini lane. Set per-attempt (not on
+    // the shared body) so a cascade to glm-5 runs standard tier.
     const useFlex = flexEligible && isGeminiModel(model);
-    if (useFlex) {
-      (reqBody as RequestBody).serviceTier = 'flex';
-    }
 
-    if (body.stream) {
-      const stream = await provider.createStreamingCompletion(reqBody);
-      return tagServedTier(new Response(stream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        },
-      }), useFlex);
+    const callOnce = async (withFlex: boolean): Promise<Response> => {
+      const rb = { ...reqBody } as RequestBody;
+      if (withFlex) rb.serviceTier = 'flex';
+      else delete (rb as Partial<RequestBody>).serviceTier;
+      if (body.stream) {
+        const stream = await provider.createStreamingCompletion(rb);
+        return tagServedTier(new Response(stream, {
+          headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+        }), withFlex);
+      }
+      return tagServedTier(await provider.createCompletion(rb), withFlex);
+    };
+
+    try {
+      return await callOnce(useFlex);
+    } catch (flexErr: any) {
+      // Flex isn't enabled for our project/region on some Gemini models
+      // ("Flex API is not supported for project ... or selected region", 400 —
+      // SCREENPIPE-AI-PROXY-V/1A, 650+/day). Retry the SAME model at standard
+      // tier instead of 400'ing or cascading through more flex-rejecting siblings.
+      if (useFlex && /flex api is not supported/i.test(String(flexErr?.message || ''))) {
+        return await callOnce(false);
+      }
+      throw flexErr;
     }
-    return tagServedTier(await provider.createCompletion(reqBody), useFlex);
   } catch (error: any) {
     // Prefer error.status (UpstreamError, etc); fall back to parsing the
     // message for providers that throw plain Error("... 524 ..."). Defaults

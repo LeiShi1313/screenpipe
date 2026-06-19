@@ -1363,15 +1363,36 @@ impl DatabaseManager {
     /// Rebuild the database with a full `VACUUM` to return freed pages to the
     /// OS. The retention loop's `incremental_vacuum` is a no-op while the DB is
     /// `auto_vacuum=NONE` (how it ships) — it only recycles pages internally.
-    /// A full `VACUUM` always shrinks the file, but takes a brief exclusive
-    /// lock (writes block until it finishes) and needs free disk roughly equal
-    /// to the live data size, so this is an explicit user action, never part of
-    /// the background loop. Checkpoints the WAL first so the rewrite is clean.
+    /// A full `VACUUM` always shrinks the file, but needs free disk roughly
+    /// equal to the live data size, so this is an explicit user action, never
+    /// part of the background loop.
+    ///
+    /// Concurrency: VACUUM needs an exclusive lock and would otherwise fail
+    /// with SQLITE_BUSY against the live capture pipeline (the pool's default
+    /// busy_timeout is only 5s). We make it reliable the way `repair_database`
+    /// does: hold the single-permit `write_semaphore` so writers queue instead
+    /// of contending (the "recording briefly pauses" the UI warns about —
+    /// writes resume the moment VACUUM commits), and run checkpoint + VACUUM on
+    /// one connection with busy_timeout bumped to 60s so VACUUM waits out active
+    /// readers (WAL readers stay live) rather than erroring. The timeout is
+    /// reset to the 5s default before the connection returns to the pool. On
+    /// insufficient disk VACUUM errors (surfaced as 500) without corrupting
+    /// anything.
     pub async fn compact(&self) -> Result<(), sqlx::Error> {
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.pool)
+        let _write_guard = self.write_semaphore.acquire().await.ok();
+
+        let mut conn = self.pool.acquire().await?;
+        let _ = sqlx::query("PRAGMA busy_timeout = 60000")
+            .execute(&mut *conn)
             .await;
-        sqlx::query("VACUUM").execute(&self.pool).await?;
-        Ok(())
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut *conn)
+            .await;
+        let result = sqlx::query("VACUUM").execute(&mut *conn).await.map(|_| ());
+        // Restore the default busy_timeout on this pooled connection.
+        let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(&mut *conn)
+            .await;
+        result
     }
 }

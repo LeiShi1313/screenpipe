@@ -1177,6 +1177,22 @@ async fn main() {
             // Resolve data directory from user setting (custom dir or ~/.screenpipe)
             let (data_dir, data_dir_fell_back) = config::resolve_data_dir(&store.data_dir);
             info!("Recording data directory: {}", data_dir.display());
+
+            // Pin SCREENPIPE_DATA_DIR to the *resolved* dir so every consumer of
+            // `default_screenpipe_data_dir()` agrees with the engine on where the
+            // data lives. Without this, a user with a custom/relocated data dir
+            // hit a split: the engine (server_core) reads its SecretStore from
+            // `config.data_dir` (the custom path) while OAuth token writes
+            // (`open_secret_store`, chatgpt_oauth, …) went to the default
+            // `~/.screenpipe`. Tokens landed in one db.sqlite and were read from
+            // another → "no credentials found … cannot authenticate" 401s on
+            // every Microsoft 365 / Google / ChatGPT call, reconnecting forever
+            // never helping. Setting the env var here (before any OAuth callback
+            // can fire) makes `default_screenpipe_data_dir()` self-consistent and
+            // also propagates the correct dir to child processes (the CLI
+            // sidecar inherits this env).
+            std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
+
             if data_dir_fell_back {
                 let app_handle_fb = app_handle.clone();
                 tauri::async_runtime::spawn(async move {

@@ -173,6 +173,21 @@ describe("normalizeMediaFilePath — edge cases", () => {
       "~/Downloads/clip.mp4",
     );
   });
+
+  it("preserves a Windows-style home-relative path (backslashes)", () => {
+    // The backend only expands `~\` on Windows; the frontend just keeps the
+    // prefix intact so the right home dir gets joined there.
+    expect(normalizeMediaFilePath(String.raw`~\Downloads\clip.mp4`)).toBe(
+      String.raw`~\Downloads\clip.mp4`,
+    );
+  });
+
+  it("does not treat a mid-path ~ as a home reference", () => {
+    // The `~` here ends a directory name; it must not be mistaken for `~/`.
+    expect(normalizeMediaFilePath("/Users/me~/clip.mp4")).toBe(
+      "/Users/me~/clip.mp4",
+    );
+  });
 });
 
 describe("isAudioMediaPath / isMediaFilePath — edge cases", () => {

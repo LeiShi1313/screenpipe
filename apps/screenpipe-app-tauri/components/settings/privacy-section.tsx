@@ -464,6 +464,29 @@ export function PrivacySection() {
     handlePiiModeChange(checked ? "basic" : "off");
   };
 
+  // Smart mode runs two independent AI workers — text (DB columns) and
+  // image (screenshot pixels). They're separate flags, so let the user
+  // pick either or both. Switching to Smart turns both on; unchecking the
+  // last one degrades cleanly to Basic (keep the regex safety net).
+  const textRedactionOn = Boolean(settings.asyncPiiRedaction ?? false);
+  const imageRedactionOn = Boolean(settings.asyncImagePiiRedaction ?? false);
+  const handleModalityToggle = (which: "text" | "image", checked: boolean) => {
+    const text = which === "text" ? checked : textRedactionOn;
+    const image = which === "image" ? checked : imageRedactionOn;
+    if (!text && !image) {
+      handlePiiModeChange("basic");
+      return;
+    }
+    handleSettingsChange(
+      {
+        usePiiRemoval: true,
+        asyncPiiRedaction: text,
+        asyncImagePiiRedaction: image,
+      },
+      true,
+    );
+  };
+
   // Cloud media analysis (Gemma 4 E4B inside our Tinfoil enclave) —
   // toggling this also rewrites the screenpipe-api skill markdown so
   // agents see the capability iff the toggle is on. Defaults to true.
@@ -1276,6 +1299,52 @@ export function PrivacySection() {
                       </span>
                     </span>
                   </label>
+
+                  {piiMode === "smart" && (
+                    <div className="ml-6 space-y-1.5 pt-1">
+                      <p className="text-xs font-medium text-foreground">
+                        Apply to
+                      </p>
+                      <label className="flex items-start gap-2 text-xs cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={textRedactionOn}
+                          onChange={(e) =>
+                            handleModalityToggle("text", e.target.checked)
+                          }
+                        />
+                        <span>
+                          <span className="font-medium text-foreground">
+                            Text
+                          </span>
+                          <span className="text-muted-foreground">
+                            {" "}— scrub captured text (OCR, accessibility,
+                            transcripts, typed &amp; clipboard input)
+                          </span>
+                        </span>
+                      </label>
+                      <label className="flex items-start gap-2 text-xs cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={imageRedactionOn}
+                          onChange={(e) =>
+                            handleModalityToggle("image", e.target.checked)
+                          }
+                        />
+                        <span>
+                          <span className="font-medium text-foreground">
+                            Images
+                          </span>
+                          <span className="text-muted-foreground">
+                            {" "}— black out PII in screenshot frames (on-device
+                            vision model)
+                          </span>
+                        </span>
+                      </label>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1359,41 +1428,47 @@ export function PrivacySection() {
                   searchable. Secrets are always removed in both modes.
                 </p>
 
-                <p className="text-xs font-medium text-foreground pt-3 mt-1.5 border-t border-border">
-                  Where to redact
-                </p>
-                {PII_COLUMN_OPTIONS.map((opt) => {
-                  const checked = piiRedactionColumns.includes(opt.value);
-                  return (
-                    <label
-                      key={opt.value}
-                      className="flex items-start gap-2 text-xs cursor-pointer"
-                    >
-                      <input
-                        type="checkbox"
-                        className="mt-0.5"
-                        checked={checked}
-                        onChange={(e) =>
-                          handlePiiColumnToggle(opt.value, e.target.checked)
-                        }
-                      />
-                      <span>
-                        <span className="font-medium text-foreground">
-                          {opt.label}
-                        </span>
-                        <span className="text-muted-foreground">
-                          {" "}— {opt.desc}
-                        </span>
-                      </span>
-                    </label>
-                  );
-                })}
-                <p className="text-[11px] text-muted-foreground pt-0.5">
-                  Typed text, clipboard, transcripts, window titles, and
-                  on-screen text are always redacted. These extra capture
-                  surfaces are off by default — enable any that matter for your
-                  threat model.
-                </p>
+                {/* Column allow-list is text-only — hide it when text
+                    redaction is off (Images-only Smart mode). */}
+                {textRedactionOn && (
+                  <>
+                    <p className="text-xs font-medium text-foreground pt-3 mt-1.5 border-t border-border">
+                      Where to redact (text)
+                    </p>
+                    {PII_COLUMN_OPTIONS.map((opt) => {
+                      const checked = piiRedactionColumns.includes(opt.value);
+                      return (
+                        <label
+                          key={opt.value}
+                          className="flex items-start gap-2 text-xs cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-0.5"
+                            checked={checked}
+                            onChange={(e) =>
+                              handlePiiColumnToggle(opt.value, e.target.checked)
+                            }
+                          />
+                          <span>
+                            <span className="font-medium text-foreground">
+                              {opt.label}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {" "}— {opt.desc}
+                            </span>
+                          </span>
+                        </label>
+                      );
+                    })}
+                    <p className="text-[11px] text-muted-foreground pt-0.5">
+                      Typed text, clipboard, transcripts, window titles, and
+                      on-screen text are always redacted. These extra capture
+                      surfaces are off by default — enable any that matter for
+                      your threat model.
+                    </p>
+                  </>
+                )}
 
                 <label className="flex items-start gap-2 text-xs cursor-pointer pt-2 mt-1.5 border-t border-border">
                   <input

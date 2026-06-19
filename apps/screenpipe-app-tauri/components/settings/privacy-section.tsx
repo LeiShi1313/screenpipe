@@ -1350,39 +1350,35 @@ export function PrivacySection() {
             )}
             {aiPiiRemovalEnabled && (
               <div className="mt-3 ml-6 space-y-2 border-l-2 border-border pl-3">
-                <p className="text-xs font-medium text-foreground">Where it runs</p>
-                <label className={`flex items-start gap-2 text-xs ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
-                  <input
-                    type="radio"
-                    name="piiBackend"
-                    className="mt-0.5"
-                    checked={piiBackend === "local"}
-                    disabled={!!managedPiiBackend}
-                    onChange={() => handlePiiBackendChange("local")}
-                  />
-                  <span>
-                    <span className="font-medium text-foreground">Local</span>
-                    <span className="text-muted-foreground">
-                      {" "}— on your device. Strongest privacy. Slower on weak hardware.
-                    </span>
-                  </span>
-                </label>
-                <label className={`flex items-start gap-2 text-xs ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
-                  <input
-                    type="radio"
-                    name="piiBackend"
-                    className="mt-0.5"
-                    checked={piiBackend === "tinfoil"}
-                    disabled={!!managedPiiBackend}
-                    onChange={() => handlePiiBackendChange("tinfoil")}
-                  />
-                  <span>
-                    <span className="font-medium text-foreground">Cloud (enclave)</span>
-                    <span className="text-muted-foreground">
-                      {" "}— screenpipe&apos;s confidential-compute enclave. Fast everywhere; your device cryptographically verifies the enclave is running the open-source build before sending anything.
-                    </span>
-                  </span>
-                </label>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                  <span className="font-medium text-foreground">Where it runs</span>
+                  <label className={`flex items-center gap-1.5 ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
+                    <input
+                      type="radio"
+                      name="piiBackend"
+                      checked={piiBackend === "local"}
+                      disabled={!!managedPiiBackend}
+                      onChange={() => handlePiiBackendChange("local")}
+                    />
+                    <span className="text-foreground">Local</span>
+                  </label>
+                  <label className={`flex items-center gap-1.5 ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
+                    <input
+                      type="radio"
+                      name="piiBackend"
+                      checked={piiBackend === "tinfoil"}
+                      disabled={!!managedPiiBackend}
+                      onChange={() => handlePiiBackendChange("tinfoil")}
+                    />
+                    <span className="text-foreground">Cloud (enclave)</span>
+                  </label>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Local stays on-device — strongest privacy, slower on weak
+                  hardware. Cloud uses screenpipe&apos;s attested
+                  confidential-compute enclave — fast everywhere; your device
+                  verifies the open-source build before sending anything.
+                </p>
 
                 <p className="text-xs font-medium text-foreground pt-2">
                   Fields to redact

@@ -1747,13 +1747,13 @@ export const TimelineSlider = ({
 
 									const hasAudio = frame?.devices?.some((d) => d.audio?.some((a) => a.transcription?.trim()));
 									const isCurrent = frameIndex === currentIndex;
-									const matchesDevice = selectedDeviceId === "all" || frame.devices.some((d) => d.device_id === selectedDeviceId);
-									const matchesApp = selectedAppName === "all" || frame.devices.some((d) => d.metadata?.app_name === selectedAppName);
-									const matchesDomain = selectedDomain === "all" || frame.devices.some((d) => {
+									const matchesDevice = selectedDeviceId === "all" || (frame.devices?.some((d) => d.device_id === selectedDeviceId) ?? false);
+									const matchesApp = selectedAppName === "all" || (frame.devices?.some((d) => d.metadata?.app_name === selectedAppName) ?? false);
+									const matchesDomain = selectedDomain === "all" || (frame.devices?.some((d) => {
 										const url = d.metadata?.browser_url?.trim();
 										return url ? extractDomain(url) === selectedDomain : false;
-									});
-									const matchesSpeaker = selectedSpeaker === "all" || frame.devices.some((d) => d.audio?.some((a) => a.speaker_name === selectedSpeaker));
+									}) ?? false);
+									const matchesSpeaker = selectedSpeaker === "all" || (frame.devices?.some((d) => d.audio?.some((a) => a.speaker_name === selectedSpeaker)) ?? false);
 									const frameIdForTag = frame.devices?.[0]?.frame_id || '';
 									const frameTagsForFilter = frameIdForTag ? (tags[frameIdForTag] || []) : [];
 									const matchesTag = selectedTag === "all" || frameTagsForFilter.includes(selectedTag);

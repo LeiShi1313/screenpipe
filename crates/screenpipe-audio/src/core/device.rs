@@ -1070,7 +1070,10 @@ mod stream_config_tests {
         let err = ensure_usable_stream_config(0, 48_000, "Some Virtual Cable")
             .expect_err("0 channels must be an error");
         let msg = err.to_string();
-        assert!(msg.contains("0 channels"), "error should explain why: {msg}");
+        assert!(
+            msg.contains("0 channels"),
+            "error should explain why: {msg}"
+        );
         assert!(
             msg.contains("Some Virtual Cable"),
             "error should name the device: {msg}"
@@ -1084,8 +1087,14 @@ mod stream_config_tests {
         let err = ensure_usable_stream_config(2, 0, "Weird Device")
             .expect_err("0 sample rate must be an error");
         let msg = err.to_string();
-        assert!(msg.contains("0 sample rate"), "error should explain why: {msg}");
-        assert!(msg.contains("Weird Device"), "error should name the device: {msg}");
+        assert!(
+            msg.contains("0 sample rate"),
+            "error should explain why: {msg}"
+        );
+        assert!(
+            msg.contains("Weird Device"),
+            "error should name the device: {msg}"
+        );
     }
 
     #[test]

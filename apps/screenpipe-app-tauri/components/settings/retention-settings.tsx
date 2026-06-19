@@ -372,8 +372,8 @@ export function RetentionSettings() {
               testId="retention-mode-lean"
               checked={effective === "lean"}
               icon={<FileText className="h-4 w-4" />}
-              title="shrink the database, keep text + memories"
-              body="everything media mode does, plus drops the bulky accessibility/ui detail (the biggest part of the database) older than the cutoff. text search, transcripts, timeline, and memories still work. best if the database file itself is getting large."
+              title="trim heavy ui data, keep text + memories"
+              body="everything media mode does, plus drops the bulky accessibility/ui detail (the biggest part of the database) older than the cutoff. text search, transcripts, timeline, and memories still work. stops the database from ballooning and frees that space for reuse."
               onClick={() => handleSelectMode("lean")}
             />
             <ModeRow

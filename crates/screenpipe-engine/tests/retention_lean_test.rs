@@ -165,4 +165,108 @@ async fn strip_heavy_text_keeps_recent_and_text_drops_old_blobs() {
         2,
         "both frames remain full-text searchable"
     );
+
+    // ui_events_fts must drop the deleted old event too (ui_events_ad trigger).
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM ui_events_fts WHERE ui_events_fts MATCH 'typed'"
+        )
+        .await,
+        1,
+        "ui_events_fts kept in sync (one old event removed, one recent kept)"
+    );
+}
+
+/// Anchor-reference edge case: a kept (out-of-range, recent) frame can share
+/// its element rows with an in-range (old) anchor frame via
+/// `elements_ref_frame_id`. Stripping the old window must migrate those
+/// elements to the recent frame first, so the recent frame does NOT lose its
+/// elements. This is the subtle path that distinguishes a correct strip from a
+/// naive "DELETE elements WHERE frame_id IN (old frames)".
+#[tokio::test]
+async fn strip_heavy_text_preserves_elements_of_kept_frame_referencing_old_anchor() {
+    let db = DatabaseManager::new("sqlite::memory:", Default::default())
+        .await
+        .unwrap();
+
+    let old_ts = (Utc::now() - Duration::days(30)).to_rfc3339();
+    let recent_ts = Utc::now().to_rfc3339();
+
+    // Old frame 1 is the anchor that physically owns the element rows.
+    sqlx::query("INSERT INTO frames (id, timestamp, full_text) VALUES (1, ?1, 'old anchor')")
+        .bind(&old_ts)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Recent frame 2 is kept and references frame 1's elements (dedup of an
+    // identical scene), so its own elements live under frame_id = 1.
+    sqlx::query(
+        "INSERT INTO frames (id, timestamp, full_text, elements_ref_frame_id) VALUES (2, ?1, 'recent', 1)",
+    )
+    .bind(&recent_ts)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // The shared element rows sit on the anchor (frame_id = 1).
+    sqlx::query(
+        "INSERT INTO elements (frame_id, source, role, text) VALUES (1, 'accessibility', 'AXStaticText', 'sharedtoken')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let start = Utc::now() - Duration::days(31);
+    let end = Utc::now() - Duration::days(29);
+    db.strip_heavy_text_in_range(start, end).await.unwrap();
+
+    // The element must survive — migrated onto the kept frame 2, not deleted.
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM elements WHERE frame_id = 2").await,
+        1,
+        "kept frame must inherit the element rows from the stripped anchor"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM elements WHERE frame_id = 1").await,
+        0,
+        "old anchor's elements are moved off (it's in the stripped window)"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM elements_fts WHERE elements_fts MATCH 'sharedtoken'"
+        )
+        .await,
+        1,
+        "the shared element stays searchable via the kept frame"
+    );
+    // Frame 2 now owns the elements outright (ref cleared).
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM frames WHERE id = 2 AND elements_ref_frame_id IS NULL"
+        )
+        .await,
+        1,
+        "kept frame becomes the new anchor (ref cleared)"
+    );
+}
+
+/// Documents the actual on-disk reclaim semantics so the UI copy stays honest:
+/// the database runs with `auto_vacuum = NONE` (SQLite default — nothing in the
+/// schema or connection setup changes it), so `PRAGMA incremental_vacuum` is a
+/// no-op. Stripping frees pages onto the free list (reused by future writes,
+/// halting growth) but does NOT return bytes to the OS without a full VACUUM.
+#[tokio::test]
+async fn database_auto_vacuum_is_none_so_file_does_not_self_shrink() {
+    let db = DatabaseManager::new("sqlite::memory:", Default::default())
+        .await
+        .unwrap();
+    let mode = count(&db, "PRAGMA auto_vacuum").await; // 0=NONE, 1=FULL, 2=INCREMENTAL
+    assert_eq!(
+        mode, 0,
+        "auto_vacuum is NONE: lean halts growth + reuses freed pages, but the \
+         file only shrinks on a full VACUUM — keep the UI copy honest about this"
+    );
 }

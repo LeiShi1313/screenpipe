@@ -525,9 +525,16 @@ async fn do_local_cleanup(
                 warn!("retention: orphan chunk cleanup failed: {}", e);
             }
         }
-        // Both `All` and `Lean` free pages in db.sqlite, so reclaim them.
+        // Both `All` and `Lean` free pages in db.sqlite. NOTE: this only hands
+        // pages back to the OS when the DB is auto_vacuum=INCREMENTAL; today it
+        // ships as auto_vacuum=NONE, so this is effectively a no-op and the
+        // freed pages are reused by future writes instead. Net effect for the
+        // user: growth halts and space is reused, but the file doesn't shrink
+        // without a full VACUUM (intentionally not run here — it takes an
+        // exclusive lock that would stall live capture). Kept so the reclaim
+        // becomes real if/when the DB is migrated to incremental auto_vacuum.
         if matches!(mode, RetentionMode::All | RetentionMode::Lean) {
-            info!("retention: running incremental vacuum to reclaim disk space");
+            info!("retention: running incremental vacuum (reclaims pages only under auto_vacuum=incremental)");
             if let Err(e) = db.execute_raw_sql("PRAGMA incremental_vacuum(1000)").await {
                 warn!("retention: incremental vacuum failed: {}", e);
             }

@@ -31,6 +31,7 @@ import {
   Keyboard,
   MousePointerClick,
   FolderTree,
+  ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -276,6 +277,59 @@ function EncryptDataCard({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// Live, on-device-only illustration of what the current "what to hide"
+// selection masks. Pure example text — never real captured data. Each token
+// maps to a SpanLabel; it renders as the redaction placeholder when its
+// category is selected (secret is always on), otherwise as the raw value.
+// Makes the abstract category checkboxes concrete without a real frame.
+const REDACTION_PREVIEW_PARTS: (
+  | { text: string }
+  | { cat: string; value: string; ph: string }
+)[] = [
+  { text: "hi, i'm " },
+  { cat: "person", value: "Jordan Lee", ph: "[PERSON]" },
+  { text: " — email " },
+  { cat: "email", value: "jordan@example.com", ph: "[EMAIL]" },
+  { text: ", cell " },
+  { cat: "phone", value: "(555) 010-2983", ph: "[PHONE]" },
+  { text: ", ssn " },
+  { cat: "id", value: "412-09-1764", ph: "[ID]" },
+  { text: ", key " },
+  { cat: "secret", value: "AKIA…X7Q", ph: "[SECRET]" },
+  { text: "." },
+];
+
+function RedactionExamplePreview({ labels }: { labels: string[] }) {
+  const isOn = (cat: string) => cat === "secret" || labels.includes(cat);
+  return (
+    <div className="rounded-md border border-border bg-muted/40 px-2.5 py-2">
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+        Preview
+      </p>
+      <p className="text-xs leading-relaxed text-foreground">
+        {REDACTION_PREVIEW_PARTS.map((part, i) =>
+          "text" in part ? (
+            <span key={i} className="text-muted-foreground">
+              {part.text}
+            </span>
+          ) : isOn(part.cat) ? (
+            <span
+              key={i}
+              className="rounded-[3px] bg-foreground px-1 py-0.5 font-mono text-[10px] text-background align-baseline"
+            >
+              {part.ph}
+            </span>
+          ) : (
+            <span key={i} className="font-medium">
+              {part.value}
+            </span>
+          ),
+        )}
+      </p>
+    </div>
   );
 }
 
@@ -555,15 +609,15 @@ export function PrivacySection() {
     desc: string;
     always?: boolean;
   }[] = [
-    { value: "secret", label: "Secrets", desc: "passwords, API keys, tokens", always: true },
-    { value: "id", label: "IDs", desc: "SSNs, credit cards, account & license numbers" },
+    { value: "secret", label: "Passwords & keys", desc: "passwords, API keys, tokens", always: true },
+    { value: "id", label: "ID numbers", desc: "SSNs, credit cards, account & license numbers" },
     { value: "person", label: "Names", desc: "people's names" },
-    { value: "email", label: "Emails", desc: "email addresses" },
+    { value: "email", label: "Email addresses", desc: "email addresses" },
     { value: "phone", label: "Phone numbers", desc: "phone numbers" },
-    { value: "address", label: "Addresses", desc: "postal addresses" },
-    { value: "url", label: "URLs", desc: "links carrying tokens or session IDs" },
+    { value: "address", label: "Mailing addresses", desc: "postal addresses" },
+    { value: "url", label: "Links with tokens", desc: "links carrying tokens or session IDs" },
     { value: "date", label: "Dates", desc: "dates of birth, timestamps" },
-    { value: "sensitive", label: "Sensitive info", desc: "health, financial, identity context" },
+    { value: "sensitive", label: "Health & financial details", desc: "health, financial, identity context" },
   ];
 
   const piiRedactionLabels = useMemo<string[]>(() => {
@@ -613,31 +667,43 @@ export function PrivacySection() {
     "ui_window_title",
     "element_text",
   ];
-  const PII_COLUMN_OPTIONS: { value: string; label: string; desc: string }[] = [
+  // Form-field values default ON: it's the surface where real PII (typed
+  // passwords / field values a11y exposes that OCR never sees) actually
+  // lives. Kept OUT of CORE so the user can still uncheck it — it only
+  // seeds the default. Keep in sync with the Rust defaults
+  // (`RedactColumns::default` / `default_pii_redaction_columns`).
+  const DEFAULT_OPTIONAL_COLUMNS = ["element_properties"];
+  const PII_COLUMN_OPTIONS: {
+    value: string;
+    label: string;
+    desc: string;
+    recommended?: boolean;
+  }[] = [
     {
       value: "element_properties",
-      label: "Form field values (accessibility)",
-      desc: "the value of every captured control — catches password & form-field contents OCR can't see. Heaviest surface; off by default",
+      label: "Form field values",
+      desc: "what you type into forms — catches passwords and field contents that on-screen text misses",
+      recommended: true,
     },
     {
       value: "browser_url",
-      label: "Page URLs",
-      desc: "the browser address bar — often non-PII, and redacting breaks links",
+      label: "Web addresses",
+      desc: "the address bar — usually not private, and hiding them breaks links",
     },
     {
       value: "ui_element_name",
-      label: "Control names",
-      desc: "accessibility name of clicked/focused controls — usually static labels",
+      label: "Button & menu labels",
+      desc: "names like “Submit” or “Search” — rarely private",
     },
     {
       value: "ui_element_description",
-      label: "Control descriptions",
-      desc: "accessibility help text of controls",
+      label: "Help text on controls",
+      desc: "the longer description some buttons and menus expose",
     },
     {
       value: "a11y_url_field",
-      label: "URLs in accessibility data",
-      desc: "the url field inside captured accessibility nodes",
+      label: "Links inside app data",
+      desc: "URLs embedded in an app’s underlying structure",
     },
   ];
 
@@ -645,6 +711,7 @@ export function PrivacySection() {
     return (
       (settings.piiRedactionColumns as string[] | undefined) ?? [
         ...CORE_REDACTION_COLUMNS,
+        ...DEFAULT_OPTIONAL_COLUMNS,
       ]
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1380,8 +1447,10 @@ export function PrivacySection() {
                   verifies the open-source build before sending anything.
                 </p>
 
+                {/* Axis 1 — WHAT to hide (PII categories). The primary knob:
+                    content-type, applies wherever it's found. */}
                 <p className="text-xs font-medium text-foreground pt-2">
-                  Fields to redact
+                  What to hide
                 </p>
                 {PII_FIELD_OPTIONS.map((opt) => {
                   const checked =
@@ -1419,51 +1488,70 @@ export function PrivacySection() {
                     </label>
                   );
                 })}
+                {textRedactionOn && (
+                  <RedactionExamplePreview labels={piiRedactionLabels} />
+                )}
                 <p className="text-[11px] text-muted-foreground pt-0.5">
                   Unselected types stay visible so your timeline remains
                   searchable. Secrets are always removed in both modes.
                 </p>
 
-                {/* Column allow-list is text-only — hide it when text
-                    redaction is off (Images-only Smart mode). */}
+                {/* Axis 2 — WHERE to look (captured surfaces). Advanced and
+                    orthogonal to the categories above; collapsed by default so
+                    most users only deal with "What to hide". Text-only, so
+                    hide it entirely when text redaction is off (Images-only
+                    Smart mode). */}
                 {textRedactionOn && (
-                  <>
-                    <p className="text-xs font-medium text-foreground pt-3 mt-1.5 border-t border-border">
-                      Where to redact (text)
-                    </p>
-                    {PII_COLUMN_OPTIONS.map((opt) => {
-                      const checked = piiRedactionColumns.includes(opt.value);
-                      return (
-                        <label
-                          key={opt.value}
-                          className="flex items-start gap-2 text-xs cursor-pointer"
-                        >
-                          <input
-                            type="checkbox"
-                            className="mt-0.5"
-                            checked={checked}
-                            onChange={(e) =>
-                              handlePiiColumnToggle(opt.value, e.target.checked)
-                            }
-                          />
-                          <span>
-                            <span className="font-medium text-foreground">
-                              {opt.label}
+                  <details className="group pt-3 mt-1.5 border-t border-border">
+                    <summary className="flex cursor-pointer select-none items-center gap-1.5 text-xs font-medium text-foreground list-none [&::-webkit-details-marker]:hidden">
+                      <ChevronRight className="h-3 w-3 shrink-0 transition-transform group-open:rotate-90" />
+                      Where we look
+                      <span className="font-normal text-muted-foreground">
+                        — advanced
+                      </span>
+                    </summary>
+                    <div className="mt-2 space-y-1.5">
+                      <p className="text-[11px] text-muted-foreground">
+                        We always scan what you type, your clipboard,
+                        transcripts, window titles, and on-screen text. Turn on
+                        any of these extra places the same info can hide.
+                      </p>
+                      {PII_COLUMN_OPTIONS.map((opt) => {
+                        const checked = piiRedactionColumns.includes(opt.value);
+                        return (
+                          <label
+                            key={opt.value}
+                            className="flex items-start gap-2 text-xs cursor-pointer"
+                          >
+                            <input
+                              type="checkbox"
+                              className="mt-0.5"
+                              checked={checked}
+                              onChange={(e) =>
+                                handlePiiColumnToggle(
+                                  opt.value,
+                                  e.target.checked,
+                                )
+                              }
+                            />
+                            <span>
+                              <span className="font-medium text-foreground">
+                                {opt.label}
+                              </span>
+                              {opt.recommended && (
+                                <span className="text-muted-foreground">
+                                  {" "}(recommended)
+                                </span>
+                              )}
+                              <span className="text-muted-foreground">
+                                {" "}— {opt.desc}
+                              </span>
                             </span>
-                            <span className="text-muted-foreground">
-                              {" "}— {opt.desc}
-                            </span>
-                          </span>
-                        </label>
-                      );
-                    })}
-                    <p className="text-[11px] text-muted-foreground pt-0.5">
-                      Typed text, clipboard, transcripts, window titles, and
-                      on-screen text are always redacted. These extra capture
-                      surfaces are off by default — enable any that matter for
-                      your threat model.
-                    </p>
-                  </>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </details>
                 )}
 
                 <label className="flex items-start gap-2 text-xs cursor-pointer pt-2 mt-1.5 border-t border-border">

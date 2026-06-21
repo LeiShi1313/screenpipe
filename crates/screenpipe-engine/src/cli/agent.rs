@@ -27,7 +27,7 @@ pub enum AgentCommand {
     /// Install the screenpipe skill + register the MCP server into an agent.
     Setup {
         /// Which agent to wire up.
-        #[arg(value_parser = ["openclaw", "hermes", "claude"])]
+        #[arg(value_parser = ["openclaw", "hermes", "claude-code", "claude-desktop", "codex", "cursor", "windsurf"])]
         target: String,
         /// screenpipe REST API base URL the skill + MCP should target.
         /// Default `http://localhost:3030` (agent co-located with the engine).
@@ -48,7 +48,8 @@ pub async fn handle_agent_command(cmd: &AgentCommand) -> Result<()> {
 /// OpenClaw/Hermes cards exactly so CLI and GUI setups agree.
 struct AgentLayout {
     name: &'static str,
-    skills_dir: PathBuf,
+    /// `None` for MCP-only agents (Claude Desktop, Codex, Cursor, Windsurf).
+    skills_dir: Option<PathBuf>,
     mcp_path: PathBuf,
     mcp_format: McpFormat,
 }
@@ -57,6 +58,7 @@ struct AgentLayout {
 enum McpFormat {
     Json,
     Yaml,
+    Toml,
 }
 
 fn layout(target: &str) -> Result<AgentLayout> {
@@ -64,24 +66,64 @@ fn layout(target: &str) -> Result<AgentLayout> {
     Ok(match target {
         "openclaw" => AgentLayout {
             name: "OpenClaw",
-            skills_dir: h.join("openclaw/skills"),
+            skills_dir: Some(h.join("openclaw/skills")),
             mcp_path: h.join("openclaw/mcp.json"),
             mcp_format: McpFormat::Json,
         },
         "hermes" => AgentLayout {
             name: "Hermes",
-            skills_dir: h.join(".hermes/skills"),
+            skills_dir: Some(h.join(".hermes/skills")),
             mcp_path: h.join(".hermes/config.yaml"),
             mcp_format: McpFormat::Yaml,
         },
-        "claude" => AgentLayout {
-            name: "Claude",
-            skills_dir: h.join(".claude/skills"),
-            mcp_path: h.join(".claude/mcp.json"),
+        "claude-code" => AgentLayout {
+            name: "Claude Code",
+            skills_dir: Some(h.join(".claude/skills")),
+            mcp_path: h.join(".claude.json"),
             mcp_format: McpFormat::Json,
         },
-        other => anyhow::bail!("unknown agent target '{other}' (use openclaw, hermes, or claude)"),
+        "claude-desktop" => AgentLayout {
+            name: "Claude Desktop",
+            skills_dir: None, // desktop app is MCP-only
+            mcp_path: claude_desktop_config(&h)?,
+            mcp_format: McpFormat::Json,
+        },
+        "codex" => AgentLayout {
+            name: "Codex",
+            skills_dir: None,
+            mcp_path: h.join(".codex/config.toml"),
+            mcp_format: McpFormat::Toml,
+        },
+        "cursor" => AgentLayout {
+            name: "Cursor",
+            skills_dir: None,
+            mcp_path: h.join(".cursor/mcp.json"),
+            mcp_format: McpFormat::Json,
+        },
+        "windsurf" => AgentLayout {
+            name: "Windsurf",
+            skills_dir: None,
+            mcp_path: h.join(".codeium/windsurf/mcp_config.json"),
+            mcp_format: McpFormat::Json,
+        },
+        other => anyhow::bail!(
+            "unknown agent target '{other}' (use: openclaw, hermes, claude-code, claude-desktop, codex, cursor, windsurf)"
+        ),
     })
+}
+
+/// Claude Desktop's MCP config path (the desktop app is macOS/Windows only).
+fn claude_desktop_config(home: &Path) -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        Ok(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+    } else if cfg!(target_os = "windows") {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join("AppData/Roaming"));
+        Ok(appdata.join("Claude/claude_desktop_config.json"))
+    } else {
+        anyhow::bail!("claude-desktop is only available on macOS/Windows")
+    }
 }
 
 /// Strip the scheme from an API URL to get the `host:port` the SKILL.md uses.
@@ -108,14 +150,19 @@ fn setup(target: &str, api_url: &str) -> Result<()> {
     let remote = host_port(api_url) != "localhost:3030";
     println!("wiring screenpipe → {} (api: {})", l.name, api_url);
 
-    let api_path = write_skill(&l.skills_dir, "screenpipe-api", API_SKILL_MD, api_url)?;
-    let cli_path = write_skill(&l.skills_dir, "screenpipe-cli", CLI_SKILL_MD, api_url)?;
-    println!("  ✓ skill {}", api_path.display());
-    println!("  ✓ skill {}", cli_path.display());
+    if let Some(skills_dir) = &l.skills_dir {
+        let api_path = write_skill(skills_dir, "screenpipe-api", API_SKILL_MD, api_url)?;
+        let cli_path = write_skill(skills_dir, "screenpipe-cli", CLI_SKILL_MD, api_url)?;
+        println!("  ✓ skill {}", api_path.display());
+        println!("  ✓ skill {}", cli_path.display());
+    } else {
+        println!("  · {} is MCP-only (no skills dir)", l.name);
+    }
 
     match l.mcp_format {
         McpFormat::Json => merge_mcp_json(&l.mcp_path, remote, api_url)?,
         McpFormat::Yaml => merge_mcp_yaml(&l.mcp_path, remote, api_url)?,
+        McpFormat::Toml => merge_mcp_toml(&l.mcp_path, remote, api_url)?,
     }
 
     println!(
@@ -200,6 +247,39 @@ fn merge_mcp_yaml(path: &Path, remote: bool, api_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Add the `screenpipe` server to a TOML MCP config (Codex). No TOML lib —
+/// append a `[mcp_servers.screenpipe]` table if absent, preserving the rest of
+/// the file; if one already exists, leave it untouched.
+fn merge_mcp_toml(path: &Path, remote: bool, api_url: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let env_block = if remote {
+        format!("\n[mcp_servers.screenpipe.env]\nSCREENPIPE_API_URL = \"{api_url}\"\n")
+    } else {
+        String::new()
+    };
+    let block = format!(
+        "[mcp_servers.screenpipe]\ncommand = \"npx\"\nargs = [\"-y\", \"screenpipe-mcp@latest\"]\n{env_block}"
+    );
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if existing.contains("[mcp_servers.screenpipe]") {
+        println!("  • {} already has [mcp_servers.screenpipe]; left as-is", path.display());
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&block);
+    std::fs::write(path, out)?;
+    println!("  ✓ mcp   {}", path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +324,28 @@ mod tests {
             v["mcpServers"]["screenpipe"]["env"]["SCREENPIPE_API_URL"],
             "http://box:3030"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_mcp_toml() {
+        let dir = std::env::temp_dir().join(format!("sp-agent-toml-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // pre-existing config preserved; our table appended with env.
+        std::fs::write(&path, "model = \"o3\"\n").unwrap();
+        merge_mcp_toml(&path, true, "http://box:3030").unwrap();
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert!(s.contains("model = \"o3\""));
+        assert!(s.contains("[mcp_servers.screenpipe]"));
+        assert!(s.contains("SCREENPIPE_API_URL = \"http://box:3030\""));
+
+        // idempotent: no duplicate table.
+        merge_mcp_toml(&path, true, "http://box:3030").unwrap();
+        let s2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(s2.matches("[mcp_servers.screenpipe]").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

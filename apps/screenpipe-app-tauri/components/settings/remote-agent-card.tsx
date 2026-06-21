@@ -14,9 +14,9 @@ import { Button } from "@/components/ui/button";
 import { commands } from "@/lib/utils/tauri";
 
 // One unified "Remote agent" entry that supersedes the separate OpenClaw and
-// Hermes cards: pick an agent, then run ONE command on the machine where that
-// agent lives (your VPS / cloud box / Mac mini) to wire screenpipe into it —
-// skills (where supported) + the MCP server, in the right format. The Sync
+// Hermes cards. Pick an agent, then set screenpipe up on the machine where that
+// agent lives (your VPS / cloud box / Mac mini) the easy way: copy one command
+// to run on the box, or copy a prompt for your own AI to do it. The Sync
 // (remote) tab pushes your data to that box. New targets = one entry here; the
 // `screenpipe agent setup` CLI already covers cursor/windsurf too.
 
@@ -164,70 +164,28 @@ const TARGETS: { id: TargetId; label: string; props: AgentCardProps }[] = [
 
 export function RemoteAgentCard() {
   const [targetId, setTargetId] = useState<TargetId>("openclaw");
-  const [copied, setCopied] = useState(false);
-  const [run, setRun] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [msg, setMsg] = useState("");
+  const [copied, setCopied] = useState<"" | "cmd" | "prompt">("");
   const target = TARGETS.find((t) => t.id === targetId) ?? TARGETS[0];
 
+  const name = target.props.name;
   const hasSkills = target.props.skills.length > 0;
-  const setupCmd = `npx screenpipe@latest agent setup ${target.id}`;
 
-  const copyCmd = async () => {
-    try {
-      await commands.copyTextToClipboard(setupCmd);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {}
-  };
+  const setupCmd = `npx -y screenpipe@latest agent setup ${target.id}`;
 
-  // One-click over SSH: reuse the host + key the user entered in the Sync
-  // (remote) tab (stored under "<target>-sync-config") and run `agent setup`
-  // on that box — no terminal.
-  const setupOverSsh = async () => {
-    let saved: {
-      host?: string;
-      port?: string;
-      user?: string;
-      keyPath?: string;
-      remotePath?: string;
-      intervalMinutes?: number;
-      enabled?: boolean;
-    } | null = null;
+  // A prompt the user pastes into their own AI (Claude Code, Cursor, Codex, …)
+  // which already has their SSH access — it does the remote setup for them.
+  const aiPrompt = `set up screenpipe on the machine where my "${name}" agent runs (ssh into it if it's remote). run this there:
+
+  ${setupCmd}
+
+that installs the screenpipe MCP server${hasSkills ? " + skill" : ""} so ${name} can search my screen + audio history. then restart ${name}. if screenpipe runs on a different host than ${name}, append \`--api-url http://<that-host>:3030\`.`;
+
+  const copy = async (text: string, which: "cmd" | "prompt") => {
     try {
-      const raw = localStorage?.getItem(`${target.id}-sync-config`);
-      if (raw) saved = JSON.parse(raw);
+      await commands.copyTextToClipboard(text);
+      setCopied(which);
+      setTimeout(() => setCopied(""), 1500);
     } catch {}
-    if (!saved?.host || !saved?.user || !saved?.keyPath) {
-      setRun("error");
-      setMsg("add your server's host + SSH key in the Sync (remote) tab below first.");
-      return;
-    }
-    setRun("running");
-    setMsg("");
-    try {
-      const cfg = {
-        host: saved.host,
-        port: parseInt(saved.port ?? "22") || 22,
-        user: saved.user,
-        key_path: saved.keyPath,
-        remote_path: saved.remotePath || "~/screenpipe-data",
-        interval_minutes: saved.intervalMinutes ?? 5,
-        enabled: !!saved.enabled,
-      };
-      const res = await commands.remoteSyncExecSetup(cfg, target.id);
-      if (res.status === "error") throw new Error(res.error);
-      const { code, stdout, stderr } = res.data;
-      if (code === 0) {
-        setRun("done");
-        setMsg(`✓ wired ${target.props.name} on ${saved.host}. restart it there.`);
-      } else {
-        setRun("error");
-        setMsg((stderr || stdout || `exited ${code}`).slice(0, 400));
-      }
-    } catch (e) {
-      setRun("error");
-      setMsg(e instanceof Error ? e.message : String(e));
-    }
   };
 
   return (
@@ -238,9 +196,7 @@ export function RemoteAgentCard() {
           value={targetId}
           onChange={(e) => {
             setTargetId(e.target.value as TargetId);
-            setCopied(false);
-            setRun("idle");
-            setMsg("");
+            setCopied("");
           }}
           className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground"
         >
@@ -252,35 +208,54 @@ export function RemoteAgentCard() {
         </select>
       </div>
 
-      {/* Remote-first: one click over SSH, or the command to run yourself. */}
       <div className="rounded-md border border-border bg-muted/40 p-3 space-y-3">
         <p className="text-xs text-muted-foreground leading-relaxed">
-          <span className="text-foreground font-medium">Set it up where {target.props.name} runs</span>{" "}
-          — your VPS, a cloud box, or a Mac mini. It wires the screenpipe MCP
-          {hasSkills ? " + skill" : ""} into {target.props.name}.
+          <span className="text-foreground font-medium">Set screenpipe up where {name} runs</span>{" "}
+          — your VPS, a cloud box, or a Mac mini. Two easy ways:
         </p>
-        <div className="flex items-center gap-2 flex-wrap">
-          <Button size="sm" className="h-8 text-xs" onClick={setupOverSsh} disabled={run === "running"}>
-            {run === "running" ? "setting up over SSH…" : "Set up on my remote server"}
-          </Button>
-          <span className="text-[11px] text-muted-foreground">
-            uses your Sync (remote) SSH login below
-          </span>
-        </div>
-        {run === "done" && <p className="text-[11px] text-green-600 dark:text-green-500">{msg}</p>}
-        {run === "error" && <p className="text-[11px] text-red-500">{msg}</p>}
 
-        <div className="pt-2 border-t border-border/60">
-          <p className="text-[11px] text-muted-foreground mb-1">or run it yourself on the box:</p>
+        <div className="space-y-1.5">
+          <p className="text-[11px] text-muted-foreground">
+            1. Run this on the box (SSH in, paste):
+          </p>
           <div className="flex items-center gap-2">
             <code className="flex-1 text-xs font-mono bg-background border border-border rounded px-2 py-1.5 overflow-x-auto whitespace-nowrap">
               {setupCmd}
             </code>
-            <Button size="sm" variant="outline" className="h-7 text-xs shrink-0" onClick={copyCmd}>
-              {copied ? "copied" : "copy"}
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs shrink-0"
+              onClick={() => copy(setupCmd, "cmd")}
+            >
+              {copied === "cmd" ? "copied" : "copy"}
             </Button>
           </div>
         </div>
+
+        <div className="space-y-1.5 pt-2 border-t border-border/60">
+          <p className="text-[11px] text-muted-foreground">
+            2. Or paste this into your AI (Claude, Cursor, Codex…) and let it set up your server:
+          </p>
+          <div className="flex items-start gap-2">
+            <pre className="flex-1 text-[11px] font-mono bg-background border border-border rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap max-h-28">
+              {aiPrompt}
+            </pre>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs shrink-0"
+              onClick={() => copy(aiPrompt, "prompt")}
+            >
+              {copied === "prompt" ? "copied" : "copy"}
+            </Button>
+          </div>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground leading-relaxed">
+          then push your screenpipe data to that box via the{" "}
+          <span className="font-medium">Sync (remote)</span> tab below.
+        </p>
       </div>
 
       {/* Manual MCP/skill snippets + remote-sync; key resets tabs on change */}

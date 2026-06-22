@@ -639,16 +639,13 @@ async fn run_download(
     let metadata_dir = output_dir.join("metadata");
     let mut seen: HashSet<String> = HashSet::new();
 
-    // Process time windows depth-first, splitting any window that saturates the
-    // page limit. This is complete regardless of server ordering: every blob's
-    // timestamp falls into some sub-window small enough to return fully.
-    let mut windows: Vec<(DateTime<Utc>, DateTime<Utc>)> = vec![(start, end)];
+    // Walk time windows depth-first, splitting any window that saturates the
+    // page limit (see `WindowWalker`). Complete regardless of server ordering:
+    // every blob's timestamp falls into some sub-window small enough to return
+    // in full.
+    let mut walker = WindowWalker::new(start, end, DOWNLOAD_PAGE_LIMIT as usize);
 
-    while let Some((win_start, win_end)) = windows.pop() {
-        if win_start > win_end {
-            continue;
-        }
-
+    while let Some((win_start, win_end)) = walker.next_window() {
         let blobs = manager
             .download_with_meta(
                 Some(win_start.to_rfc3339()),
@@ -666,25 +663,19 @@ async fn run_download(
                 )
             })?;
 
-        let saturated = blobs.len() as u32 >= DOWNLOAD_PAGE_LIMIT;
-        let splittable = (win_end - win_start) > Duration::seconds(1);
-
-        if saturated && splittable {
-            // Can't trust this page is complete — split and retry the halves.
-            // Overlap at `mid` is fine; dedup by blob_id drops the repeat.
-            let mid = win_start + (win_end - win_start) / 2;
-            windows.push((mid, win_end));
-            windows.push((win_start, mid));
-            continue;
-        }
-
-        if saturated && !splittable {
-            let mut g = progress.write().await;
-            g.warnings.push(format!(
-                "more than {} blobs at {} — some may be missing",
-                DOWNLOAD_PAGE_LIMIT,
-                win_start.to_rfc3339()
-            ));
+        match walker.on_result((win_start, win_end), blobs.len()) {
+            // Page came back full and the window can be split — discard this
+            // batch and let the halves re-fetch it (dedup drops the overlap).
+            WindowDecision::Split => continue,
+            WindowDecision::ProcessTruncated => {
+                let mut g = progress.write().await;
+                g.warnings.push(format!(
+                    "more than {} blobs at {} — some may be missing",
+                    DOWNLOAD_PAGE_LIMIT,
+                    win_start.to_rfc3339()
+                ));
+            }
+            WindowDecision::Process => {}
         }
 
         for blob in blobs {
@@ -696,6 +687,71 @@ async fn run_download(
     }
 
     Ok(())
+}
+
+/// What to do with a window's results, decided from how many blobs came back.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WindowDecision {
+    /// Page wasn't full — results are complete; write them.
+    Process,
+    /// Page was full but the window can't be split further; write what we got
+    /// and warn that some blobs at this instant may be missing.
+    ProcessTruncated,
+    /// Page was full and the window can be split — discard, retry the halves.
+    Split,
+}
+
+/// Splits a time range into windows so we never silently drop blobs the server
+/// truncated to its page limit.
+///
+/// The cloud has no "list all blobs" API, so we enumerate by time. The server
+/// returns at most `page_limit` blobs per window, so a window that comes back
+/// *full* might be hiding more — we can't tell. So we split any full window in
+/// half and retry, down to a 1-second floor (below which splitting can't help).
+///
+/// Kept pure and synchronous on purpose: the splitting logic is the risky part
+/// (completeness, termination), and this lets it be unit-tested without a
+/// server. `run_download` is the live driver that feeds it real page counts.
+struct WindowWalker {
+    /// Windows still to fetch (LIFO → depth-first).
+    stack: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    page_limit: usize,
+}
+
+impl WindowWalker {
+    fn new(start: DateTime<Utc>, end: DateTime<Utc>, page_limit: usize) -> Self {
+        let stack = if start <= end { vec![(start, end)] } else { Vec::new() };
+        Self { stack, page_limit }
+    }
+
+    /// The next window to fetch, or `None` when the walk is complete.
+    fn next_window(&mut self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.stack.pop()
+    }
+
+    /// Feed back how many blobs the window returned. When the window is full
+    /// and splittable, enqueues its two halves (overlapping at the midpoint;
+    /// the caller dedups). Returns what the caller should do with the batch.
+    fn on_result(
+        &mut self,
+        window: (DateTime<Utc>, DateTime<Utc>),
+        returned: usize,
+    ) -> WindowDecision {
+        let (start, end) = window;
+        let saturated = returned >= self.page_limit;
+        let splittable = (end - start) > Duration::seconds(1);
+
+        match (saturated, splittable) {
+            (false, _) => WindowDecision::Process,
+            (true, false) => WindowDecision::ProcessTruncated,
+            (true, true) => {
+                let mid = start + (end - start) / 2;
+                self.stack.push((mid, end));
+                self.stack.push((start, mid));
+                WindowDecision::Split
+            }
+        }
+    }
 }
 
 /// Write one decrypted blob to disk and update progress.
@@ -1594,5 +1650,136 @@ mod tests {
         assert!(parse_ts("2026-06-20T14:01:38+00:00").is_some());
         assert!(parse_ts("2026-06-20 14:01:38.123").is_some());
         assert!(parse_ts("not a timestamp").is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // WindowWalker — the risky enumeration logic. Drive the *real* walker with
+    // a synthetic "server" so we exercise the actual split/terminate code path.
+    // ------------------------------------------------------------------------
+
+    /// Run the real `WindowWalker` against a synthetic set of blob timestamps
+    /// (given as whole-second offsets from the epoch). The fake server returns
+    /// every blob whose timestamp falls in `[start, end]`, capped at
+    /// `page_limit` — exactly what the cloud `/download` does.
+    ///
+    /// Returns `(covered_secs, steps, truncated_windows)`.
+    fn simulate(blob_secs: &[i64], page_limit: usize) -> (HashSet<i64>, usize, usize) {
+        use chrono::TimeZone;
+        let base = Utc.timestamp_opt(0, 0).unwrap();
+        let at = |s: i64| base + Duration::seconds(s);
+
+        let start = at(*blob_secs.iter().min().unwrap());
+        // Pad the end exactly like run_download does.
+        let end = at(*blob_secs.iter().max().unwrap()) + Duration::seconds(1);
+
+        let mut walker = WindowWalker::new(start, end, page_limit);
+        let mut covered: HashSet<i64> = HashSet::new();
+        let mut steps = 0usize;
+        let mut truncated = 0usize;
+
+        while let Some((ws, we)) = walker.next_window() {
+            steps += 1;
+            assert!(steps < 1_000_000, "walk did not terminate");
+
+            // Fake server: blobs in [ws, we], capped at page_limit.
+            let hits: Vec<i64> = blob_secs
+                .iter()
+                .copied()
+                .filter(|s| {
+                    let t = at(*s);
+                    t >= ws && t <= we
+                })
+                .collect();
+            let returned = hits.len().min(page_limit);
+
+            match walker.on_result((ws, we), returned) {
+                WindowDecision::Split => {} // discard; halves enqueued
+                WindowDecision::Process => {
+                    // Not full → all hits were returned.
+                    covered.extend(hits);
+                }
+                WindowDecision::ProcessTruncated => {
+                    // Full + unsplittable → only `page_limit` came back; the
+                    // rest are genuinely lost (and we warned). Mirror that.
+                    truncated += 1;
+                    covered.extend(hits.into_iter().take(page_limit));
+                }
+            }
+        }
+        (covered, steps, truncated)
+    }
+
+    #[test]
+    fn walker_covers_every_blob_when_spread_out() {
+        // 100 blobs, 10s apart, tiny page limit → forces lots of splitting.
+        let blobs: Vec<i64> = (0..100).map(|i| i * 10).collect();
+        let (covered, steps, truncated) = simulate(&blobs, 10);
+
+        let expected: HashSet<i64> = blobs.iter().copied().collect();
+        assert_eq!(covered, expected, "every blob must be downloaded exactly once");
+        assert_eq!(truncated, 0, "no window should be truncated");
+        assert!(steps > 1, "must have split at least once");
+    }
+
+    #[test]
+    fn walker_covers_irregular_clusters() {
+        // Dense clusters next to sparse points — but never page_limit at one sec.
+        let mut blobs: Vec<i64> = Vec::new();
+        for i in 0..40 {
+            blobs.push(100 + i); // 40 consecutive seconds (cluster)
+        }
+        blobs.push(5);
+        blobs.push(5000);
+        blobs.push(9999);
+        let (covered, _steps, truncated) = simulate(&blobs, 8);
+
+        let expected: HashSet<i64> = blobs.iter().copied().collect();
+        assert_eq!(covered, expected);
+        assert_eq!(truncated, 0);
+    }
+
+    #[test]
+    fn walker_handles_single_blob() {
+        let (covered, _steps, truncated) = simulate(&[42], 10);
+        assert_eq!(covered, HashSet::from([42]));
+        assert_eq!(truncated, 0);
+    }
+
+    #[test]
+    fn walker_terminates_and_warns_when_too_dense_to_split() {
+        // 50 blobs all at the SAME second, page limit 10. No split can help —
+        // it must terminate, take 10, and flag the rest as truncated.
+        let blobs = vec![7i64; 50];
+        let (covered, steps, truncated) = simulate(&blobs, 10);
+
+        assert_eq!(covered, HashSet::from([7])); // dedup → one unique second
+        assert!(truncated >= 1, "must report truncation, not silently drop");
+        assert!(steps < 1000, "must terminate quickly");
+    }
+
+    #[test]
+    fn walker_decision_matches_saturation_and_splittability() {
+        use chrono::TimeZone;
+        let base = Utc.timestamp_opt(0, 0).unwrap();
+        let mut w = WindowWalker::new(base, base + Duration::seconds(100), 10);
+        let win = w.next_window().unwrap();
+
+        // Not full → process.
+        assert_eq!(w.on_result(win, 9), WindowDecision::Process);
+        // Full + wide window → split (and enqueue two halves).
+        assert_eq!(w.on_result(win, 10), WindowDecision::Split);
+        assert_eq!(w.stack.len(), 2);
+
+        // Full + 1-second window → can't split, must truncate.
+        let tiny = (base, base + Duration::seconds(1));
+        assert_eq!(w.on_result(tiny, 10), WindowDecision::ProcessTruncated);
+    }
+
+    #[test]
+    fn walker_empty_when_start_after_end() {
+        use chrono::TimeZone;
+        let base = Utc.timestamp_opt(0, 0).unwrap();
+        let mut w = WindowWalker::new(base + Duration::seconds(10), base, 10);
+        assert!(w.next_window().is_none());
     }
 }

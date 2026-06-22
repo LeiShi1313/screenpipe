@@ -15,11 +15,13 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use oasgen::{oasgen, OaSchema};
-use screenpipe_core::sync::{BlobType, SyncClientConfig, SyncManager};
+use screenpipe_core::sync::{BlobType, DownloadedBlob, SyncClientConfig, SyncManager};
 use screenpipe_db::DatabaseManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -38,12 +40,16 @@ use crate::sync_provider::{
 /// Runtime archive state stored in AppState.
 pub struct ArchiveState {
     inner: Arc<RwLock<Option<ArchiveRuntime>>>,
+    /// Progress of the "download my archive" export (independent of the
+    /// upload loop — works even when archive uploading is disabled).
+    download: Arc<RwLock<DownloadProgress>>,
 }
 
 impl Default for ArchiveState {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
+            download: Arc::new(RwLock::new(DownloadProgress::default())),
         }
     }
 }
@@ -135,6 +141,46 @@ pub struct ArchiveStatusResponse {
     pub media_files_pending: u64,
 }
 
+/// Request to start a "download my archive" export.
+#[derive(Debug, Deserialize, OaSchema)]
+pub struct ArchiveDownloadRequest {
+    /// Auth token — used to derive the same encryption keys the upload used.
+    pub token: String,
+    /// Destination folder. Defaults to `<screenpipe_dir>/archive-export`.
+    pub output_dir: Option<String>,
+}
+
+/// Progress of the archive export (download). Polled by the UI.
+#[derive(Debug, Clone, Default, Serialize, OaSchema)]
+pub struct DownloadProgress {
+    /// A download is currently in progress.
+    pub running: bool,
+    /// The last download finished (successfully or with an error).
+    pub done: bool,
+    /// Folder the data is being written to.
+    pub output_dir: Option<String>,
+    /// When the current/last run started (RFC3339).
+    pub started_at: Option<String>,
+    /// When the current/last run finished (RFC3339).
+    pub finished_at: Option<String>,
+    /// Best-effort total blob count from the cloud (for a progress bar).
+    pub total_blobs: u64,
+    /// Number of blobs downloaded so far.
+    pub blobs_downloaded: u64,
+    /// Files written to disk so far.
+    pub files_written: u64,
+    /// Media files (mp4/jpg/png) written so far.
+    pub media_files: u64,
+    /// Metadata (json) files written so far.
+    pub metadata_files: u64,
+    /// Total bytes written to disk so far.
+    pub bytes_written: u64,
+    /// Fatal error that aborted the run, if any.
+    pub error: Option<String>,
+    /// Non-fatal warnings (e.g. a window that may be truncated).
+    pub warnings: Vec<String>,
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -187,10 +233,7 @@ pub async fn archive_init(
 
         // Derive encryption keys locally from the token — no server call,
         // no dependency on sync's key storage.
-        let password = format!(
-            "screenpipe-archive-{:x}",
-            md5::compute(request.token.as_bytes())
-        );
+        let password = archive_password(&request.token);
 
         mgr.initialize_local(&password).await.map_err(|e| {
             error!("archive: failed to derive encryption keys: {}", e);
@@ -390,6 +433,338 @@ pub async fn archive_status(
             }))
         }
     }
+}
+
+// ============================================================================
+// Download / export ("download my archive")
+// ============================================================================
+
+/// Max blobs requested per `/download` page. If a time window returns this
+/// many, we can't be sure the page is complete, so we split the window and
+/// retry the halves.
+///
+/// Kept at 100 deliberately: the cross-device sync loop already requests 100
+/// and depends on the server honoring it, so 100 is a value the server is
+/// known to return in full. If we requested more than the server's cap, a
+/// saturated window would come back *under* our limit and we'd wrongly treat
+/// it as complete — silently dropping data. 100 makes "returned == limit" a
+/// reliable "there may be more here" signal.
+const DOWNLOAD_PAGE_LIMIT: u32 = 100;
+
+/// Derive the archive encryption password from the user's token.
+///
+/// Upload (`archive_init`) and export (`archive_download`) MUST use the exact
+/// same derivation, or the export cannot decrypt previously-uploaded blobs.
+fn archive_password(token: &str) -> String {
+    format!("screenpipe-archive-{:x}", md5::compute(token.as_bytes()))
+}
+
+/// Build a `SyncManager` with the archive's locally-derived encryption keys.
+/// Independent of the upload runtime, so export works even when archiving is
+/// disabled.
+async fn build_archive_manager(token: &str) -> anyhow::Result<Arc<SyncManager>> {
+    let machine_id = screenpipe_core::sync::get_or_create_machine_id();
+    let device_name = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+    let device_os = std::env::consts::OS.to_string();
+
+    let config = SyncClientConfig::new(token.to_string(), machine_id, device_name, device_os);
+    let mgr = SyncManager::new(config).map_err(|e| anyhow::anyhow!("sync manager: {}", e))?;
+
+    mgr.initialize_local(&archive_password(token))
+        .await
+        .map_err(|e| anyhow::anyhow!("init encryption: {}", e))?;
+
+    Ok(Arc::new(mgr))
+}
+
+/// POST /archive/download — export all archived data to a local folder.
+///
+/// "Dumb mode": downloads every archived blob, decrypts it, and writes it to
+/// disk (`media/` for mp4/jpg/png, `metadata/` for the JSON chunks). Runs in
+/// the background; poll `/archive/download/status` for progress.
+#[oasgen]
+pub async fn archive_download(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ArchiveDownloadRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    // One download at a time.
+    {
+        let guard = state.archive_state.download.read().await;
+        if guard.running {
+            return Err((
+                StatusCode::CONFLICT,
+                JsonResponse(json!({"error": "a download is already in progress"})),
+            ));
+        }
+    }
+
+    if request.token.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({"error": "token is required"})),
+        ));
+    }
+
+    // Resolve destination. Default to a well-known folder so the UI can be a
+    // single click with no folder picker.
+    let output_dir: PathBuf = match request
+        .output_dir
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(dir) => PathBuf::from(dir),
+        None => state.screenpipe_dir.join("archive-export"),
+    };
+
+    // Create output dirs up-front so a bad path fails fast (before we report
+    // "running").
+    let media_dir = output_dir.join("media");
+    let metadata_dir = output_dir.join("metadata");
+    if let Err(e) =
+        std::fs::create_dir_all(&media_dir).and_then(|_| std::fs::create_dir_all(&metadata_dir))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({
+                "error": format!("cannot create output dir {}: {}", output_dir.display(), e)
+            })),
+        ));
+    }
+
+    // Build the sync manager (also validates the token-derived keys).
+    let manager = build_archive_manager(&request.token).await.map_err(|e| {
+        error!("archive-download: init failed: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonResponse(json!({"error": format!("failed to initialize: {}", e)})),
+        )
+    })?;
+
+    // Reset progress and mark running.
+    {
+        let mut guard = state.archive_state.download.write().await;
+        *guard = DownloadProgress {
+            running: true,
+            output_dir: Some(output_dir.to_string_lossy().to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            ..Default::default()
+        };
+    }
+
+    spawn_download_task(manager, output_dir.clone(), state.archive_state.download.clone());
+
+    info!("archive-download: started → {}", output_dir.display());
+
+    Ok(JsonResponse(json!({
+        "success": true,
+        "output_dir": output_dir.to_string_lossy().to_string(),
+    })))
+}
+
+/// GET /archive/download/status — progress of the export.
+#[oasgen]
+pub async fn archive_download_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<JsonResponse<DownloadProgress>, (StatusCode, JsonResponse<Value>)> {
+    let guard = state.archive_state.download.read().await;
+    Ok(JsonResponse(guard.clone()))
+}
+
+fn spawn_download_task(
+    manager: Arc<SyncManager>,
+    output_dir: PathBuf,
+    progress: Arc<RwLock<DownloadProgress>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = run_download(&manager, &output_dir, &progress).await;
+
+        let mut guard = progress.write().await;
+        guard.running = false;
+        guard.done = true;
+        guard.finished_at = Some(Utc::now().to_rfc3339());
+        match result {
+            Err(e) => {
+                error!("archive-download: failed: {}", e);
+                guard.error = Some(format!("{}", e));
+            }
+            Ok(()) => {
+                info!(
+                    "archive-download: complete — {} files, {} bytes → {}",
+                    guard.files_written,
+                    guard.bytes_written,
+                    output_dir.display()
+                );
+            }
+        }
+    })
+}
+
+/// Download every archived blob and write it to `output_dir`.
+async fn run_download(
+    manager: &SyncManager,
+    output_dir: &std::path::Path,
+    progress: &Arc<RwLock<DownloadProgress>>,
+) -> anyhow::Result<()> {
+    // Determine the time span of archived data.
+    let status = manager
+        .get_status()
+        .await
+        .map_err(|e| anyhow::anyhow!("status: {}", e))?;
+
+    {
+        let mut g = progress.write().await;
+        g.total_blobs = status.stats.total_blobs as u64;
+    }
+
+    let start = match status.stats.oldest_data.as_deref().and_then(parse_ts) {
+        Some(t) => t,
+        None => {
+            info!("archive-download: no archived data found");
+            return Ok(());
+        }
+    };
+    // Pad the end so the newest instant is included.
+    let end = status
+        .stats
+        .newest_data
+        .as_deref()
+        .and_then(parse_ts)
+        .unwrap_or_else(Utc::now)
+        + Duration::seconds(1);
+
+    let media_dir = output_dir.join("media");
+    let metadata_dir = output_dir.join("metadata");
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Process time windows depth-first, splitting any window that saturates the
+    // page limit. This is complete regardless of server ordering: every blob's
+    // timestamp falls into some sub-window small enough to return fully.
+    let mut windows: Vec<(DateTime<Utc>, DateTime<Utc>)> = vec![(start, end)];
+
+    while let Some((win_start, win_end)) = windows.pop() {
+        if win_start > win_end {
+            continue;
+        }
+
+        let blobs = manager
+            .download_with_meta(
+                Some(win_start.to_rfc3339()),
+                Some(win_end.to_rfc3339()),
+                None,
+                Some(DOWNLOAD_PAGE_LIMIT),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "download {}–{}: {}",
+                    win_start.to_rfc3339(),
+                    win_end.to_rfc3339(),
+                    e
+                )
+            })?;
+
+        let saturated = blobs.len() as u32 >= DOWNLOAD_PAGE_LIMIT;
+        let splittable = (win_end - win_start) > Duration::seconds(1);
+
+        if saturated && splittable {
+            // Can't trust this page is complete — split and retry the halves.
+            // Overlap at `mid` is fine; dedup by blob_id drops the repeat.
+            let mid = win_start + (win_end - win_start) / 2;
+            windows.push((mid, win_end));
+            windows.push((win_start, mid));
+            continue;
+        }
+
+        if saturated && !splittable {
+            let mut g = progress.write().await;
+            g.warnings.push(format!(
+                "more than {} blobs at {} — some may be missing",
+                DOWNLOAD_PAGE_LIMIT,
+                win_start.to_rfc3339()
+            ));
+        }
+
+        for blob in blobs {
+            if !seen.insert(blob.blob_id.clone()) {
+                continue;
+            }
+            write_blob(&media_dir, &metadata_dir, &blob, progress).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Write one decrypted blob to disk and update progress.
+async fn write_blob(
+    media_dir: &std::path::Path,
+    metadata_dir: &std::path::Path,
+    blob: &DownloadedBlob,
+    progress: &Arc<RwLock<DownloadProgress>>,
+) -> anyhow::Result<()> {
+    // Metadata chunks are uploaded as `BlobType::Ocr` (JSON); media (video
+    // chunks + snapshots) as `BlobType::Frames` (raw bytes).
+    let is_media = matches!(blob.blob_type, BlobType::Frames | BlobType::Audio);
+    let (dir, ext) = if is_media {
+        (media_dir, sniff_media_extension(&blob.data))
+    } else {
+        (metadata_dir, "json")
+    };
+
+    let filename = format!("{}_{}.{}", sanitize_ts(&blob.time_start), blob.blob_id, ext);
+    let path = dir.join(filename);
+
+    tokio::fs::write(&path, &blob.data)
+        .await
+        .map_err(|e| anyhow::anyhow!("write {}: {}", path.display(), e))?;
+
+    let mut g = progress.write().await;
+    g.files_written += 1;
+    g.blobs_downloaded += 1;
+    g.bytes_written += blob.data.len() as u64;
+    if is_media {
+        g.media_files += 1;
+    } else {
+        g.metadata_files += 1;
+    }
+    Ok(())
+}
+
+/// Parse an RFC3339 or SQLite (`%Y-%m-%d %H:%M:%S%.f`) timestamp to UTC.
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&Utc));
+    }
+    if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(t.and_utc());
+    }
+    None
+}
+
+/// Detect a media file extension from magic bytes. Archive media blobs are
+/// stored as raw bytes with no filename, so we sniff the content.
+fn sniff_media_extension(data: &[u8]) -> &'static str {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return "jpg";
+    }
+    if data.len() >= 8 && data[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+        return "png";
+    }
+    // ISO base media (mp4/mov): "ftyp" box at offset 4.
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return "mp4";
+    }
+    "bin"
+}
+
+/// Make a timestamp safe to use as a filename component.
+fn sanitize_ts(ts: &str) -> String {
+    ts.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 // ============================================================================
@@ -1176,4 +1551,48 @@ async fn upload_single_file(
         storage_used: result.storage_used,
         storage_limit: result.storage_limit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_password_is_stable_and_token_specific() {
+        // Must be deterministic so the export can decrypt what the upload wrote.
+        assert_eq!(archive_password("tok-123"), archive_password("tok-123"));
+        assert!(archive_password("tok-123").starts_with("screenpipe-archive-"));
+        assert_ne!(archive_password("a"), archive_password("b"));
+    }
+
+    #[test]
+    fn sniff_media_extension_detects_types() {
+        assert_eq!(sniff_media_extension(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]), "jpg");
+        assert_eq!(sniff_media_extension(b"\x89PNG\r\n\x1a\nrest"), "png");
+
+        let mut mp4 = vec![0x00, 0x00, 0x00, 0x20];
+        mp4.extend_from_slice(b"ftypisom");
+        assert_eq!(sniff_media_extension(&mp4), "mp4");
+
+        assert_eq!(sniff_media_extension(&[0, 1, 2, 3]), "bin");
+        assert_eq!(sniff_media_extension(&[]), "bin");
+    }
+
+    #[test]
+    fn sanitize_ts_replaces_path_unsafe_chars() {
+        assert_eq!(
+            sanitize_ts("2026-06-20T14:01:38+00:00"),
+            "2026-06-20T14-01-38-00-00"
+        );
+        // alphanumerics (incl. the 'T'/'Z') are preserved
+        assert_eq!(sanitize_ts("2026-06-20T14:01:38Z"), "2026-06-20T14-01-38Z");
+    }
+
+    #[test]
+    fn parse_ts_handles_rfc3339_and_sqlite_and_garbage() {
+        assert!(parse_ts("2026-06-20T14:01:38Z").is_some());
+        assert!(parse_ts("2026-06-20T14:01:38+00:00").is_some());
+        assert!(parse_ts("2026-06-20 14:01:38.123").is_some());
+        assert!(parse_ts("not a timestamp").is_none());
+    }
 }

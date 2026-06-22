@@ -8,6 +8,7 @@ const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
 import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
+import { CaptureFrequencyPreview, AudioCaptureModePreview } from "./setting-previews";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
@@ -27,16 +28,15 @@ export const searchIndex: SettingsField[] = [
   { label: "CoreAudio system audio capture", keywords: ["coreaudio", "system audio"], conditional: true },
   { label: "Screen recording", keywords: ["screen", "video"] },
   { label: "Use all monitors", keywords: ["monitor", "display"] },
+  // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
+  { label: "Monitors", conditional: true },
   { label: "Recording quality", keywords: ["fps", "quality"] },
   // conditional: hidden when screen recording is off (same gate as Recording quality).
   { label: "Capture frequency", keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
-  // conditional: monitor picker only renders when "Use all monitors" is off.
-  { label: "Monitors", conditional: true },
   { label: "HD recording for meetings", keywords: ["hd", "meeting"] },
   { label: "Chinese mirror", keywords: ["china", "mirror"] },
 ];
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -2639,6 +2639,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 </SelectContent>
               </Select>
             </div>
+            <AudioCaptureModePreview mode={settings.audioCaptureMode ?? "always"} />
           </CardContent>
         </Card>
         )}
@@ -3081,9 +3082,9 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                       Batch Transcription
-                      <HelpTooltip text="Accumulates longer audio chunks (30s-5min) using silence-gap detection before sending to Whisper. Gives the model more context for better transcription quality and speaker diarization." />
+                      <HelpTooltip text="Groups audio into longer stretches (30s–5min) before transcribing. More context means more accurate transcripts and a better job telling speakers apart." />
                     </h3>
-                    <p className="text-xs text-muted-foreground">Longer audio chunks for better transcription quality</p>
+                    <p className="text-xs text-muted-foreground">Group audio into longer stretches for more accurate transcripts</p>
                   </div>
                 </div>
                 <Switch
@@ -3100,7 +3101,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div className="flex items-center justify-between mb-1.5">
                     <span className="text-xs text-muted-foreground flex items-center gap-1.5">
                       Max batch duration
-                      <HelpTooltip text="Maximum audio to batch before transcribing. Depends on your endpoint's file size limit. 0 = auto (~50min). Audio is compressed to MP3 before upload." />
+                      <HelpTooltip text="The most audio to group together before transcribing. Set 0 for automatic (~50min). Going higher needs a provider that accepts bigger uploads." />
                     </span>
                     <span className="text-xs font-mono text-foreground">
                       {(settings.batchMaxDurationSecs ?? 0) === 0
@@ -3138,7 +3139,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                       Filter Music
-                      <HelpTooltip text="Detect and filter out music-dominant audio (e.g. Spotify, YouTube) before transcription using spectral analysis. Reduces garbage transcriptions from background music." />
+                      <HelpTooltip text="Skips audio that's mostly music (e.g. Spotify, YouTube) so it isn't transcribed. Cuts the gibberish background music tends to produce." />
                     </h3>
                     <p className="text-xs text-muted-foreground">Remove background music from transcriptions</p>
                   </div>
@@ -3166,10 +3167,10 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         {!settings.disableAudio && (
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center space-x-2.5 min-w-0">
                 <Headphones className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
+                <div className="min-w-0">
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                     Live meeting notes
                     <HelpTooltip text="Streams only the active meeting into the live note. This is separate from background 24/7 recording and can use your selected transcription engine, screenpipe cloud, or a direct provider." />
@@ -3177,25 +3178,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-muted-foreground">Meeting-only live captions, separate from background transcription</p>
                 </div>
               </div>
-              <Switch
-                id="meetingLiveTranscriptionEnabled"
-                checked={settings.meetingLiveTranscriptionEnabled ?? true}
-                onCheckedChange={(checked) =>
-                  handleSettingsChange({
-                    meetingLiveTranscriptionEnabled: checked,
-                    meetingLiveTranscriptionProvider: checked
-                      ? ((settings.meetingLiveTranscriptionProvider && settings.meetingLiveTranscriptionProvider !== "disabled")
-                        ? settings.meetingLiveTranscriptionProvider
-                        : "selected-engine")
-                      : "disabled",
-                  }, true)
-                }
-              />
-            </div>
-            {(settings.meetingLiveTranscriptionEnabled ?? true) && (
-              <div className="mt-2.5 ml-[26px] flex flex-col gap-2">
-                <div className="flex items-center justify-between gap-3">
-                  <Label className="text-xs text-muted-foreground">Live engine</Label>
+              <div className="flex items-center gap-2 shrink-0">
+                {(settings.meetingLiveTranscriptionEnabled ?? true) && (
                   <Select
                     value={settings.meetingLiveTranscriptionProvider ?? "selected-engine"}
                     onValueChange={(value) =>
@@ -3204,7 +3188,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       }, true)
                     }
                   >
-                    <SelectTrigger className="h-8 w-[260px] text-xs">
+                    <SelectTrigger className="h-7 w-[190px] text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -3213,21 +3197,37 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       <SelectItem value="deepgram-live">Direct Deepgram live</SelectItem>
                     </SelectContent>
                   </Select>
-                </div>
-                {(settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "screenpipe-cloud" &&
-                  !settings.user?.token &&
-                  !settings.user?.id && (
-                  <p className="text-xs text-muted-foreground">
-                    Log in to screenpipe cloud to use the cloud live provider.
-                  </p>
                 )}
-                {(settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "selected-engine" &&
-                  settings.audioTranscriptionEngine === "disabled" && (
-                  <p className="text-xs text-muted-foreground">
-                    Pick an audio transcription engine above, or choose a cloud/direct live provider.
-                  </p>
-                )}
+                <Switch
+                  id="meetingLiveTranscriptionEnabled"
+                  checked={settings.meetingLiveTranscriptionEnabled ?? true}
+                  onCheckedChange={(checked) =>
+                    handleSettingsChange({
+                      meetingLiveTranscriptionEnabled: checked,
+                      meetingLiveTranscriptionProvider: checked
+                        ? ((settings.meetingLiveTranscriptionProvider && settings.meetingLiveTranscriptionProvider !== "disabled")
+                          ? settings.meetingLiveTranscriptionProvider
+                          : "selected-engine")
+                        : "disabled",
+                    }, true)
+                  }
+                />
               </div>
+            </div>
+            {(settings.meetingLiveTranscriptionEnabled ?? true) &&
+              (settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "screenpipe-cloud" &&
+              !settings.user?.token &&
+              !settings.user?.id && (
+              <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
+                Log in to screenpipe cloud to use the cloud live provider.
+              </p>
+            )}
+            {(settings.meetingLiveTranscriptionEnabled ?? true) &&
+              (settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "selected-engine" &&
+              settings.audioTranscriptionEngine === "disabled" && (
+              <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
+                Pick an audio transcription engine above, or choose a cloud/direct live provider.
+              </p>
             )}
             <div className="mt-2.5 pt-2.5 border-t border-border/50 flex items-center justify-between">
               <div>
@@ -3259,7 +3259,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div>
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                     Automatic meeting detection
-                    <HelpTooltip text="Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start/stop meetings and live notes. Turn off if it triggers spuriously and split meetings manually. CLI equivalent: --disable-meeting-detector." />
+                    <HelpTooltip text="Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start and stop meetings and live notes automatically. Turn off if it starts meetings when it shouldn't, and start them yourself instead." />
                   </h3>
                   <p className="text-xs text-muted-foreground">Auto-start meetings when a call app is detected</p>
                 </div>
@@ -3687,6 +3687,78 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
+        {/* Monitor Selection — paired directly under "Use all monitors" so
+            the picker it reveals sits next to the toggle that controls it,
+            not buried below the quality/frequency/HD cards. */}
+        {!settings.disableVision && !settings.useAllMonitors && (
+          <Card className="border-border bg-card overflow-hidden">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center space-x-2.5 mb-3">
+                <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                <h3 className="text-sm font-medium text-foreground">Monitors</h3>
+              </div>
+
+              <div className="flex items-end justify-center gap-6 py-2">
+                {/* Default option as a monitor */}
+                <button
+                  className="flex flex-col items-center gap-1.5 group"
+                  onClick={() => {
+                    const isDefaultSelected = settings.monitorIds.includes("default");
+                    if (isDefaultSelected) { handleSettingsChange({ monitorIds: settings.monitorIds.filter(id => id !== "default") }, true); }
+                    else { handleSettingsChange({ monitorIds: ["default"] }, true); }
+                  }}
+                >
+                  {/* Monitor SVG */}
+                  <svg width="80" height="56" viewBox="0 0 80 56" fill="none" className={cn("transition-opacity", settings.monitorIds.includes("default") ? "opacity-100" : "opacity-40 group-hover:opacity-60")}>
+                    <rect x="4" y="2" width="72" height="42" rx="3" className="fill-muted stroke-border" strokeWidth="1.5" />
+                    <rect x="8" y="6" width="64" height="34" rx="1" className={cn(settings.monitorIds.includes("default") ? "fill-foreground/10" : "fill-background")} />
+                    <path d="M30 44 L30 50 L50 50 L50 44" className="stroke-border" strokeWidth="1.5" fill="none" />
+                    <line x1="24" y1="50" x2="56" y2="50" className="stroke-border" strokeWidth="1.5" strokeLinecap="round" />
+                    {settings.monitorIds.includes("default") && (
+                      <path d="M32 20 L37 25 L48 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-foreground" />
+                    )}
+                  </svg>
+                  <span className={cn("text-[11px] font-medium", settings.monitorIds.includes("default") ? "text-foreground" : "text-muted-foreground")}>
+                    Default
+                  </span>
+                </button>
+
+                {availableMonitors.map((monitor) => {
+                  const isSelected = settings.monitorIds.includes(monitor.stableId);
+                  return (
+                    <button
+                      key={monitor.stableId}
+                      className="flex flex-col items-center gap-1.5 group"
+                      onClick={() => {
+                        const newIds = isSelected
+                          ? settings.monitorIds.filter(id => id !== monitor.stableId)
+                          : [...settings.monitorIds.filter(id => id !== "default"), monitor.stableId];
+                        handleSettingsChange({ monitorIds: newIds }, true);
+                      }}
+                    >
+                      <svg width="80" height="56" viewBox="0 0 80 56" fill="none" className={cn("transition-opacity", isSelected ? "opacity-100" : "opacity-40 group-hover:opacity-60")}>
+                        <rect x="4" y="2" width="72" height="42" rx="3" className="fill-muted stroke-border" strokeWidth="1.5" />
+                        <rect x="8" y="6" width="64" height="34" rx="1" className={cn(isSelected ? "fill-foreground/10" : "fill-background")} />
+                        <path d="M30 44 L30 50 L50 50 L50 44" className="stroke-border" strokeWidth="1.5" fill="none" />
+                        <line x1="24" y1="50" x2="56" y2="50" className="stroke-border" strokeWidth="1.5" strokeLinecap="round" />
+                        {isSelected && (
+                          <path d="M32 20 L37 25 L48 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-foreground" />
+                        )}
+                      </svg>
+                      <div className="text-center">
+                        <span className={cn("text-[11px] font-medium block", isSelected ? "text-foreground" : "text-muted-foreground")}>
+                          {monitor.name || `Monitor ${monitor.id}`}
+                        </span>
+                        <p className="text-[10px] text-muted-foreground">{monitor.width}x{monitor.height}</p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Recording quality — single knob for crispness + disk cost */}
         {!settings.disableVision && (
           <Card className="border-border bg-card">
@@ -3770,6 +3842,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <span>auto</span>
                   <span>every 10s</span>
                 </div>
+                <CaptureFrequencyPreview seconds={seconds} />
               </CardContent>
             </Card>
           );
@@ -3785,76 +3858,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             settings={settings}
             onSettingsChange={(patch) => handleSettingsChange(patch, true)}
           />
-        )}
-
-        {/* Monitor Selection */}
-        {!settings.disableVision && !settings.useAllMonitors && (
-          <Card className="border-border bg-card overflow-hidden">
-            <CardContent className="px-3 py-2.5">
-              <div className="flex items-center space-x-2.5 mb-3">
-                <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
-                <h3 className="text-sm font-medium text-foreground">Monitors</h3>
-              </div>
-
-              <div className="flex items-end justify-center gap-6 py-2">
-                {/* Default option as a monitor */}
-                <button
-                  className="flex flex-col items-center gap-1.5 group"
-                  onClick={() => {
-                    const isDefaultSelected = settings.monitorIds.includes("default");
-                    if (isDefaultSelected) { handleSettingsChange({ monitorIds: settings.monitorIds.filter(id => id !== "default") }, true); }
-                    else { handleSettingsChange({ monitorIds: ["default"] }, true); }
-                  }}
-                >
-                  {/* Monitor SVG */}
-                  <svg width="80" height="56" viewBox="0 0 80 56" fill="none" className={cn("transition-opacity", settings.monitorIds.includes("default") ? "opacity-100" : "opacity-40 group-hover:opacity-60")}>
-                    <rect x="4" y="2" width="72" height="42" rx="3" className="fill-muted stroke-border" strokeWidth="1.5" />
-                    <rect x="8" y="6" width="64" height="34" rx="1" className={cn(settings.monitorIds.includes("default") ? "fill-foreground/10" : "fill-background")} />
-                    <path d="M30 44 L30 50 L50 50 L50 44" className="stroke-border" strokeWidth="1.5" fill="none" />
-                    <line x1="24" y1="50" x2="56" y2="50" className="stroke-border" strokeWidth="1.5" strokeLinecap="round" />
-                    {settings.monitorIds.includes("default") && (
-                      <path d="M32 20 L37 25 L48 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-foreground" />
-                    )}
-                  </svg>
-                  <span className={cn("text-[11px] font-medium", settings.monitorIds.includes("default") ? "text-foreground" : "text-muted-foreground")}>
-                    Default
-                  </span>
-                </button>
-
-                {availableMonitors.map((monitor) => {
-                  const isSelected = settings.monitorIds.includes(monitor.stableId);
-                  return (
-                    <button
-                      key={monitor.stableId}
-                      className="flex flex-col items-center gap-1.5 group"
-                      onClick={() => {
-                        const newIds = isSelected
-                          ? settings.monitorIds.filter(id => id !== monitor.stableId)
-                          : [...settings.monitorIds.filter(id => id !== "default"), monitor.stableId];
-                        handleSettingsChange({ monitorIds: newIds }, true);
-                      }}
-                    >
-                      <svg width="80" height="56" viewBox="0 0 80 56" fill="none" className={cn("transition-opacity", isSelected ? "opacity-100" : "opacity-40 group-hover:opacity-60")}>
-                        <rect x="4" y="2" width="72" height="42" rx="3" className="fill-muted stroke-border" strokeWidth="1.5" />
-                        <rect x="8" y="6" width="64" height="34" rx="1" className={cn(isSelected ? "fill-foreground/10" : "fill-background")} />
-                        <path d="M30 44 L30 50 L50 50 L50 44" className="stroke-border" strokeWidth="1.5" fill="none" />
-                        <line x1="24" y1="50" x2="56" y2="50" className="stroke-border" strokeWidth="1.5" strokeLinecap="round" />
-                        {isSelected && (
-                          <path d="M32 20 L37 25 L48 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-foreground" />
-                        )}
-                      </svg>
-                      <div className="text-center">
-                        <span className={cn("text-[11px] font-medium block", isSelected ? "text-foreground" : "text-muted-foreground")}>
-                          {monitor.name || `Monitor ${monitor.id}`}
-                        </span>
-                        <p className="text-[10px] text-muted-foreground">{monitor.width}x{monitor.height}</p>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </CardContent>
-          </Card>
         )}
 
       </div>

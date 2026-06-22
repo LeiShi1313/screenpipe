@@ -50,6 +50,7 @@ mod embedded_server;
 mod enterprise_install_metadata;
 mod enterprise_policy;
 mod enterprise_sync;
+mod events;
 mod google_calendar;
 mod hardware;
 mod ics_calendar;
@@ -369,6 +370,13 @@ macro_rules! define_specta_builder {
             .typ::<enterprise_install_metadata::EnterpriseInstallMetadata>()
             .typ::<chatgpt_oauth::ChatGptOAuthStatus>()
             .typ::<oauth::OAuthStatus>()
+            .typ::<events::JobEvent>()
+            .typ::<events::ExportEvent>()
+            .typ::<events::ExportRequestInfo>()
+            .typ::<events::EngineEvent>()
+            .typ::<events::NotificationActionEvent>()
+            .typ::<meeting_export::MeetingExportSummary>()
+            .typ::<meeting_export::StartExportRecordingResponse>()
     }};
 }
 
@@ -516,9 +524,12 @@ async fn main() {
             })
         })
     };
+    // CI / automation (GitHub Actions, etc.) always wins over the settings
+    // opt-in so the desktop-app e2e suite never reaches Sentry/PostHog.
     let telemetry_disabled = store_bool("analyticsEnabled")
         .map(|enabled| !enabled)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || screenpipe_engine::analytics::telemetry_disabled_by_env();
     let _posthog_disabled = telemetry_disabled;
 
     let app_version = env!("CARGO_PKG_VERSION");

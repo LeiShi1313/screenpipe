@@ -327,6 +327,12 @@ const TOOLS: Tool[] = [
           description:
             "Comma-separated tags; returns only items carrying ALL of them (e.g. 'person:ada,project:atlas'). Works for screen + audio (content_type 'ocr'/'audio'/'all', tags written by add-tags) AND memories (content_type 'memory', tags written by update-memory). Same tag string links across all three, so two items sharing a tag are connected. Use namespaced tags (person:, project:, topic:) to link people/projects/topics. content_type 'input' and 'accessibility' have no tags and return nothing when this is set.",
         },
+        include_related: {
+          type: "boolean",
+          description:
+            "With tags set, also return the co-occurring tags (the people/projects/topics seen alongside yours, ranked by frequency) as a 'Related:' line. One call for the surrounding context instead of several follow-ups. Ignored without tags.",
+          default: false,
+        },
         max_content_length: {
           type: "integer",
           description: "Truncate each result's text via middle-truncation. Use 200-500 to keep responses compact.",
@@ -1151,6 +1157,16 @@ function normalizeTimeFields(
   return out;
 }
 
+// Zone label for a timestamp's HH:MM slice. The server serializes timestamps in
+// its LOCAL timezone (e.g. "...T09:03:44+05:30"), so the HH:MM is already local —
+// derive the label from the string's own offset instead of hardcoding "UTC"
+// (which mislabeled local times by the offset, e.g. "09:03 UTC" for 09:03+05:30).
+function zoneSuffix(iso: string): string {
+  const m = iso.match(/([+-]\d{2}:?\d{2})$/);
+  if (!m) return iso.endsWith("Z") ? " UTC" : "";
+  return m[1] === "+00:00" ? " UTC" : ` ${m[1]}`;
+}
+
 // Middle-truncate long strings: keep head + tail, mark the gap with how much
 // was cut. Used to cap OCR/transcription text in search-content responses
 // so a single call doesn't blow past Claude Code's per-tool output limit
@@ -1403,8 +1419,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const tagsStr = content.tags?.length ? ` [${content.tags.join(", ")}]` : "";
             const importance =
               content.importance != null ? ` (importance: ${content.importance})` : "";
+            // frame_id links a memory back to the exact moment — jump there with
+            // frame-context / get-frame-elements (frame_id=N).
+            const frameRef = content.frame_id != null ? ` frame:${content.frame_id}` : "";
             formattedResults.push(
-              `[Memory #${content.id}]${tagsStr}${importance}\n` +
+              `[Memory #${content.id}]${tagsStr}${importance}${frameRef}\n` +
                 `${content.created_at || ""}\n` +
                 `${truncateMiddle(content.content || "", effectiveCap)}`
             );
@@ -1417,9 +1436,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ? ` (use offset=${(pagination.offset || 0) + results.length} for more)`
             : "");
 
+        // Co-occurring tags (only present when include_related=true + tags set).
+        // Compact one-liner per namespace so it's cheap to read.
+        const related = data.related as Record<string, string[]> | undefined;
+        const relatedStr =
+          related && Object.keys(related).length > 0
+            ? "\n\nRelated tags: " +
+              Object.entries(related)
+                .map(([ns, vals]) => `${ns}: ${(Array.isArray(vals) ? vals : []).join(", ")}`)
+                .join(" | ")
+            : "";
+
         contentItems.push({
           type: "text",
-          text: header + "\n\n" + formattedResults.join("\n---\n"),
+          text: header + "\n\n" + formattedResults.join("\n---\n") + relatedStr,
         });
 
         for (const img of images) {
@@ -1488,7 +1518,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }) => {
             const timeSpan =
               a.first_seen && a.last_seen
-                ? `, ${a.first_seen.slice(11, 16)}–${a.last_seen.slice(11, 16)} UTC`
+                ? `, ${a.first_seen.slice(11, 16)}–${a.last_seen.slice(11, 16)}${zoneSuffix(a.first_seen)}`
                 : "";
             return `  ${a.name}: ${a.minutes} min (${a.frame_count} frames${timeSpan})`;
           }

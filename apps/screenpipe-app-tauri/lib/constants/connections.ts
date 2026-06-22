@@ -135,7 +135,6 @@ export const CONNECTION_CATEGORY_BY_ID: Record<string, string> = {
   pushover: "Notifications",
 
   // System — OS-level capture sources & features
-  "input-monitoring": "System",
   "browser-url": "System",
   "user-browser": "System",
   "voice-memos": "System",
@@ -161,7 +160,6 @@ export const CONNECTION_HARDCODED_DESCRIPTIONS: Record<string, string> = {
   "chatgpt": "Search your screen history from ChatGPT",
   "browser-url": "Capture visited URLs from your browser in real time",
   "voice-memos": "Sync Apple Voice Memos for AI-powered search",
-  "input-monitoring": "Track keyboard & mouse for productivity insights",
   "apple-calendar": "Search Apple Calendar events with AI",
   "google-calendar": "Search Google Calendar events with AI",
   "google-docs": "Read and search your Google Docs",
@@ -208,7 +206,6 @@ export const DEVICE_CONNECTION_ORDER = [
   "claude-code",
   "chatgpt",
   "browser-url",
-  "input-monitoring",
   "obsidian",
   "notion",
   "linear",

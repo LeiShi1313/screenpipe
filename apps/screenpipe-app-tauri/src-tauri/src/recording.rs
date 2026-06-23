@@ -301,6 +301,12 @@ pub struct RecordingState {
     pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
+    /// User/boot intent: true while recording is supposed to be ON. Set by
+    /// `spawn_screenpipe`, cleared by `stop_screenpipe`. Lets the health
+    /// watchdog distinguish a crash (server gone but intent still ON → respawn)
+    /// from a deliberate stop (intent OFF → leave it down). `last_spawn_epoch`
+    /// can't carry this — it's reset to 0 on a failed spawn too.
+    pub wants_recording: Arc<AtomicBool>,
     /// Recently active meeting to revive when capture is immediately restarted.
     pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
     /// App-scoped cloud-auth token (Clerk JWT). Outlives the Server (which
@@ -640,6 +646,10 @@ pub async fn stop_screenpipe(
 ) -> Result<(), String> {
     info!("stop_screenpipe: stopping capture and server");
 
+    // Deliberate stop → clear the intent so the health watchdog leaves the
+    // server down instead of auto-respawning it.
+    state.wants_recording.store(false, Ordering::SeqCst);
+
     // Stop capture first
     {
         *state.interrupted_meeting.lock().await = None;
@@ -681,6 +691,11 @@ pub async fn spawn_screenpipe(
     _override_args: Option<Vec<String>>,
 ) -> Result<(), String> {
     info!("spawn_screenpipe: starting server + capture");
+
+    // Mark recording as intended-ON up front (even if the start below fails or
+    // is deferred by cooldown) so the health watchdog will keep trying to bring
+    // a crashed/failed server back instead of treating it as a user stop.
+    state.wants_recording.store(true, Ordering::SeqCst);
 
     // --- Cooldown enforcement ---
     let now_epoch = std::time::SystemTime::now()

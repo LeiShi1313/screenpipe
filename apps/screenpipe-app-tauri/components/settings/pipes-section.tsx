@@ -63,6 +63,7 @@ import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
 import { humanizeDow, humanizeSchedule, parseHumanSchedule } from "@/lib/utils/schedule-format";
+import { PipeCustomScheduleField } from "./pipe-custom-schedule-field";
 import {
   PipeActivityIndicator,
   formatPipeElapsed,
@@ -967,6 +968,111 @@ function PipePresetSelector({
         </button>
       )}
     </div>
+  );
+}
+
+const SCHEDULE_PRESETS = [
+  { value: "manual", label: "manual" },
+  { value: "*/5 8-23 * * *", label: "every 5 min (daytime 8a-11p)" },
+  { value: "*/15 8-23 * * *", label: "every 15 min (daytime 8a-11p)" },
+  { value: "*/30 8-23 * * *", label: "every 30 min (daytime 8a-11p)" },
+  { value: "every 5m", label: "every 5 minutes" },
+  { value: "every 15m", label: "every 15 minutes" },
+  { value: "every 30m", label: "every 30 minutes" },
+  { value: "every 1h", label: "every hour" },
+  { value: "every 3h", label: "every 3 hours" },
+  { value: "every day at 9am", label: "every morning (9 AM)" },
+  { value: "every day at 12pm", label: "every noon (12 PM)" },
+  { value: "every day at 6pm", label: "every evening (6 PM)" },
+  { value: "every monday at 9am", label: "every monday (9 AM)" },
+];
+
+/** Schedule frequency control: preset dropdown + a "custom…" option that reveals
+ *  {@link PipeCustomScheduleField}. Lets users set any frequency the engine accepts
+ *  without editing the pipe via AI. */
+function PipeScheduleControls({
+  pipe,
+  setPipes,
+  fetchPipes,
+  pendingConfigSaves,
+  apiBase,
+}: {
+  pipe: { config: PipeConfig };
+  setPipes: React.Dispatch<React.SetStateAction<any[]>>;
+  fetchPipes: () => void;
+  pendingConfigSaves: React.MutableRefObject<Record<string, Promise<void>>>;
+  apiBase: string;
+}) {
+  const current = pipe.config.schedule || "manual";
+  const [customOpen, setCustomOpen] = useState(false);
+
+  const saveSchedule = (value: string) => {
+    const pipeName = pipe.config.name;
+    setPipes((prev: any[]) =>
+      prev.map((p: any) =>
+        p.config.name === pipeName
+          ? { ...p, config: { ...p.config, schedule: value } }
+          : p
+      )
+    );
+    const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ schedule: value }),
+    })
+      .then(async () => {
+        await new Promise((r) => setTimeout(r, 500));
+        delete pendingConfigSaves.current[pipeName];
+        fetchPipes();
+      })
+      .catch(() => {
+        delete pendingConfigSaves.current[pipeName];
+      });
+    // Register guard so a background fetchPipes never overwrites with stale data.
+    pendingConfigSaves.current[pipeName] = savePromise;
+  };
+
+  const isCustomValue = !SCHEDULE_PRESETS.some((p) => p.value === current);
+  const CUSTOM_SENTINEL = "__custom__";
+
+  return (
+    <>
+      <Select
+        value={customOpen ? CUSTOM_SENTINEL : current}
+        onValueChange={(value) => {
+          if (value === CUSTOM_SENTINEL) {
+            setCustomOpen(true);
+            return;
+          }
+          setCustomOpen(false);
+          saveSchedule(value);
+        }}
+      >
+        <SelectTrigger className="mt-1 h-8 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {isCustomValue && !customOpen && (
+            <SelectItem value={current}>{humanizeSchedule(current)} (custom)</SelectItem>
+          )}
+          {SCHEDULE_PRESETS.map((p) => (
+            <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
+          ))}
+          <SelectItem value={CUSTOM_SENTINEL}>custom (cron / every Nm)…</SelectItem>
+        </SelectContent>
+      </Select>
+
+      {customOpen && (
+        <PipeCustomScheduleField
+          initial={current === "manual" ? "" : current}
+          onSave={(value) => {
+            saveSchedule(value);
+            setCustomOpen(false);
+          }}
+          onCancel={() => setCustomOpen(false)}
+        />
+      )}
+    </>
   );
 }
 
@@ -2610,68 +2716,13 @@ export function PipesSection() {
                           <span className="text-muted-foreground font-normal">+ triggers</span>
                         )}
                       </Label>
-                      <Select
-                        value={pipe.config.schedule || "manual"}
-                        onValueChange={(value) => {
-                          const pipeName = pipe.config.name;
-                          setPipes((prev) =>
-                            prev.map((p) =>
-                              p.config.name === pipeName
-                                ? { ...p, config: { ...p.config, schedule: value } }
-                                : p
-                            )
-                          );
-                          const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ schedule: value }),
-                          }).then(async () => {
-                            await new Promise((r) => setTimeout(r, 500));
-                            delete pendingConfigSaves.current[pipeName];
-                            fetchPipes();
-                          }).catch(() => {
-                            delete pendingConfigSaves.current[pipeName];
-                          });
-                          pendingConfigSaves.current[pipeName] = savePromise;
-                        }}
-                      >
-                        <SelectTrigger
-                          className="mt-1 h-8 text-xs"
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {(() => {
-                            const presets = [
-                              { value: "manual", label: "manual" },
-                              { value: "*/5 8-23 * * *", label: "every 5 min (daytime 8a-11p)" },
-                              { value: "*/15 8-23 * * *", label: "every 15 min (daytime 8a-11p)" },
-                              { value: "*/30 8-23 * * *", label: "every 30 min (daytime 8a-11p)" },
-                              { value: "every 5m", label: "every 5 minutes" },
-                              { value: "every 15m", label: "every 15 minutes" },
-                              { value: "every 30m", label: "every 30 minutes" },
-                              { value: "every 1h", label: "every hour" },
-                              { value: "every 3h", label: "every 3 hours" },
-                              { value: "every day at 9am", label: "every morning (9 AM)" },
-                              { value: "every day at 12pm", label: "every noon (12 PM)" },
-                              { value: "every day at 6pm", label: "every evening (6 PM)" },
-                              { value: "every monday at 9am", label: "every monday (9 AM)" },
-                            ];
-                            const current = pipe.config.schedule || "manual";
-                            const isCustom = !presets.some((p) => p.value === current);
-                            return (
-                              <>
-                                {isCustom && (
-                                  <SelectItem value={current}>{humanizeSchedule(current)} (custom)</SelectItem>
-                                )}
-                                {presets.map((p) => (
-                                  <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
-                                ))}
-                              </>
-                            );
-                          })()}
-                        </SelectContent>
-                      </Select>
+                      <PipeScheduleControls
+                        pipe={pipe}
+                        setPipes={setPipes}
+                        fetchPipes={fetchPipes}
+                        pendingConfigSaves={pendingConfigSaves}
+                        apiBase={apiBase}
+                      />
 
                           {/* Day-of-week picker */}
                           {pipe.config.schedule && pipe.config.schedule !== "manual" && (() => {

@@ -20,6 +20,14 @@ export interface ScheduleConfig {
   timezone: string | null; // IANA, e.g. "America/New_York"
   starting: string | null; // RFC3339
   ending: string | null; // RFC3339
+  max_occurrences: number | null; // "stop after N runs" (counted from starting)
+}
+
+/** Today at local midnight as an RFC3339 (UTC) string, for the Starting default. */
+export function todayIso(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T00:00:00Z`;
 }
 
 /** Weekday pills, Sunday-first like Notion. */
@@ -74,8 +82,9 @@ export function defaultScheduleConfig(): ScheduleConfig {
     at_hour: 9,
     at_minute: 0,
     timezone: detectTimezone(),
-    starting: null,
+    starting: todayIso(),
     ending: null,
+    max_occurrences: null,
   };
 }
 

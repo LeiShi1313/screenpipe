@@ -47,6 +47,7 @@ function cfg(overrides: Partial<ScheduleConfig> = {}): ScheduleConfig {
     timezone: "UTC",
     starting: null,
     ending: null,
+    max_occurrences: null,
     ...overrides,
   };
 }
@@ -117,6 +118,20 @@ describe("PipeScheduleBuilder", () => {
     fireEvent.click(screen.getByRole("switch")); // turn schedule off
     fireEvent.click(saveButton());
     expect(onSave).toHaveBeenCalledWith(null);
+  });
+
+  test("'after N runs' ending shows the count input and saves max_occurrences", () => {
+    const { onSave } = renderBuilder(cfg({ frequency: "days", at_hour: 9, max_occurrences: 3 }));
+    const input = screen.getByLabelText("max occurrences");
+    expect(input).toHaveValue(3);
+    fireEvent.change(input, { target: { value: "10" } });
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ max_occurrences: 10 }));
+  });
+
+  test("'on date' ending shows a date input", () => {
+    renderBuilder(cfg({ frequency: "days", ending: "2099-06-10T23:59:59Z" }));
+    expect(screen.getByLabelText("ending date")).toBeInTheDocument();
   });
 
   test("cancel calls onCancel", () => {

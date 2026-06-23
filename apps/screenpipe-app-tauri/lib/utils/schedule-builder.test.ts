@@ -22,6 +22,7 @@ function cfg(overrides: Partial<ScheduleConfig> = {}): ScheduleConfig {
     timezone: null,
     starting: null,
     ending: null,
+    max_occurrences: null,
     ...overrides,
   };
 }

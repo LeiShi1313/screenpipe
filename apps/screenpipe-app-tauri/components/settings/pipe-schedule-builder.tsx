@@ -69,6 +69,8 @@ export function PipeScheduleBuilder({
   const showTime = cfg.frequency === "days" || cfg.frequency === "weeks" || cfg.frequency === "months";
   const showTimezone = showTime;
   const weeklyNoDays = !manual && cfg.frequency === "weeks" && cfg.days_of_week.length === 0;
+  const endMode: "never" | "on" | "after" =
+    cfg.max_occurrences != null ? "after" : cfg.ending ? "on" : "never";
 
   const update = (patch: Partial<ScheduleConfig>) => setCfg((c) => ({ ...c, ...patch }));
 
@@ -277,16 +279,53 @@ export function PipeScheduleBuilder({
           </div>
           <div className="flex items-center justify-between gap-2">
             <Label className="text-xs">ending</Label>
-            <input
-              type="date"
-              aria-label="ending"
-              value={isoToDateInput(cfg.ending)}
-              onChange={(e) =>
-                update({ ending: e.target.value ? `${e.target.value}T23:59:59Z` : null })
-              }
-              className="h-8 w-36 text-xs font-mono px-2 rounded border border-input bg-background"
-            />
+            <Select
+              value={endMode}
+              onValueChange={(v) => {
+                if (v === "never") update({ ending: null, max_occurrences: null });
+                else if (v === "on") update({ max_occurrences: null });
+                else update({ ending: null, max_occurrences: cfg.max_occurrences ?? 5 });
+              }}
+            >
+              <SelectTrigger className="h-8 w-36 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="never">never</SelectItem>
+                <SelectItem value="on">on date</SelectItem>
+                <SelectItem value="after">after N runs</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
+          {endMode === "on" && (
+            <div className="flex items-center justify-end">
+              <input
+                type="date"
+                aria-label="ending date"
+                value={isoToDateInput(cfg.ending)}
+                onChange={(e) =>
+                  update({ ending: e.target.value ? `${e.target.value}T23:59:59Z` : null })
+                }
+                className="h-8 w-36 text-xs font-mono px-2 rounded border border-input bg-background"
+              />
+            </div>
+          )}
+          {endMode === "after" && (
+            <div className="flex items-center justify-end gap-1.5">
+              <Input
+                type="number"
+                min={1}
+                max={9999}
+                aria-label="max occurrences"
+                value={cfg.max_occurrences ?? 5}
+                onChange={(e) =>
+                  update({ max_occurrences: Math.max(1, Number(e.target.value) || 1) })
+                }
+                className="h-8 w-20 text-xs"
+              />
+              <span className="text-muted-foreground">runs</span>
+            </div>
+          )}
         </>
       )}
 

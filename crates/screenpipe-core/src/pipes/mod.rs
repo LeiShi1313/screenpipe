@@ -4712,6 +4712,14 @@ impl PipeManager {
                 "connection-trigger watcher started (generation {})",
                 generation
             );
+            // Let the scheduler subscribe to `connection_trigger` before the
+            // first poll can emit — otherwise a fire-on-startup (cursors already
+            // initialised from a prior run) could be dropped by the bus because
+            // no receiver exists yet.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                _ = shutdown_rx.changed() => {}
+            }
             loop {
                 if *shutdown_rx.borrow() {
                     break;

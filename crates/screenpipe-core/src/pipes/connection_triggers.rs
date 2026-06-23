@@ -20,13 +20,26 @@
 //!   response against an opaque cursor token.
 //!
 //! Reliability (v1):
-//! - A persisted per-subscription cursor (opaque high-watermark token) lives in
-//!   `<pipes_dir>/.connection-triggers.json`.
-//! - On first sight a subscription initialises to "now", so enabling a trigger
+//! - Cursors persist to `<pipes_dir>/.connection-triggers.json`, so a restart
+//!   resumes from the last watermark rather than replaying or losing position.
+//! - On first sight a subscription initialises to "now" — enabling a trigger
 //!   never replays the whole backlog.
-//! - The cursor advances on emit (at-most-once). A crash between emit and run
-//!   drops that one trigger rather than replaying — pair a source trigger with a
-//!   safety `schedule` for stronger delivery. Advance-after-run is a follow-up.
+//! - Each fire is capped to `MAX_ITEMS_PER_FIRE` and the cursor advances only to
+//!   the last item delivered, so a large backlog (e.g. after the app was offline)
+//!   drains over several ticks. For ordered sources this is loss-free.
+//! - On startup the watcher waits a few seconds before its first poll so the
+//!   scheduler is subscribed and can't miss a fire-on-startup.
+//!
+//! Known gaps (documented, not yet closed):
+//! - Delivery is at-most-once: the cursor advances on emit, so a crash between
+//!   emit and the pipe run drops that one trigger. Pair a source trigger with a
+//!   safety `schedule` for stronger delivery; advance-after-run is the fix.
+//! - Slack/Notion fetch one page per poll. If MORE than a page of new items
+//!   appears between two polls (a very busy channel, or a long offline gap), the
+//!   oldest beyond the page are skipped (and a warning is logged). Cursor-based
+//!   pagination is the fix. Obsidian re-scans the whole folder, so it has no cap.
+//! - Two pipes watching the same Slack channel poll it independently (no shared
+//!   fetch). Fine for a handful; dedup is a follow-up.
 
 use super::{PipeConfig, SourceTrigger};
 use serde::{Deserialize, Serialize};
@@ -38,6 +51,16 @@ use tracing::{debug, info, warn};
 
 /// How often sources are polled.
 pub const POLL_INTERVAL_SECS: u64 = 30;
+
+/// Max items delivered in a single fire. A large backlog (e.g. after the app
+/// was offline) drains over several ticks instead of one giant fire — bounds the
+/// `.trigger-context.json` size and the pipe's context, and is loss-free for
+/// ordered sources because the cursor only advances to the last delivered item.
+pub const MAX_ITEMS_PER_FIRE: usize = 50;
+
+/// Slack `conversations.history` page size. Larger than MAX_ITEMS_PER_FIRE so a
+/// moderate backlog is fetched in one call and then drained in capped batches.
+const SLACK_HISTORY_LIMIT: usize = 200;
 
 /// Cursor file living alongside the pipes, mapping subscription → high-watermark.
 const CURSOR_FILE: &str = ".connection-triggers.json";
@@ -360,13 +383,30 @@ async fn slack_poll(
         .map(|s| s.as_str())
         .filter(|s| !s.is_empty())?;
     let mut url = format!(
-        "{}/connections/slack/history?channel={}&limit=50",
-        ctx.api_base, channel
+        "{}/connections/slack/history?channel={}&limit={}",
+        ctx.api_base, channel, SLACK_HISTORY_LIMIT
     );
+    // Fetch only messages newer than the cursor — smaller payloads and the
+    // server returns at most SLACK_HISTORY_LIMIT of them.
+    if cursor.initialized && !cursor.token.is_empty() {
+        url.push_str(&format!("&oldest={}&inclusive=false", cursor.token));
+    }
     if let Some(inst) = src.instance.as_deref().filter(|s| !s.is_empty()) {
         url.push_str(&format!("&instance={inst}"));
     }
     let value = ctx.get_json(&url).await?;
+    // `has_more` means more new messages exist than one page held; the oldest
+    // ones beyond the page are skipped (cursor pagination is a follow-up).
+    if value
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        warn!(
+            "connection trigger: slack channel {} returned a full page ({}+ new messages); oldest beyond the page are skipped until pagination lands",
+            channel, SLACK_HISTORY_LIMIT
+        );
+    }
     let all = parse_slack_messages(&value);
 
     if !cursor.initialized {
@@ -472,13 +512,25 @@ async fn notion_poll(
         "page_size": 20
     });
     let value = ctx.post_json(&url, body).await?;
+    if value
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        warn!(
+            "connection trigger: notion search returned a full page for pipe source; oldest edits beyond the page are skipped until pagination lands"
+        );
+    }
     let all = parse_notion_results(&value);
 
     if !cursor.initialized {
-        let token = all
-            .last()
-            .map(|(_, i)| i.ts.clone())
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        // Match Notion's timestamp shape (millis + Z) so lexicographic compares
+        // against real `last_edited_time` values stay correct.
+        let token = all.last().map(|(_, i)| i.ts.clone()).unwrap_or_else(|| {
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string()
+        });
         return Some(PollOutcome::Initialized(token));
     }
     let since = &cursor.token;
@@ -507,11 +559,31 @@ async fn poll_source(
     cursor: &CursorState,
 ) -> Option<PollOutcome> {
     match src.app.as_str() {
-        "obsidian" => obsidian_poll(src, cursor),
+        // The vault scan is blocking filesystem work — run it on the blocking
+        // pool so a large vault can't stall the async poll loop.
+        "obsidian" => {
+            let src = src.clone();
+            let cursor = cursor.clone();
+            tokio::task::spawn_blocking(move || obsidian_poll(&src, &cursor))
+                .await
+                .ok()
+                .flatten()
+        }
         "slack" => slack_poll(ctx, src, cursor).await,
         "notion" => notion_poll(ctx, src, cursor).await,
         _ => None,
     }
+}
+
+/// Cap a fired batch to `MAX_ITEMS_PER_FIRE` and return the token to advance the
+/// cursor to — the last item actually delivered. Items must be sorted oldest
+/// first; the remainder (if any) is picked up on the next poll, so a backlog
+/// drains over ticks without loss for ordered sources. Returns None if empty.
+fn cap_batch(items: &mut Vec<DetectedItem>) -> Option<String> {
+    if items.len() > MAX_ITEMS_PER_FIRE {
+        items.truncate(MAX_ITEMS_PER_FIRE);
+    }
+    items.last().map(|i| i.ts.clone())
 }
 
 /// Drop cursors for subscriptions that no longer exist. Returns true if changed.
@@ -562,22 +634,37 @@ pub async fn poll_once(
                         src.app, pipe
                     );
                 }
-                Some(PollOutcome::Fired { items, new_cursor }) => {
+                Some(PollOutcome::Fired {
+                    mut items,
+                    new_cursor,
+                }) => {
+                    let total = items.len();
+                    // Deliver at most MAX_ITEMS_PER_FIRE and advance the cursor
+                    // only to the last item delivered, so a backlog drains over
+                    // ticks rather than firing one huge batch.
+                    let advance_to = cap_batch(&mut items).unwrap_or(new_cursor);
                     if let Some(c) = state.cursors.get_mut(&key) {
-                        c.token = new_cursor;
+                        c.token = advance_to;
                         c.initialized = true;
                     }
                     state.dirty = true;
                     let count = items.len();
                     write_trigger_context(&pipes_dir.join(pipe), src, &items);
                     emit_event(pipe, src, count);
-                    info!(
-                        "connection trigger: pipe '{}' fired by {} new {} item(s) from {}",
-                        pipe,
-                        count,
-                        effective_kind(src),
-                        src.app
-                    );
+                    if total > count {
+                        info!(
+                            "connection trigger: pipe '{}' fired by {}/{} new {} item(s) from {} (rest drain next tick)",
+                            pipe, count, total, effective_kind(src), src.app
+                        );
+                    } else {
+                        info!(
+                            "connection trigger: pipe '{}' fired by {} new {} item(s) from {}",
+                            pipe,
+                            count,
+                            effective_kind(src),
+                            src.app
+                        );
+                    }
                 }
             }
         }
@@ -793,6 +880,31 @@ mod tests {
         b.filter.insert("channel".into(), "C222".into());
         assert_ne!(subscription_key("p", &a), subscription_key("p", &b));
         assert_eq!(subscription_key("p", &a), subscription_key("p", &a));
+    }
+
+    #[test]
+    fn cap_batch_truncates_and_advances_to_last_delivered() {
+        let mk = |ts: u64| DetectedItem {
+            id: ts.to_string(),
+            title: "n".into(),
+            preview: String::new(),
+            ts: ts.to_string(),
+        };
+        // Under the cap: unchanged, advance to the last item.
+        let mut few: Vec<DetectedItem> = (1..=3).map(mk).collect();
+        assert_eq!(cap_batch(&mut few).as_deref(), Some("3"));
+        assert_eq!(few.len(), 3);
+        // Over the cap: truncated to the oldest MAX, advance to the MAX-th so the
+        // remainder fires on the next tick (loss-free drain for ordered sources).
+        let mut many: Vec<DetectedItem> = (1..=(MAX_ITEMS_PER_FIRE as u64 + 10)).map(mk).collect();
+        assert_eq!(
+            cap_batch(&mut many).as_deref(),
+            Some(MAX_ITEMS_PER_FIRE.to_string().as_str())
+        );
+        assert_eq!(many.len(), MAX_ITEMS_PER_FIRE);
+        // Empty: no token.
+        let mut none: Vec<DetectedItem> = vec![];
+        assert!(cap_batch(&mut none).is_none());
     }
 
     #[test]

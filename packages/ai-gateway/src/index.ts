@@ -19,7 +19,7 @@ import { handleTinfoilAttestation, handleTinfoilProxy } from './handlers/tinfoil
 import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost, getMaxDailyCostPerUser, getTierDailyCostCap, resolveServedModel } from './services/cost-tracker';
 import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { pruneModelHealth } from './services/model-health';
-import { resolveLatencyClass } from './utils/latency';
+import { resolveLatencyClass, isBackgroundRequest } from './utils/latency';
 import { enforceDailyCostCap } from './services/cost-cap';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
@@ -115,13 +115,24 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
 			// Check if model is allowed for this tier
 			if (!isModelAllowed(body.model, authResult.tier, env)) {
-				const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
-				return addCorsHeaders(createErrorResponse(403, JSON.stringify({
-					error: 'model_not_allowed',
-					message: `Model "${body.model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
-					tier: authResult.tier,
-					allowed_models: allowedModels,
-				})));
+				// Background/automation traffic (pipes, daily summaries) must never
+				// hard-fail on the model gate — a scheduled pipe pinned to a now-gated
+				// model would silently break every run. Downgrade to 'auto' (always
+				// allowed, routes to a free model) so the automation keeps running.
+				// Interactive requests still get the visible 403 so the app can surface
+				// the upgrade UI. Mirrors the frontier-model downgrade in chat.ts.
+				if (body.model !== 'auto' && isBackgroundRequest(request)) {
+					console.log(`background request for disallowed model "${body.model}" (${authResult.tier}) -> downgraded to auto`);
+					body.model = 'auto';
+				} else {
+					const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
+					return addCorsHeaders(createErrorResponse(403, JSON.stringify({
+						error: 'model_not_allowed',
+						message: `Model "${body.model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
+						tier: authResult.tier,
+						allowed_models: allowedModels,
+					})));
+				}
 			}
 
 			// Per-user daily cost cap (account-wide $ ceiling, credit-extended).

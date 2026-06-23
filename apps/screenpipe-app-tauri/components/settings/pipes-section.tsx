@@ -68,6 +68,7 @@ import {
   formatPipeElapsed,
 } from "@/components/pipe-activity-indicator";
 import { getApiBaseUrl, localFetch } from "@/lib/api";
+import { parsePipeError } from "@/lib/pipe-errors";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import { CloudPipesTab } from "./cloud-pipes-tab";
@@ -323,52 +324,8 @@ function buildRemixPrompt(pipeName: string): string {
 4. install and enable the new pipe, then tell me what it does.`;
 }
 
-function parsePipeError(stderr: string): {
-  type: "daily_limit" | "credits_exhausted" | "rate_limit" | "unknown";
-  message: string;
-  used?: number;
-  limit?: number;
-  resets_at?: string;
-  credits_remaining?: number;
-} {
-  // stderr format: '429 "{\"error\":...}"\n' — inner quotes are backslash-escaped
-  const jsonMatch = stderr.match(/\d{3}\s+"(.+)"/s);
-  if (jsonMatch) {
-    try {
-      const raw = jsonMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      const parsed = JSON.parse(raw);
-      if (parsed.error === "daily_limit_exceeded") {
-        return {
-          type: "daily_limit",
-          message: `daily limit reached (${parsed.used_today}/${parsed.limit_today})`,
-          used: parsed.used_today,
-          limit: parsed.limit_today,
-          resets_at: parsed.resets_at,
-        };
-      }
-      if (parsed.error === "daily_cost_limit_exceeded") {
-        return {
-          type: "daily_limit",
-          message: `daily ai usage limit reached — try a lighter model or wait until tomorrow`,
-        };
-      }
-      if (parsed.error === "rate limit exceeded") {
-        return {
-          type: "rate_limit",
-          message: `rate limited — retrying automatically`,
-        };
-      }
-      if (parsed.error === "credits_exhausted") {
-        return {
-          type: "credits_exhausted",
-          message: parsed.message || "daily ai limit reached — upgrade or wait until tomorrow",
-          credits_remaining: parsed.credits_remaining ?? 0,
-        };
-      }
-    } catch {}
-  }
-  return { type: "unknown", message: stderr.slice(0, 150) };
-}
+// parsePipeError moved to @/lib/pipe-errors (shared with the global pipe-advisory
+// watcher so both surface the same friendly message). Imported at the top.
 
 interface PipeConfig {
   name: string;

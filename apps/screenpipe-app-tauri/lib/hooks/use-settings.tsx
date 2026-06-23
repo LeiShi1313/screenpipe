@@ -326,8 +326,14 @@ export type Settings = SettingsStore & {
 	 *  Costs one extra inference per new chat. Disable to save tokens —
 	 *  chats fall back to a title derived from the first message (default: true) */
 	autoGenerateChatTitles?: boolean;
-	/** Notification preferences — which notification sources are enabled */
+	/** Notification preferences — which notification sources are enabled.
+	 *  The set of per-category keys is declared in
+	 *  `components/settings/notification-registry.ts` (single source of truth);
+	 *  this type lists the stable ones the Rust side reads by name. */
 	notificationPrefs?: {
+		/** Master switch. When false the `/notify` handler drops every panel
+		 *  (pipe, system, power, transcript-stall, …). Default true. */
+		notificationsEnabled?: boolean;
 		captureStalls: boolean;
 		appUpdates: boolean;
 		pipeSuggestions: boolean;

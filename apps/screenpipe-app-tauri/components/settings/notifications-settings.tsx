@@ -8,19 +8,6 @@ import { useSettings, Settings } from "@/lib/hooks/use-settings";
 import { Switch } from "@/components/ui/switch";
 import type { SettingsField } from "./settings-search";
 import { NotificationSamplePreview } from "./setting-previews";
-
-/** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
-export const searchIndex: SettingsField[] = [
-  { label: "Capture stalls" },
-  { label: "Power mode changes" },
-  { label: "App updates" },
-  { label: "Pipe suggestions" },
-  { label: "Pipe notifications" },
-  { label: "Display changes" },
-  { label: "Meeting live notes" },
-  { label: "Meeting audio not capturing" },
-  { label: "Live transcript not flowing" },
-];
 import {
   Select,
   SelectContent,
@@ -29,116 +16,292 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { commands } from "@/lib/utils/tauri";
+import { cn } from "@/lib/utils";
+import { Search, ChevronRight } from "lucide-react";
+import {
+  NOTIFICATION_GROUPS,
+  NOTIFICATION_CATEGORIES,
+  MASTER_NOTIFICATIONS_KEY,
+  DEFAULT_NOTIFICATION_PREFS,
+  categoriesForGroup,
+  categoryEnabled,
+  type NotificationCategory,
+} from "./notification-registry";
+import { NotificationPipeControls } from "./notification-pipe-controls";
 
-const defaultPrefs = {
-  captureStalls: true,
-  powerModeChanges: true,
-  appUpdates: true,
-  pipeSuggestions: true,
-  pipeNotifications: true,
-  displayChanges: true,
-  meetingLiveNotes: true,
-  audioCaptureStalled: true,
-  liveTranscriptStalled: true,
-  mutedPipes: [] as string[],
-};
+/**
+ * Settings search index — derived from the registry so it can never drift from
+ * the rendered toggles. Adding a notification category in `notification-registry.ts`
+ * makes it searchable automatically.
+ */
+export const searchIndex: SettingsField[] = [
+  {
+    label: "All notifications",
+    keywords: ["mute all", "do not disturb", "dnd", "silence", "master"],
+  },
+  ...NOTIFICATION_CATEGORIES.map((c) => ({
+    label: c.label,
+    keywords: c.keywords,
+  })),
+  {
+    label: "Per-pipe notifications",
+    keywords: ["pipe", "mute pipe", "per pipe", "individual pipe"],
+    conditional: true,
+  },
+];
+
+type Prefs = Record<string, unknown> & { mutedPipes?: string[] };
+
+function matchesQuery(category: NotificationCategory, q: string): boolean {
+  if (!q) return true;
+  const haystack = [
+    category.label,
+    category.description,
+    ...(category.keywords ?? []),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(q);
+}
 
 export function NotificationsSettings() {
   const { settings, updateSettings } = useSettings();
+  const [query, setQuery] = React.useState("");
+  const [pipesExpanded, setPipesExpanded] = React.useState(false);
 
   if (!settings) return null;
 
-  const prefs = settings.notificationPrefs || defaultPrefs;
-
-  const updatePref = (key: string, value: boolean) => {
-    updateSettings({
-      notificationPrefs: { ...prefs, [key]: value },
-    } as Partial<Settings>);
+  // Merge stored prefs over registry defaults so a freshly-added category is
+  // never `undefined` — it inherits its declared default until touched.
+  const prefs: Prefs = {
+    ...DEFAULT_NOTIFICATION_PREFS,
+    ...(settings.notificationPrefs as Prefs | undefined),
   };
+
+  const masterOn = prefs[MASTER_NOTIFICATIONS_KEY] !== false;
+  const mutedPipes = Array.isArray(prefs.mutedPipes) ? prefs.mutedPipes : [];
+
+  const writePrefs = (patch: Record<string, unknown>) => {
+    updateSettings({
+      notificationPrefs: { ...prefs, ...patch },
+    } as unknown as Partial<Settings>);
+  };
+
+  const q = query.trim().toLowerCase();
+
+  // Groups that still have at least one matching category under the active filter.
+  const visibleGroups = NOTIFICATION_GROUPS.map((group) => ({
+    group,
+    categories: categoriesForGroup(group.id).filter((c) => matchesQuery(c, q)),
+  })).filter((g) => g.categories.length > 0);
+
+  const masterMatches =
+    !q ||
+    "all notifications mute all do not disturb dnd silence".includes(q);
 
   return (
     <div className="space-y-6">
       <div>
-        <p className="text-muted-foreground text-sm">
-          Control which notifications screenpipe sends you.
+        <p className="text-sm text-muted-foreground">
+          Control which notifications screenpipe sends you. Turn whole groups
+          off, or fine-tune a single pipe.
         </p>
       </div>
 
       <NotificationSamplePreview />
 
-      <div className="space-y-1">
-        {/* Capture stalls */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
+      {/* In-section filter — keeps the page usable as categories grow */}
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" />
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="search notifications"
+          aria-label="search notifications"
+          data-testid="notification-search"
+          className="w-full border border-border bg-transparent py-2 pl-8 pr-3 text-sm outline-none transition-colors placeholder:text-muted-foreground/60 focus:border-foreground/30"
+        />
+      </div>
+
+      {/* Master switch — the single choke point. Off = silence everything. */}
+      {masterMatches && (
+        <div
+          className={cn(
+            "flex items-center justify-between gap-3 border border-border bg-card px-4 py-3.5",
+            !masterOn && "border-foreground/40"
+          )}
+        >
           <div>
-            <p className="text-sm font-medium">Capture stalls <span className="text-[10px] font-normal text-muted-foreground/70 ml-1">experimental</span></p>
+            <p className="text-sm font-medium">All notifications</p>
             <p className="text-xs text-muted-foreground">
-              Alert when audio or screen capture stops — may send false positives
+              {masterOn
+                ? "Master switch. Turn off to silence every notification below."
+                : "Everything is muted. Critical recording-stopped alerts still fire."}
             </p>
           </div>
           <Switch
-            data-testid="notification-pref-capture-stalls"
-            checked={prefs.captureStalls ?? true}
-            onCheckedChange={(v) => {
-              updateSettings({
-                notificationPrefs: { ...prefs, captureStalls: v },
-                showRestartNotifications: v,
-              } as Partial<Settings>);
-            }}
+            data-testid="notification-pref-master"
+            checked={masterOn}
+            onCheckedChange={(v) =>
+              writePrefs({ [MASTER_NOTIFICATIONS_KEY]: v })
+            }
           />
         </div>
+      )}
 
-        {/* Power mode changes */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Power mode changes</p>
-            <p className="text-xs text-muted-foreground">
-              Tells you when battery saver turns on (Balanced or Saver). You&apos;ll still get critical alerts if recording pauses on low battery.
-            </p>
+      {/* Grouped categories, rendered from the registry */}
+      <div className={cn("space-y-6", !masterOn && "opacity-50")}>
+        {visibleGroups.map(({ group, categories }) => (
+          <div key={group.id} className="space-y-1">
+            <div className="mb-1">
+              <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                {group.label}
+              </p>
+            </div>
+            {categories.map((category) => (
+              <CategoryRow
+                key={category.id}
+                category={category}
+                checked={categoryEnabled(prefs, category)}
+                disabled={!masterOn}
+                settings={settings}
+                updateSettings={updateSettings}
+                onToggle={(v) => {
+                  if (category.hasFrequency) {
+                    // pipe suggestions drive three values — keep them in one write
+                    updateSettings({
+                      pipeSuggestionsEnabled: v,
+                      notificationPrefs: { ...prefs, [category.id]: v },
+                    } as unknown as Partial<Settings>);
+                    commands
+                      .pipeSuggestionsUpdateSettings(
+                        v,
+                        settings.pipeSuggestionFrequencyHours ?? 24
+                      )
+                      .catch(() => {});
+                    return;
+                  }
+                  if (category.mirrorsShowRestartNotifications) {
+                    // legacy flag kept in sync so the engine watchdog agrees
+                    updateSettings({
+                      notificationPrefs: { ...prefs, [category.id]: v },
+                      showRestartNotifications: v,
+                    } as unknown as Partial<Settings>);
+                    return;
+                  }
+                  writePrefs({ [category.id]: v });
+                }}
+              >
+                {/* Progressive disclosure: pipe notifications expand into
+                    a searchable per-pipe override list. */}
+                {category.hasPerPipe && (
+                  <div className="mt-1">
+                    <button
+                      type="button"
+                      disabled={!masterOn}
+                      onClick={() => setPipesExpanded((e) => !e)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none"
+                    >
+                      <ChevronRight
+                        className={cn(
+                          "h-3.5 w-3.5 transition-transform",
+                          pipesExpanded && "rotate-90"
+                        )}
+                      />
+                      customize per pipe
+                      {mutedPipes.length > 0 && (
+                        <span className="ml-1 text-muted-foreground/70">
+                          ({mutedPipes.length} muted)
+                        </span>
+                      )}
+                    </button>
+                    {pipesExpanded && (
+                      <div className="mt-2.5 pl-1">
+                        <NotificationPipeControls
+                          mutedPipes={mutedPipes}
+                          disabled={
+                            !masterOn ||
+                            categoryEnabled(prefs, category) === false
+                          }
+                          onChange={(next) => writePrefs({ mutedPipes: next })}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </CategoryRow>
+            ))}
           </div>
-          <Switch
-            data-testid="notification-pref-power-mode-changes"
-            checked={prefs.powerModeChanges ?? true}
-            onCheckedChange={(v) => updatePref("powerModeChanges", v)}
-          />
+        ))}
+
+        {visibleGroups.length === 0 && (
+          <p className="py-6 text-center text-xs text-muted-foreground">
+            no notifications match &quot;{query}&quot;
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface CategoryRowProps {
+  category: NotificationCategory;
+  checked: boolean;
+  disabled: boolean;
+  settings: Settings;
+  updateSettings: (s: Partial<Settings>) => void;
+  onToggle: (value: boolean) => void;
+  children?: React.ReactNode;
+}
+
+/**
+ * One notification category row. The switch is generic; categories that own
+ * extra controls (the pipe-suggestion frequency selector) render them inline
+ * to the left of the switch. Per-pipe expansion is passed in as `children`.
+ */
+function CategoryRow({
+  category,
+  checked,
+  disabled,
+  settings,
+  updateSettings,
+  onToggle,
+  children,
+}: CategoryRowProps) {
+  // The pipe-suggestion category drives two stored values (frequency + the
+  // dedicated scheduler-enabled flag) and pings the scheduler command, so it
+  // gets its own toggle handler that keeps all three in sync.
+  const isFrequency = category.hasFrequency;
+  const suggestionsOn = settings.pipeSuggestionsEnabled !== false;
+  const effectiveChecked = isFrequency ? suggestionsOn : checked;
+
+  return (
+    <div className="border-b border-border py-3 last:border-b-0">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">
+            {category.label}
+            {category.experimental && (
+              <span className="ml-1.5 text-[10px] font-normal text-muted-foreground/70">
+                experimental
+              </span>
+            )}
+          </p>
+          <p className="text-xs text-muted-foreground">{category.description}</p>
         </div>
 
-        {/* App updates */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">App updates</p>
-            <p className="text-xs text-muted-foreground">
-              New version available
-            </p>
-          </div>
-          <Switch
-            data-testid="notification-pref-app-updates"
-            checked={prefs.appUpdates ?? true}
-            onCheckedChange={(v) => updatePref("appUpdates", v)}
-          />
-        </div>
-
-        {/* Pipe suggestions */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Pipe suggestions</p>
-            <p className="text-xs text-muted-foreground">
-              AI automation ideas based on your data
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-3">
+          {isFrequency && (
             <Select
               value={String(settings.pipeSuggestionFrequencyHours ?? 24)}
               onValueChange={(value) => {
                 const freq = parseInt(value, 10);
                 updateSettings({ pipeSuggestionFrequencyHours: freq });
                 commands
-                  .pipeSuggestionsUpdateSettings(
-                    settings.pipeSuggestionsEnabled !== false,
-                    freq
-                  )
+                  .pipeSuggestionsUpdateSettings(suggestionsOn, freq)
                   .catch(() => {});
               }}
-              disabled={settings.pipeSuggestionsEnabled === false}
+              disabled={disabled || !suggestionsOn}
             >
               <SelectTrigger className="h-7 w-[110px] text-xs">
                 <SelectValue />
@@ -154,131 +317,16 @@ export function NotificationsSettings() {
                 <SelectItem value="168">weekly</SelectItem>
               </SelectContent>
             </Select>
-            <Switch
-              data-testid="notification-pref-pipe-suggestions"
-              checked={settings.pipeSuggestionsEnabled !== false}
-              onCheckedChange={(checked) => {
-                updateSettings({
-                  pipeSuggestionsEnabled: checked,
-                  notificationPrefs: { ...prefs, pipeSuggestions: checked },
-                } as Partial<Settings>);
-                commands
-                  .pipeSuggestionsUpdateSettings(
-                    checked,
-                    settings.pipeSuggestionFrequencyHours ?? 24
-                  )
-                  .catch(() => {});
-              }}
-            />
-          </div>
-        </div>
-
-        {/* Pipe notifications */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Pipe notifications</p>
-            <p className="text-xs text-muted-foreground">
-              Alerts from installed pipes
-            </p>
-          </div>
+          )}
           <Switch
-            data-testid="notification-pref-pipe-notifications"
-            checked={prefs.pipeNotifications ?? true}
-            onCheckedChange={(v) => updatePref("pipeNotifications", v)}
-          />
-        </div>
-
-        {/* Display changes */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Display changes</p>
-            <p className="text-xs text-muted-foreground">
-              Tells you when a monitor is plugged in, unplugged, or switched (laptop lid closed, docking)
-            </p>
-          </div>
-          <Switch
-            data-testid="notification-pref-display-changes"
-            checked={prefs.displayChanges ?? true}
-            onCheckedChange={(v) => updatePref("displayChanges", v)}
-          />
-        </div>
-
-        {/* Meeting live notes */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Meeting live notes</p>
-            <p className="text-xs text-muted-foreground">
-              Prompt to open a live note when a meeting is detected
-            </p>
-          </div>
-          <Switch
-            data-testid="notification-pref-meeting-live-notes"
-            checked={prefs.meetingLiveNotes ?? true}
-            onCheckedChange={(v) => updatePref("meetingLiveNotes", v)}
-          />
-        </div>
-
-        {/* Meeting audio stall */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Meeting audio not capturing</p>
-            <p className="text-xs text-muted-foreground">
-              OS notification when a meeting is detected but no audio reaches the recorder within 60s
-            </p>
-          </div>
-          <Switch
-            data-testid="notification-pref-audio-capture-stalled"
-            checked={prefs.audioCaptureStalled ?? true}
-            onCheckedChange={(v) => updatePref("audioCaptureStalled", v)}
-          />
-        </div>
-
-        {/* Meeting transcript stall */}
-        <div className="flex items-center justify-between py-3 border-b border-border">
-          <div>
-            <p className="text-sm font-medium">Live transcript not flowing</p>
-            <p className="text-xs text-muted-foreground">
-              In-app alert when audio is captured but no live transcript arrives within 60s
-            </p>
-          </div>
-          <Switch
-            data-testid="notification-pref-live-transcript-stalled"
-            checked={prefs.liveTranscriptStalled ?? true}
-            onCheckedChange={(v) => updatePref("liveTranscriptStalled", v)}
+            data-testid={`notification-pref-${category.id}`}
+            checked={effectiveChecked}
+            disabled={disabled}
+            onCheckedChange={(v) => onToggle(v)}
           />
         </div>
       </div>
-
-      {/* Muted pipes */}
-      {(prefs.mutedPipes?.length ?? 0) > 0 && (
-        <div className="space-y-2">
-          <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-            Muted pipes
-          </p>
-          <div className="flex flex-wrap gap-1.5">
-            {prefs.mutedPipes.map((pipe) => (
-              <span
-                key={pipe}
-                className="inline-flex items-center gap-1.5 px-2 py-1 bg-muted rounded text-xs text-muted-foreground"
-              >
-                {pipe}
-                <button
-                  className="hover:text-foreground transition-colors"
-                  onClick={() => {
-                    const updated = { ...prefs };
-                    updated.mutedPipes = updated.mutedPipes.filter(
-                      (p) => p !== pipe
-                    );
-                    updateSettings({ notificationPrefs: updated } as Partial<Settings>);
-                  }}
-                >
-                  ✕
-                </button>
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
+      {children}
     </div>
   );
 }

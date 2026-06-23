@@ -131,7 +131,27 @@ export function PipeScheduleBuilder({
 
       {!manual && (
         <>
-          {/* Every [N] [unit] — one row, like Notion */}
+          {/* Repeat */}
+          <div className="flex items-center justify-between gap-2">
+            <Label className="text-xs">repeat</Label>
+            <Select
+              value={cfg.frequency}
+              onValueChange={(v) => update({ frequency: v as Frequency })}
+            >
+              <SelectTrigger className="h-8 w-[170px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {FREQUENCY_OPTIONS.map((f) => (
+                  <SelectItem key={f.value} value={f.value}>
+                    every {f.label.replace(/s$/, "")}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Every N <unit> */}
           <div className="flex items-center justify-between gap-2">
             <Label className="text-xs">every</Label>
             <div className="flex items-center gap-1.5">
@@ -144,21 +164,7 @@ export function PipeScheduleBuilder({
                 onChange={(e) => update({ interval: Math.max(1, Number(e.target.value) || 1) })}
                 className="h-8 w-16 text-xs"
               />
-              <Select
-                value={cfg.frequency}
-                onValueChange={(v) => update({ frequency: v as Frequency })}
-              >
-                <SelectTrigger className="h-8 w-[110px] text-xs" aria-label="unit">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {FREQUENCY_OPTIONS.map((f) => (
-                    <SelectItem key={f.value} value={f.value}>
-                      {cfg.interval === 1 ? f.label.replace(/s$/, "") : f.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <span className="text-muted-foreground">{cfg.frequency}</span>
             </div>
           </div>
 

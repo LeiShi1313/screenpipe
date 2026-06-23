@@ -177,6 +177,11 @@ pub async fn run_record_and_transcribe(
     // trigger the watchdog: rebuilding them wouldn't help anyway, and the
     // tight rebuild loop is itself a problem (recovery storm).
     let mut last_non_zero_at: Option<Instant> = None;
+    // macOS System Audio (output) liveness watchdog state (#3901). Inert for
+    // non-output devices and on non-macOS platforms; only mutated on the macOS
+    // output paths in recv_audio_chunk below.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut sck_watchdog = crate::core::sck_output_watchdog::SckOutputWatchdog::default();
     let mut segment_count: u64 = 0;
 
     let mut was_paused_for_lock = false;
@@ -245,6 +250,7 @@ pub async fn run_record_and_transcribe(
                 &metrics,
                 &stream_start,
                 &mut last_non_zero_at,
+                &mut sck_watchdog,
             )
             .await?
             {
@@ -334,7 +340,12 @@ async fn recv_audio_chunk(
     metrics: &Arc<AudioPipelineMetrics>,
     stream_start: &Instant,
     last_non_zero_at: &mut Option<Instant>,
+    sck_watchdog: &mut crate::core::sck_output_watchdog::SckOutputWatchdog,
 ) -> Result<Option<Vec<f32>>> {
+    // The watchdog is only consulted on the macOS System Audio output path.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &sck_watchdog;
+
     let recv_result = tokio::time::timeout(
         Duration::from_secs(AUDIO_RECEIVE_TIMEOUT_SECS),
         receiver.recv(),
@@ -351,6 +362,13 @@ async fn recv_audio_chunk(
                 // the UI / health endpoint cannot show green during a
                 // zero-fill hijack.
                 update_device_capture_time(device_name);
+                // Snapshot the usable-display topology while System Audio is
+                // actually flowing, so a later silence can be classified as
+                // "display invalidated" (dead) vs "nothing playing" (idle). (#3901)
+                #[cfg(target_os = "macos")]
+                if audio_stream.device.device_type == DeviceType::Output {
+                    sck_watchdog.note_real_audio();
+                }
                 return Ok(Some(chunk));
             }
 
@@ -418,19 +436,49 @@ async fn recv_audio_chunk(
             // - macOS ScreenCaptureKit: observed on Sequoia 24.3+ that SCK may
             //   also stop firing callbacks during prolonged silence with no
             //   audio source, contrary to the earlier assumption of continuous
-            //   callbacks. Treat silence as non-fatal on both — the separate
-            //   device_monitor watchdog detects genuine device removal via the
-            //   OS device list.
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            {
-                use crate::core::device::DeviceType;
-                if audio_stream.device.device_type == DeviceType::Output {
-                    debug!(
-                        "no audio from output device {} for {}s (nothing playing), continuing",
-                        device_name, AUDIO_RECEIVE_TIMEOUT_SECS
+            //   callbacks.
+            //
+            // So silence alone is NOT distinguishing on output. macOS adds a
+            // topology watchdog (#3901): an SCK output stream whose anchor
+            // display was invalidated (lid close in clamshell, monitor unplug)
+            // also goes silent forever with no cpal error. The watchdog rebuilds
+            // ONLY when a previously-usable display has left the usable set
+            // (CGDisplayIsActive/IsAsleep) — pure "nothing playing" leaves the
+            // set unchanged and stays non-fatal, preserving the reverted
+            // output recv-timeout behavior (commit 0f287761d).
+            #[cfg(target_os = "macos")]
+            if audio_stream.device.device_type == DeviceType::Output {
+                if let Some((healthy, current)) =
+                    sck_watchdog.check_dead(stream_start.elapsed(), *last_non_zero_at)
+                {
+                    warn!(
+                        "System Audio (output) {} dead — usable displays degraded \
+                         {:?} -> {:?}, re-anchoring via device_monitor",
+                        device_name, healthy, current
                     );
-                    return Ok(None);
+                    metrics.record_stream_timeout();
+                    audio_stream.is_disconnected.store(true, Ordering::Relaxed);
+                    return Err(anyhow!(
+                        "SCK System Audio stream dead — display invalidation (#3901)"
+                    ));
                 }
+                debug!(
+                    "no audio from output device {} for {}s, display topology unchanged \
+                     (nothing playing), continuing",
+                    device_name, AUDIO_RECEIVE_TIMEOUT_SECS
+                );
+                return Ok(None);
+            }
+
+            // Windows WASAPI loopback output: silent = no callbacks; non-fatal.
+            // device_monitor still detects genuine device removal via the OS list.
+            #[cfg(target_os = "windows")]
+            if audio_stream.device.device_type == DeviceType::Output {
+                debug!(
+                    "no audio from output device {} for {}s (nothing playing), continuing",
+                    device_name, AUDIO_RECEIVE_TIMEOUT_SECS
+                );
+                return Ok(None);
             }
 
             // For input devices (all platforms) and output devices (Linux):

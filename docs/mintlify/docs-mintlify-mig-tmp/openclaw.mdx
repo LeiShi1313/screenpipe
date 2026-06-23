@@ -20,11 +20,27 @@ With screenpipe, OpenClaw can recall what you've seen on screen, reference past 
   style={{ borderRadius: "12px", margin: "0 auto", display: "block" }}
 ></iframe>
 
-## same machine
+## quick setup
+
+One command makes OpenClaw screenpipe-aware: it installs the screenpipe skills into OpenClaw's skills directory and registers the screenpipe MCP server in its config.
+
+```bash
+screenpipe agent setup openclaw
+```
+
+Restart OpenClaw and it can search your screen history, audio transcriptions, and memories. The command is idempotent (safe to re-run) and preserves any MCP servers you already had.
+
+<Tip>
+The same command wires up other agents too: `screenpipe agent setup <hermes | claude-code | claude-desktop | codex | cursor | windsurf>`.
+</Tip>
+
+Want to wire it up by hand, or run OpenClaw on another machine? See the manual and remote setups below.
+
+## same machine (manual)
 
 If OpenClaw and screenpipe run on the same machine, setup is straightforward.
 
-### MCP (recommended)
+### MCP
 
 Add screenpipe to your OpenClaw MCP config:
 
@@ -80,7 +96,33 @@ Restart OpenClaw to load the skill.
 
 ## different machines
 
-If OpenClaw runs on a different machine (e.g., a VPS or home server) than screenpipe, there are two ways to connect them:
+If OpenClaw runs on a different machine (e.g., a VPS or home server) than screenpipe, the simplest path is to sync your data over and run the one-command setup. You can also query screenpipe's API over the network — see the options below.
+
+### recommended: selective sync + one-command setup
+
+**1. sync your data to the server (lightly).** screenpipe's remote sync pushes `~/.screenpipe` over SSH — no cloud account needed. Skip the heavy media and exclude anything sensitive, so you ship just text, transcripts, and memories:
+
+```bash
+screenpipe sync remote now \
+  --host openclaw.example.com --user ubuntu \
+  --key-path ~/.ssh/id_ed25519 --remote-path /home/ubuntu/.screenpipe \
+  --no-media \
+  --exclude "secrets/*" \
+  --disable-clipboard-capture
+```
+
+- `--no-media` skips screenshots and video — text, transcripts, and memories still sync.
+- `--exclude <glob>` is repeatable, and a `<data-dir>/.screenpipeignore` file (one glob per line) is honored too.
+
+Put it on a timer for continuous sync (see the cron example below).
+
+**2. point OpenClaw at the synced data.** On the server, one command writes the skill + MCP config targeting the local synced copy:
+
+```bash
+screenpipe agent setup openclaw --api-url http://localhost:3030
+```
+
+Headless `screenpipe login` writes the cloud token where the engine reads it, so cloud features work on the server without the desktop app.
 
 ### option 1: query screenpipe's REST API directly
 

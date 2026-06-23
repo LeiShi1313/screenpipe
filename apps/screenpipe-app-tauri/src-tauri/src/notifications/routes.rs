@@ -123,7 +123,11 @@ pub async fn send_notification(
     // recording-stopped alert and also exempt (see `gate`).
     // `show_notification_panel` enforces the same gate for the direct callers
     // that skip this route.
-    if super::gate::suppressed_now(&state.app_handle, Some(resolved_type.as_str())) {
+    if super::gate::suppressed_now(
+        &state.app_handle,
+        Some(resolved_type.as_str()),
+        source.pipe_name.as_deref(),
+    ) {
         debug!("notify: skipped (notifications paused — master/snooze/quiet)");
         return Ok(Json(ApiResponse {
             success: true,

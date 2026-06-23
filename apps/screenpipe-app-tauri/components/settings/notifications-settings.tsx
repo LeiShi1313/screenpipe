@@ -100,6 +100,9 @@ export function NotificationsSettings() {
 
   const masterOn = prefs[MASTER_NOTIFICATIONS_KEY] !== false;
   const mutedPipes = Array.isArray(prefs.mutedPipes) ? prefs.mutedPipes : [];
+  const allowDuringPause = Array.isArray(prefs.allowDuringPause)
+    ? (prefs.allowDuringPause as string[])
+    : [];
   const snoozeUntil =
     typeof prefs.snoozeUntil === "number" ? prefs.snoozeUntil : 0;
   const quietHours =
@@ -180,6 +183,7 @@ export function NotificationsSettings() {
         masterOn={masterOn}
         snoozeUntil={snoozeUntil}
         quietHours={quietHours}
+        vipCount={allowDuringPause.length}
         onSnooze={(untilMs) => writePrefs({ snoozeUntil: untilMs })}
         onResume={() =>
           writePrefs({ snoozeUntil: 0, [MASTER_NOTIFICATIONS_KEY]: true })
@@ -314,8 +318,12 @@ export function NotificationsSettings() {
                       <div className="mt-2.5 pl-1">
                         <NotificationPipeControls
                           mutedPipes={mutedPipes}
+                          allowPipes={allowDuringPause}
                           disabled={categoryEnabled(prefs, category) === false}
                           onChange={(next) => writePrefs({ mutedPipes: next })}
+                          onAllowChange={(next) =>
+                            writePrefs({ allowDuringPause: next })
+                          }
                         />
                       </div>
                     )}

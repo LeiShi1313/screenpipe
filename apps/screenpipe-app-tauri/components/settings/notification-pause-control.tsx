@@ -30,6 +30,8 @@ interface NotificationPauseControlProps {
   masterOn: boolean;
   snoozeUntil: number;
   quietHours: QuietHoursPref;
+  /** number of VIP pipes that still notify during a temporary pause */
+  vipCount?: number;
   onSnooze: (untilMs: number) => void;
   onResume: () => void;
   onTurnOff: () => void;
@@ -40,6 +42,7 @@ export function NotificationPauseControl({
   masterOn,
   snoozeUntil,
   quietHours,
+  vipCount = 0,
   onSnooze,
   onResume,
   onTurnOff,
@@ -57,12 +60,19 @@ export function NotificationPauseControl({
   const quietNow = isQuietActive(quietHours);
   const paused = !masterOn || isSnoozed;
 
+  // VIP pipes punch through a temporary pause (snooze / quiet hours), but not
+  // a hard off — so only surface the exception count in those states.
+  const vipSuffix =
+    masterOn && (isSnoozed || quietNow) && vipCount > 0
+      ? ` · ${vipCount} pipe${vipCount === 1 ? "" : "s"} still notify`
+      : "";
+
   const statusLabel = !masterOn
     ? "off — until you turn it back on"
     : isSnoozed
-      ? `paused ${formatSnoozeUntil(snoozeUntil)}`
+      ? `paused ${formatSnoozeUntil(snoozeUntil)}${vipSuffix}`
       : quietNow
-        ? "quiet hours active"
+        ? `quiet hours active${vipSuffix}`
         : "on";
 
   return (

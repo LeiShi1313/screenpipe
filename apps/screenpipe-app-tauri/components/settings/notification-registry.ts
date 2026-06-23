@@ -284,6 +284,7 @@ export const DEFAULT_NOTIFICATION_PREFS: Record<string, unknown> = {
   [MASTER_NOTIFICATIONS_KEY]: true,
   ...Object.fromEntries(NOTIFICATION_CATEGORIES.map((c) => [c.id, c.default])),
   mutedPipes: [] as string[],
+  allowDuringPause: [] as string[],
   snoozeUntil: 0,
   quietHours: DEFAULT_QUIET_HOURS,
 };

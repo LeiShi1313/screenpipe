@@ -340,6 +340,9 @@ export type Settings = SettingsStore & {
 		/** Recurring daily quiet window (local wall-clock). When `enabled`,
 		 *  non-critical notifications are paused inside the window. */
 		quietHours?: { enabled: boolean; start: string; end: string };
+		/** Pipe names that still notify while snoozed / in quiet hours (Slack-VIP
+		 *  pattern). A hard master-off still silences them. */
+		allowDuringPause?: string[];
 		captureStalls: boolean;
 		appUpdates: boolean;
 		pipeSuggestions: boolean;

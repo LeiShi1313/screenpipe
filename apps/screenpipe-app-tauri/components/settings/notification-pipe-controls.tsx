@@ -7,7 +7,7 @@ import React from "react";
 import { Switch } from "@/components/ui/switch";
 import { usePipes } from "@/lib/hooks/use-pipes";
 import { cn } from "@/lib/utils";
-import { Search } from "lucide-react";
+import { Search, Star } from "lucide-react";
 
 /**
  * Per-pipe notification controls. Renders one row per installed pipe with a
@@ -29,6 +29,9 @@ const SEARCH_THRESHOLD = 6;
 interface NotificationPipeControlsProps {
   mutedPipes: string[];
   onChange: (mutedPipes: string[]) => void;
+  /** pipes that still notify while snoozed / in quiet hours (Slack-VIP) */
+  allowPipes?: string[];
+  onAllowChange?: (allowPipes: string[]) => void;
   /** disabled when the global pipe gate (or master switch) is off */
   disabled?: boolean;
 }
@@ -36,6 +39,8 @@ interface NotificationPipeControlsProps {
 export function NotificationPipeControls({
   mutedPipes,
   onChange,
+  allowPipes = [],
+  onAllowChange,
   disabled = false,
 }: NotificationPipeControlsProps) {
   const { pipes, loading } = usePipes();
@@ -69,12 +74,40 @@ export function NotificationPipeControls({
 
   const muted = React.useMemo(() => new Set(mutedPipes), [mutedPipes]);
   const mutedCount = pipeRows.filter((r) => muted.has(r.name)).length;
+  const vip = React.useMemo(() => new Set(allowPipes), [allowPipes]);
+  const vipCount = pipeRows.filter((r) => vip.has(r.name)).length;
+  const canVip = !!onAllowChange;
 
   const setAllowed = (name: string, allowed: boolean) => {
     const next = new Set(mutedPipes);
     if (allowed) next.delete(name);
-    else next.add(name);
+    else {
+      next.add(name);
+      // muting clears VIP — a muted pipe can't be a "still notify" exception
+      if (vip.has(name) && onAllowChange) {
+        const v = new Set(allowPipes);
+        v.delete(name);
+        onAllowChange(Array.from(v));
+      }
+    }
     onChange(Array.from(next));
+  };
+
+  const setVip = (name: string, isVip: boolean) => {
+    if (!onAllowChange) return;
+    const v = new Set(allowPipes);
+    if (isVip) {
+      v.add(name);
+      // VIP implies it can notify — unmute if needed
+      if (muted.has(name)) {
+        const m = new Set(mutedPipes);
+        m.delete(name);
+        onChange(Array.from(m));
+      }
+    } else {
+      v.delete(name);
+    }
+    onAllowChange(Array.from(v));
   };
 
   if (loading && pipeRows.length === 0) {
@@ -99,6 +132,12 @@ export function NotificationPipeControls({
           {mutedCount > 0
             ? `${mutedCount} of ${pipeRows.length} muted`
             : `${pipeRows.length} pipe${pipeRows.length === 1 ? "" : "s"} can notify you`}
+          {vipCount > 0 && (
+            <span className="text-muted-foreground/80">
+              {" · "}
+              {vipCount} always notifies
+            </span>
+          )}
         </p>
         {mutedCount > 0 && (
           <button
@@ -111,6 +150,11 @@ export function NotificationPipeControls({
           </button>
         )}
       </div>
+      {canVip && (
+        <p className="text-[10px] text-muted-foreground/70">
+          ★ = always notify, even while snoozed or in quiet hours
+        </p>
+      )}
 
       {pipeRows.length > SEARCH_THRESHOLD && (
         <div className="relative">
@@ -134,6 +178,7 @@ export function NotificationPipeControls({
         ) : (
           filtered.map((row) => {
             const allowed = !muted.has(row.name);
+            const isVip = vip.has(row.name);
             return (
               <div
                 key={row.name}
@@ -147,12 +192,40 @@ export function NotificationPipeControls({
                     </p>
                   )}
                 </div>
-                <Switch
-                  data-testid={`notification-pipe-${row.name}`}
-                  checked={allowed}
-                  disabled={disabled}
-                  onCheckedChange={(v) => setAllowed(row.name, v)}
-                />
+                <div className="flex shrink-0 items-center gap-2.5">
+                  {canVip && (
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      aria-label={
+                        isVip
+                          ? `stop always-notifying ${row.title}`
+                          : `always notify for ${row.title}`
+                      }
+                      aria-pressed={isVip}
+                      title="always notify, even while paused"
+                      data-testid={`notification-pipe-vip-${row.name}`}
+                      onClick={() => setVip(row.name, !isVip)}
+                      className={cn(
+                        "transition-colors disabled:pointer-events-none",
+                        isVip
+                          ? "text-foreground"
+                          : "text-muted-foreground/40 hover:text-muted-foreground"
+                      )}
+                    >
+                      <Star
+                        className="h-3.5 w-3.5"
+                        fill={isVip ? "currentColor" : "none"}
+                      />
+                    </button>
+                  )}
+                  <Switch
+                    data-testid={`notification-pipe-${row.name}`}
+                    checked={allowed}
+                    disabled={disabled}
+                    onCheckedChange={(v) => setAllowed(row.name, v)}
+                  />
+                </div>
               </div>
             );
           })

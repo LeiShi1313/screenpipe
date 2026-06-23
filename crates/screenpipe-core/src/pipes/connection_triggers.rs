@@ -193,11 +193,21 @@ impl SourceCtx<'_> {
 // ---------------------------------------------------------------------------
 
 /// Compare two opaque cursor tokens for an app. Slack `ts` / Obsidian mtime are
-/// numeric; Notion `last_edited_time` is fixed-format UTC ISO, so a lexicographic
-/// compare is a correct chronological compare. An unparseable token sorts lowest.
+/// numeric. Notion `last_edited_time` is RFC3339 but the format varies (the proxy
+/// can return `…Z` or `…-07:00`, with or without millis), so we parse to an
+/// instant rather than compare strings — a smoke test against live Notion showed
+/// offset-form timestamps. An unparseable token sorts lowest.
 fn token_cmp(app: &str, a: &str, b: &str) -> Ordering {
     if app == "notion" {
-        a.cmp(b)
+        match (
+            chrono::DateTime::parse_from_rfc3339(a),
+            chrono::DateTime::parse_from_rfc3339(b),
+        ) {
+            (Ok(da), Ok(db)) => da.cmp(&db),
+            (Ok(_), Err(_)) => Ordering::Greater, // a parsed, b didn't → a is "newer"
+            (Err(_), Ok(_)) => Ordering::Less,
+            (Err(_), Err(_)) => a.cmp(b),
+        }
     } else {
         let pa = a.parse::<f64>().unwrap_or(f64::MIN);
         let pb = b.parse::<f64>().unwrap_or(f64::MIN);
@@ -903,21 +913,41 @@ mod tests {
     }
 
     #[test]
-    fn token_cmp_numeric_and_lexicographic() {
+    fn token_cmp_numeric_and_chronological() {
         assert_eq!(
             token_cmp("slack", "1700000002.0001", "1700000001.0009"),
             Ordering::Greater
         );
         assert_eq!(token_cmp("obsidian", "1000", "999"), Ordering::Greater);
+        assert_eq!(token_cmp("slack", "", "0"), Ordering::Less); // unparseable sorts lowest
+
+        // Notion compares the instant, not the string — formats vary in the wild
+        // (live API returned offset form). 14:52Z == 07:52-07:00 (same instant);
+        // 07:53-07:00 is later even though it sorts "smaller" than 14:52Z as text.
         assert_eq!(
             token_cmp(
                 "notion",
-                "2026-06-23T12:00:00.000Z",
-                "2026-06-22T23:59:59.999Z"
+                "2026-06-23T14:52:00.000Z",
+                "2026-06-23T07:52:00-07:00"
+            ),
+            Ordering::Equal
+        );
+        assert_eq!(
+            token_cmp(
+                "notion",
+                "2026-06-23T07:53:00-07:00",
+                "2026-06-23T14:52:00.000Z"
             ),
             Ordering::Greater
         );
-        assert_eq!(token_cmp("slack", "", "0"), Ordering::Less); // unparseable sorts lowest
+        assert_eq!(
+            token_cmp(
+                "notion",
+                "2000-01-01T00:00:00.000Z",
+                "2026-06-23T07:52:00-07:00"
+            ),
+            Ordering::Less
+        );
     }
 
     #[test]

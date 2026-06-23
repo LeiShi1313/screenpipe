@@ -138,9 +138,13 @@ mod tests {
         assert_eq!(def.id, "outlook-email");
         assert_eq!(def.icon, "outlook-email");
 
-        let oauth = OutlookEmail.oauth_config().expect("outlook-email uses OAuth");
+        let oauth = OutlookEmail
+            .oauth_config()
+            .expect("outlook-email uses OAuth");
         assert!(
-            oauth.auth_url.starts_with("https://login.microsoftonline.com/"),
+            oauth
+                .auth_url
+                .starts_with("https://login.microsoftonline.com/"),
             "must authorize against Microsoft identity platform"
         );
 
@@ -155,7 +159,10 @@ mod tests {
         assert!(scope.contains("Mail.Read"), "must read mail");
         assert!(scope.contains("Mail.Send"), "must send mail");
         assert!(scope.contains("offline_access"), "must refresh tokens");
-        assert!(!scope.contains("Calendars."), "email-only: no calendar scope");
+        assert!(
+            !scope.contains("Calendars."),
+            "email-only: no calendar scope"
+        );
         assert!(!scope.contains("Files."), "email-only: no files scope");
         assert!(
             !scope.contains("Chat.") && !scope.contains("Team."),

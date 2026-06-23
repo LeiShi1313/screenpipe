@@ -112,6 +112,13 @@ describe('tier locking in /v1/models', () => {
 		const models = await listedFor('subscribed');
 		expect(models.every(m => !m.locked)).toBe(true);
 	});
+
+	it('master kill-switch off → nothing locked even for logged_in', async () => {
+		const response = await handleModelListing(env({ MODEL_GATING_ENABLED: 'false' }), 'logged_in');
+		const body = await response.json() as { data: Array<{ locked?: boolean }> };
+		expect(body.data.length).toBeGreaterThan(0);
+		expect(body.data.every(m => !m.locked)).toBe(true);
+	});
 });
 
 describe('OpenAI API accounting and routing', () => {

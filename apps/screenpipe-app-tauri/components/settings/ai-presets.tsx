@@ -110,6 +110,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import { AIPreset, commands } from "@/lib/utils/tauri";
+import { useModelUpsellGating } from "@/lib/hooks/use-model-upsell-gating";
 import {
   validatePresetName,
   validateUrl,
@@ -270,6 +271,11 @@ const AISection = ({
   // Daily quota snapshot — drives the "N left today" chip on weighted
   // models. Null on BYOK providers; we render nothing in that case.
   const usage = useUsageStatus();
+  // Whether to surface the proactive "Business" lock UI. Off unless the PostHog
+  // flag is on and the user has no persisted entitlement evidence (fail-open so
+  // a tier flicker never false-locks a paying customer). The gateway's `locked`
+  // flag only takes visual effect when this is true.
+  const showUpsell = useModelUpsellGating();
   const [settingsPreset, setSettingsPreset] = useState<
     Partial<AIPreset> | undefined
   >(preset);
@@ -1509,18 +1515,20 @@ const AISection = ({
                           ))}
                         </CommandGroup>
                       )}
-                      <CommandGroup heading={models?.some((m) => !m.free && m.locked) ? "More models" : models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
-                        {models?.filter((m) => !m.free).slice().sort((a, b) => (a.locked ? 1 : 0) - (b.locked ? 1 : 0)).map((model) => {
+                      <CommandGroup heading={showUpsell && models?.some((m) => !m.free && m.locked) ? "More models" : models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
+                        {models?.filter((m) => !m.free).slice().sort((a, b) => ((showUpsell && a.locked) ? 1 : 0) - ((showUpsell && b.locked) ? 1 : 0)).map((model) => {
                           const costLabel = model.cost_tier === 'low' ? '$' : model.cost_tier === 'medium' ? '$$' : model.cost_tier === 'high' ? '$$$' : model.cost_tier === 'very_high' ? '$$$$' : '';
+                          // Effective lock = gateway said so AND we're allowed to surface it.
+                          const locked = !!model.locked && showUpsell;
                           return (
                           <CommandItem
                             key={model.id}
                             value={model.id}
-                            className={model.locked ? "opacity-60" : undefined}
+                            className={locked ? "opacity-60" : undefined}
                             onSelect={async () => {
                               // Locked = above the user's plan. One click -> Business
                               // checkout (or sign-in first) instead of selecting it.
-                              if (model.locked) {
+                              if (locked) {
                                 if (!settings.user?.token) {
                                   await commands.openLoginWindow();
                                 } else {
@@ -1546,18 +1554,20 @@ const AISection = ({
                               <div className="flex items-center justify-between">
                                 <span className="font-medium">{model.name}</span>
                                 <div className="flex items-center gap-1 ml-2">
-                                  {model.locked && (
+                                  {locked && (
                                     <Badge variant="outline" className="text-[10px] gap-0.5 border-foreground/40 text-foreground/80">
                                       <Lock className="h-2.5 w-2.5" />
                                       Business
                                     </Badge>
                                   )}
-                                  {!model.locked && costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
-                                  {!model.locked && model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
+                                  {!locked && costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
+                                  {!locked && model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
                                   {/* Low-quota warning — only renders when the user is within
                                       ~30% of exhausting their daily cap for this specific model.
-                                      Silent otherwise (normal state = no extra clutter). */}
-                                  {shouldWarnLowQuota(usage, model.query_weight) && (
+                                      Silent otherwise (normal state = no extra clutter). Never on a
+                                      locked model — the Business lock already says "not available",
+                                      so a "N left" count on top would be contradictory. */}
+                                  {!locked && shouldWarnLowQuota(usage, model.query_weight) && (
                                     <Badge
                                       variant="outline"
                                       className="text-[10px] bg-yellow-500/10 text-yellow-700 border-yellow-500/40 dark:text-yellow-400"

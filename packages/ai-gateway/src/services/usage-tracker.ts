@@ -474,6 +474,9 @@ export async function getUsageStatus(
     remaining,
     resets_at: getNextResetTime(),
     model_access: limits.allowedModels,
+    // Server-controlled visibility for the app's at-the-cap banner. Only
+    // non-Business tiers, and suppressed entirely by the master kill-switch.
+    upsell_banner: tier !== 'subscribed' && isModelGatingEnabled(env),
   };
 
   // Fetch credit balance if user is logged in
@@ -497,9 +500,27 @@ export async function getUsageStatus(
 }
 
 /**
+ * Master kill-switch for the Free/Basic -> Business model gate. Default ON.
+ * Set MODEL_GATING_ENABLED=false (Cloudflare env var — takes effect with no app
+ * release) to instantly neutralize the whole gate: no model 403s, no `locked`
+ * flags in /v1/models, no upsell banner. Use it to react fast if the gate ever
+ * starts firing on paying users. Mirrors the FLEX_TIER_ENABLED pattern.
+ */
+export function isModelGatingEnabled(env?: Env): boolean {
+  const raw = (env as { MODEL_GATING_ENABLED?: string } | undefined)?.MODEL_GATING_ENABLED;
+  return String(raw ?? 'true').toLowerCase() !== 'false';
+}
+
+/**
  * Check if a model is allowed for a given tier
  */
 export function isModelAllowed(model: string, tier: UserTier, env?: Env): boolean {
+  // Master kill-switch: when model gating is disabled, every model is allowed
+  // for every tier (emergency rollback without an app release).
+  if (!isModelGatingEnabled(env)) {
+    return true;
+  }
+
   // Internal zero-cost models (e.g., the workflow event classifier on our
   // own vLLM) are always allowed regardless of tier — we eat the cost and
   // they're gated at the feature level (opt-in setting), not the tier.

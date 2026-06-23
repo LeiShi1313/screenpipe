@@ -4,7 +4,7 @@
 
 import { Env, UserTier } from '../types';
 import { createSuccessResponse, createErrorResponse, addCorsHeaders } from '../utils/cors';
-import { getTierConfig, getModelWeight } from '../services/usage-tracker';
+import { getTierConfig, getModelWeight, isModelGatingEnabled } from '../services/usage-tracker';
 import { listAnthropicModels } from '../providers/anthropic-proxy';
 import { getModelHealth, ModelHealthStatus } from '../services/model-health';
 
@@ -606,7 +606,11 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
     // copy below, so the app can show them greyed with a one-click upgrade.
     // (Computed per-request in the map() so we never mutate shared catalog
     // objects across requests — a subscribed request must not inherit a lock.)
-    const lockAllowlist = tier === 'subscribed' ? null : getTierConfig(env)[tier].allowedModels;
+    // No locks for Business, or when the master kill-switch is off (so a single
+    // env flip clears the greyed picker everywhere with no app release).
+    const lockAllowlist = (tier === 'subscribed' || !isModelGatingEnabled(env))
+      ? null
+      : getTierConfig(env)[tier].allowedModels;
 
     // Attach live health status from rolling 5-minute error rates
     const health = await getModelHealth(env);

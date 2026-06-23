@@ -267,6 +267,10 @@ pub struct ScheduleConfig {
     /// Do not fire after this instant. None → repeats indefinitely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ending: Option<DateTime<Utc>>,
+    /// Stop after this many occurrences, counted from `starting`. None →
+    /// unlimited. Only enforced when `starting` is set (the UI defaults it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_occurrences: Option<u32>,
 }
 
 fn default_interval() -> u32 {
@@ -5540,9 +5544,40 @@ fn next_fire(cfg: &ScheduleConfig, after: DateTime<Utc>) -> Option<DateTime<Utc>
     }
 }
 
+/// The instant of the `max_occurrences`-th fire counted from `starting`, i.e.
+/// the last slot allowed by a "stop after N runs" rule. Only meaningful when
+/// both `starting` and `max_occurrences` are set; None otherwise (unlimited).
+fn occurrence_end(cfg: &ScheduleConfig) -> Option<DateTime<Utc>> {
+    let max = cfg.max_occurrences.filter(|n| *n > 0)? as usize;
+    let start = cfg.starting?;
+    let mut after = start - ChronoDuration::seconds(1);
+    let mut last = None;
+    for _ in 0..max {
+        match next_fire(cfg, after) {
+            Some(t) => {
+                last = Some(t);
+                after = t;
+            }
+            None => break,
+        }
+    }
+    last
+}
+
+/// The effective last-fire bound: the earlier of `ending` and the
+/// `max_occurrences` cutoff. None → no upper bound.
+fn effective_ending(cfg: &ScheduleConfig) -> Option<DateTime<Utc>> {
+    match (cfg.ending, occurrence_end(cfg)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// The first `n` future occurrences (UTC), for the builder's preview. Stops
-/// early at `ending` or if the recurrence can't produce more slots.
+/// early at the effective end (`ending` / `max_occurrences`) or if the
+/// recurrence can't produce more slots.
 pub fn next_occurrences(cfg: &ScheduleConfig, n: usize) -> Vec<DateTime<Utc>> {
+    let end = effective_ending(cfg);
     let mut out = Vec::with_capacity(n);
     let mut after = Utc::now();
     if let Some(start) = cfg.starting {
@@ -5559,7 +5594,7 @@ pub fn next_occurrences(cfg: &ScheduleConfig, n: usize) -> Vec<DateTime<Utc>> {
                 if cfg.starting.is_some_and(|s| t < s) {
                     continue;
                 }
-                if cfg.ending.is_some_and(|end| t > end) {
+                if end.is_some_and(|e| t > e) {
                     break;
                 }
                 out.push(t);
@@ -5580,7 +5615,8 @@ fn should_run_config(cfg: &ScheduleConfig, last_run: DateTime<Utc>) -> bool {
     if cfg.starting.is_some_and(|start| now < start) {
         return false;
     }
-    if cfg.ending.is_some_and(|end| now > end) {
+    let end = effective_ending(cfg);
+    if end.is_some_and(|e| now > e) {
         return false;
     }
     let mut search_from = if last_run == DateTime::<Utc>::UNIX_EPOCH {
@@ -5593,7 +5629,8 @@ fn should_run_config(cfg: &ScheduleConfig, last_run: DateTime<Utc>) -> bool {
         search_from = std::cmp::max(search_from, start - ChronoDuration::seconds(1));
     }
     match next_fire(cfg, search_from) {
-        Some(next) => now >= next,
+        // Don't fire a slot past the effective end (e.g. beyond the Nth run).
+        Some(next) => now >= next && end.map_or(true, |e| next <= e),
         None => false,
     }
 }
@@ -6814,6 +6851,7 @@ mod tests {
             timezone: None,
             starting: None,
             ending: None,
+            max_occurrences: None,
         }
     }
 
@@ -7018,6 +7056,28 @@ mod tests {
         // Noon-local on Jun 1/2/3 always falls inside [00:00 Jun 1, 23:00 Jun 3] UTC.
         assert_eq!(occ.len(), 3);
         assert!(occ.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn max_occurrences_caps_runs_from_start() {
+        // Daily at noon, starting in the future, stop after 3 occurrences.
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 12;
+        c.timezone = Some("UTC".to_string());
+        c.starting = Some(utc_dt(2099, 6, 1, 0, 0));
+        c.max_occurrences = Some(3);
+        // Preview returns exactly the 3 allowed runs (Jun 1/2/3), not more.
+        assert_eq!(next_occurrences(&c, 10).len(), 3);
+        // The effective end is the 3rd fire; no `ending` set on its own.
+        let end = effective_ending(&c).expect("bounded by occurrence count");
+        assert_eq!(end, utc_dt(2099, 6, 3, 12, 0));
+        // max=0 / no starting → unbounded (ignored).
+        let mut c2 = cfg(Frequency::Days);
+        c2.max_occurrences = Some(0);
+        assert!(effective_ending(&c2).is_none());
+        let mut c3 = cfg(Frequency::Days);
+        c3.max_occurrences = Some(3); // no starting
+        assert!(effective_ending(&c3).is_none());
     }
 
     #[test]

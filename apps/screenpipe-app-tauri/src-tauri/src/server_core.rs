@@ -441,11 +441,16 @@ impl ServerCore {
             )
             .with_api_auth_key(config.api_auth_key.clone()),
         );
+        let hermes_executor = Arc::new(
+            screenpipe_core::agents::hermes::HermesExecutor::new()
+                .with_api_auth_key(config.api_auth_key.clone()),
+        );
         let mut agent_executors: std::collections::HashMap<
             String,
             Arc<dyn screenpipe_core::agents::AgentExecutor>,
         > = std::collections::HashMap::new();
         agent_executors.insert("pi".to_string(), pi_executor.clone());
+        agent_executors.insert("hermes".to_string(), hermes_executor.clone());
 
         let pipe_store: Option<Arc<dyn screenpipe_core::pipes::PipeStore>> = Some(Arc::new(
             screenpipe_engine::pipe_store::SqlitePipeStore::new(db.clone()),

@@ -1340,6 +1340,10 @@ async fn main() -> anyhow::Result<()> {
         screenpipe_core::agents::pi::PiExecutor::new(user_token.clone())
             .with_api_auth_key(config.api_auth_key.clone()),
     );
+    let hermes_executor = std::sync::Arc::new(
+        screenpipe_core::agents::hermes::HermesExecutor::new()
+            .with_api_auth_key(config.api_auth_key.clone()),
+    );
 
     // Workflow event classifier — opt-in cloud feature. Polls recent activity
     // and emits `WorkflowEvent`s on the bus so pipes with `trigger.events`
@@ -1368,6 +1372,7 @@ async fn main() -> anyhow::Result<()> {
         std::sync::Arc<dyn screenpipe_core::agents::AgentExecutor>,
     > = std::collections::HashMap::new();
     agent_executors.insert("pi".to_string(), pi_executor.clone());
+    agent_executors.insert("hermes".to_string(), hermes_executor.clone());
 
     // Create pipe store backed by the main SQLite DB
     let pipe_store: Option<std::sync::Arc<dyn screenpipe_core::pipes::PipeStore>> =

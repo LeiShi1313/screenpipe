@@ -21,6 +21,7 @@
 
 use anyhow::{anyhow, Result};
 use colored::Colorize;
+use screenpipe_core::agents::hermes::HermesExecutor;
 use screenpipe_core::agents::pi::PiExecutor;
 use screenpipe_core::agents::AgentExecutor;
 use screenpipe_core::pipes::{parse_frontmatter, PipeManager};
@@ -91,8 +92,10 @@ pub async fn handle_install(url: &str, allow_untrusted: bool) -> Result<()> {
 
     let user_token = std::env::var("SCREENPIPE_API_KEY").ok();
     let pi: Arc<dyn AgentExecutor> = Arc::new(PiExecutor::new(user_token));
+    let hermes: Arc<dyn AgentExecutor> = Arc::new(HermesExecutor::new());
     let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
     executors.insert("pi".to_string(), pi);
+    executors.insert("hermes".to_string(), hermes);
     let manager = PipeManager::new(pipes_dir, executors, None, 3030);
     manager.load_pipes().await?;
 

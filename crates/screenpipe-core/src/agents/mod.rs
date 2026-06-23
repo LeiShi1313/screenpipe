@@ -10,6 +10,7 @@
 //! implementations without touching any pipe code.
 
 pub mod bash_env;
+pub mod hermes;
 pub mod pi;
 
 use anyhow::Result;

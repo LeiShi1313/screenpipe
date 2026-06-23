@@ -301,11 +301,14 @@ pub struct RecordingState {
     pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
-    /// User/boot intent: true while recording is supposed to be ON. Set by
-    /// `spawn_screenpipe`, cleared by `stop_screenpipe`. Lets the health
-    /// watchdog distinguish a crash (server gone but intent still ON → respawn)
-    /// from a deliberate stop (intent OFF → leave it down). `last_spawn_epoch`
-    /// can't carry this — it's reset to 0 on a failed spawn too.
+    /// Capture intent: true while capture is supposed to be running. Tracked at
+    /// every on/off point — `spawn_screenpipe`/`start_capture` set it,
+    /// `stop_screenpipe`/`stop_capture` clear it — because capture has two
+    /// on-paths (full spawn vs the tray toggle) and two off-paths. Lets the
+    /// health watchdog tell a crash (intent still ON → respawn) from a
+    /// deliberate stop (intent OFF → leave it down), including the tray "stop
+    /// recording" that keeps the server up. `last_spawn_epoch` can't carry this
+    /// — it's reset to 0 on a failed spawn too, and never sees the tray toggle.
     pub wants_recording: Arc<AtomicBool>,
     /// Recently active meeting to revive when capture is immediately restarted.
     pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
@@ -438,6 +441,11 @@ pub async fn stop_capture(
 ) -> Result<(), String> {
     info!("Stopping capture session (server stays alive)");
 
+    // The tray/shortcut "stop recording" lands here (server stays up, capture
+    // off). Clear the intent so a later engine crash doesn't get auto-respawned
+    // — which would resurrect capture the user deliberately stopped.
+    state.wants_recording.store(false, Ordering::SeqCst);
+
     remember_active_meeting_for_capture_restart(&state).await;
 
     let mut capture_guard = state.capture.lock().await;
@@ -551,6 +559,11 @@ pub async fn start_capture(
     info!("Starting capture session");
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
     require_app_entitlement(&store)?;
+
+    // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
+    // — record it so the health watchdog will respawn a crashed engine instead
+    // of treating the absence of capture as a deliberate stop.
+    state.wants_recording.store(true, Ordering::SeqCst);
 
     // Race guard: short-circuit duplicate invocations.
     //

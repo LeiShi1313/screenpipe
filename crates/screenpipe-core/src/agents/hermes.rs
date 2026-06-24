@@ -57,9 +57,10 @@ impl HermesExecutor {
 
         let provider_key = provider.to_ascii_lowercase();
         match provider_key.as_str() {
-            // Screenpipe cloud is a Pi-specific provider. Let Hermes use its
-            // own configured default instead of passing an unknown provider.
-            "screenpipe" | "screenpipe-cloud" | "pi" => None,
+            // Pi/app-owned providers do not map cleanly to Hermes CLI
+            // providers. Let Hermes use its configured default instead of
+            // passing an unsupported provider or incompatible token.
+            "screenpipe" | "screenpipe-cloud" | "pi" | "openai-chatgpt" => None,
             // Hermes' direct OpenAI API provider is named `openai-api`.
             "openai" | "openai-byok" => Some("openai-api".to_string()),
             "anthropic" | "anthropic-byok" => Some("anthropic".to_string()),
@@ -380,6 +381,7 @@ mod tests {
         assert_eq!(HermesExecutor::provider_arg(Some("screenpipe")), None);
         assert_eq!(HermesExecutor::provider_arg(Some("screenpipe-cloud")), None);
         assert_eq!(HermesExecutor::provider_arg(Some(" pi ")), None);
+        assert_eq!(HermesExecutor::provider_arg(Some("openai-chatgpt")), None);
         assert_eq!(HermesExecutor::model_arg("claude-haiku-4-5", None), None);
     }
 

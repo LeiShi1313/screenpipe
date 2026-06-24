@@ -177,10 +177,9 @@ pub async fn run_record_and_transcribe(
     // trigger the watchdog: rebuilding them wouldn't help anyway, and the
     // tight rebuild loop is itself a problem (recovery storm).
     let mut last_non_zero_at: Option<Instant> = None;
-    // macOS System Audio (output) liveness watchdog state (#3901). Inert for
-    // non-output devices and on non-macOS platforms; only mutated on the macOS
-    // output paths in recv_audio_chunk below.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    // macOS System Audio (output) liveness watchdog state (#3901). Consulted
+    // only on the macOS SCK output paths in recv_audio_chunk below; inert for
+    // non-output / non-SCK / non-macOS streams.
     let mut sck_watchdog = crate::core::sck_output_watchdog::SckOutputWatchdog::default();
     let mut segment_count: u64 = 0;
 
@@ -365,8 +364,11 @@ async fn recv_audio_chunk(
                 // Snapshot the usable-display topology while System Audio is
                 // actually flowing, so a later silence can be classified as
                 // "display invalidated" (dead) vs "nothing playing" (idle). (#3901)
+                // SCK-backed streams only — the Process Tap is anchored to the
+                // default output device, not a display, and has its own watchdog.
                 #[cfg(target_os = "macos")]
-                if audio_stream.device.device_type == DeviceType::Output {
+                if audio_stream.device.device_type == DeviceType::Output && audio_stream.is_sck_backed
+                {
                     sck_watchdog.note_real_audio();
                 }
                 return Ok(Some(chunk));
@@ -448,25 +450,35 @@ async fn recv_audio_chunk(
             // output recv-timeout behavior (commit 0f287761d).
             #[cfg(target_os = "macos")]
             if audio_stream.device.device_type == DeviceType::Output {
-                if let Some((healthy, current)) =
-                    sck_watchdog.check_dead(stream_start.elapsed(), *last_non_zero_at)
-                {
-                    warn!(
-                        "System Audio (output) {} dead — usable displays degraded \
-                         {:?} -> {:?}, re-anchoring via device_monitor",
-                        device_name, healthy, current
+                if audio_stream.is_sck_backed {
+                    if let Some((healthy, current)) =
+                        sck_watchdog.check_dead(stream_start.elapsed(), *last_non_zero_at)
+                    {
+                        warn!(
+                            "System Audio (output) {} dead — usable displays degraded \
+                             {:?} -> {:?}, re-anchoring via device_monitor",
+                            device_name, healthy, current
+                        );
+                        metrics.record_stream_timeout();
+                        audio_stream.is_disconnected.store(true, Ordering::Relaxed);
+                        return Err(anyhow!(
+                            "SCK System Audio stream dead — display invalidation (#3901)"
+                        ));
+                    }
+                    debug!(
+                        "no audio from output device {} for {}s, display topology unchanged \
+                         (nothing playing), continuing",
+                        device_name, AUDIO_RECEIVE_TIMEOUT_SECS
                     );
-                    metrics.record_stream_timeout();
-                    audio_stream.is_disconnected.store(true, Ordering::Relaxed);
-                    return Err(anyhow!(
-                        "SCK System Audio stream dead — display invalidation (#3901)"
-                    ));
+                } else {
+                    // Process Tap backend: anchored to the default output device,
+                    // not a display, and has its own silence watchdog. A topology
+                    // change is irrelevant here, so output silence stays non-fatal.
+                    debug!(
+                        "no audio from tap-backed output device {} for {}s (nothing playing), continuing",
+                        device_name, AUDIO_RECEIVE_TIMEOUT_SECS
+                    );
                 }
-                debug!(
-                    "no audio from output device {} for {}s, display topology unchanged \
-                     (nothing playing), continuing",
-                    device_name, AUDIO_RECEIVE_TIMEOUT_SECS
-                );
                 return Ok(None);
             }
 

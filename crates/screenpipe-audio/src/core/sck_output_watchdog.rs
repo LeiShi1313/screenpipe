@@ -126,31 +126,42 @@ pub fn decide_sck_output_dead(d: &SckOutputDecision) -> bool {
     no_usable || a_healthy_display_went_away
 }
 
-/// Pure filter for the CG predicate: a display is usable iff active and not
-/// asleep. Factored out so it is unit-testable without calling CoreGraphics.
+/// Pure filter for the CG predicate, factored out so it is unit-testable
+/// without calling CoreGraphics. Input tuples are `(id, is_builtin, active, asleep)`.
+///
+/// Mirrors `crates/screenpipe-screen/src/monitor.rs` `is_clamshell_inactive_builtin`:
+/// only the BUILT-IN counts as unusable when inactive/asleep (the clamshell
+/// signal). An EXTERNAL display that merely went to sleep on the Energy-Saver
+/// idle timer is still enumerated and stays usable — otherwise a routine
+/// display-off during a silent stretch would read as "a display departed" and
+/// trigger a needless rebuild. A genuinely unplugged external leaves
+/// `CGGetActiveDisplayList` entirely, so it is already absent from the input.
 /// Only referenced by the macOS CG shim and by tests.
 #[cfg(any(target_os = "macos", test))]
-fn filter_usable<I: IntoIterator<Item = (u32, bool, bool)>>(displays: I) -> BTreeSet<u32> {
+fn filter_usable<I: IntoIterator<Item = (u32, bool, bool, bool)>>(displays: I) -> BTreeSet<u32> {
     displays
         .into_iter()
-        .filter(|&(_, active, asleep)| active && !asleep)
-        .map(|(id, _, _)| id)
+        .filter(|&(_, is_builtin, active, asleep)| !(is_builtin && (!active || asleep)))
+        .map(|(id, _, _, _)| id)
         .collect()
 }
 
-/// The set of currently usable display ids (active and awake).
+/// The set of currently usable display ids, or `None` if the topology could
+/// not be read.
 ///
-/// On macOS this queries CoreGraphics; everywhere else it returns an empty set
-/// (the watchdog is only ever *invoked* on macOS — see the call sites in
-/// `run_record_and_transcribe` — but keeping the symbol cross-platform avoids
-/// `cfg` noise in the struct methods).
+/// `None` means "unknown" — a `CGGetActiveDisplayList` error — and callers MUST
+/// NOT infer "all displays gone / stream dead" from it (a CG error must not read
+/// as a degraded topology). On macOS this queries CoreGraphics; everywhere else
+/// it returns `None` (the watchdog is only ever *invoked* on macOS, but keeping
+/// the symbol cross-platform avoids `cfg` noise in the struct methods).
 #[cfg(target_os = "macos")]
-pub fn usable_display_ids() -> BTreeSet<u32> {
+pub fn usable_display_ids() -> Option<BTreeSet<u32>> {
     // Same CG entry points the monitor code uses for clamshell detection
     // (crates/screenpipe-screen/src/monitor.rs:813).
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGGetActiveDisplayList(max_displays: u32, active: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayIsBuiltin(display: u32) -> i32;
         fn CGDisplayIsActive(display: u32) -> i32;
         fn CGDisplayIsAsleep(display: u32) -> i32;
     }
@@ -160,22 +171,25 @@ pub fn usable_display_ids() -> BTreeSet<u32> {
     unsafe {
         let mut ids = [0u32; MAX];
         let mut count: u32 = 0;
-        // kCGErrorSuccess == 0.
+        // kCGErrorSuccess == 0. On error, return None ("unknown"), never empty.
         if CGGetActiveDisplayList(MAX as u32, ids.as_mut_ptr(), &mut count) != 0 {
-            return BTreeSet::new();
+            return None;
         }
         let n = (count as usize).min(MAX);
-        filter_usable(
-            ids[..n]
-                .iter()
-                .map(|&id| (id, CGDisplayIsActive(id) != 0, CGDisplayIsAsleep(id) != 0)),
-        )
+        Some(filter_usable(ids[..n].iter().map(|&id| {
+            (
+                id,
+                CGDisplayIsBuiltin(id) != 0,
+                CGDisplayIsActive(id) != 0,
+                CGDisplayIsAsleep(id) != 0,
+            )
+        })))
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn usable_display_ids() -> BTreeSet<u32> {
-    BTreeSet::new()
+pub fn usable_display_ids() -> Option<BTreeSet<u32>> {
+    None
 }
 
 /// Per-stream state for the System Audio output watchdog. One instance lives for
@@ -209,8 +223,17 @@ impl SckOutputWatchdog {
             .map(|t| t.elapsed() >= SNAPSHOT_REFRESH)
             .unwrap_or(true);
         if stale {
-            self.last_healthy_displays = Some(usable_display_ids());
             self.last_snapshot_at = Some(Instant::now());
+            // Adopt only a successful, non-empty read as the healthy baseline.
+            // Audio is flowing here, so a usable display necessarily exists; a
+            // `None` (CG error) or empty read is anomalous and must not poison
+            // the baseline — keep the last good snapshot so a later silence
+            // isn't misread as "every display went away" (a spurious rebuild).
+            if let Some(displays) = usable_display_ids() {
+                if !displays.is_empty() {
+                    self.last_healthy_displays = Some(displays);
+                }
+            }
         }
     }
 
@@ -223,7 +246,9 @@ impl SckOutputWatchdog {
         stream_elapsed: Duration,
         last_non_zero_at: Option<Instant>,
     ) -> Option<(BTreeSet<u32>, BTreeSet<u32>)> {
-        let current = usable_display_ids();
+        // Unknown topology (CG read failed) → never trip; we cannot prove the
+        // anchor display went away, so treating it as "dead" would be a guess.
+        let current = usable_display_ids()?;
         let decision = SckOutputDecision {
             device_type: DeviceType::Output,
             stream_elapsed,
@@ -398,14 +423,17 @@ mod tests {
     }
 
     #[test]
-    fn filter_usable_keeps_only_active_and_awake() {
-        // (id, active, asleep)
+    fn filter_usable_drops_only_inactive_or_asleep_builtin() {
+        // (id, is_builtin, active, asleep) — mirrors is_clamshell_inactive_builtin:
+        // only the built-in is dropped when inactive/asleep; an asleep EXTERNAL
+        // (Energy-Saver display-off) stays usable so it doesn't read as departed.
         let got = filter_usable([
-            (1u32, true, false),  // usable
-            (2, false, false),    // inactive
-            (3, true, true),      // active but asleep
-            (4, true, false),     // usable
+            (1u32, true, true, false),  // built-in, awake → usable
+            (2, true, false, false),    // built-in, inactive → dropped (clamshell)
+            (3, true, true, true),      // built-in, asleep → dropped (clamshell)
+            (4, false, true, true),     // external, asleep on idle → KEPT
+            (5, false, true, false),    // external, awake → usable
         ]);
-        assert_eq!(got, set(&[1, 4]));
+        assert_eq!(got, set(&[1, 4, 5]));
     }
 }

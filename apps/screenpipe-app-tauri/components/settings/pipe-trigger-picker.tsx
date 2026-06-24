@@ -128,9 +128,9 @@ export function PipeTriggerPicker(props: PickerProps) {
 
   return (
     <div>
-      <div className="flex items-center gap-1.5 mb-2">
-        <span className="text-xs font-medium">triggers</span>
-        <span className="text-[10px] text-muted-foreground">run this pipe when something happens</span>
+      <div className="mb-2.5">
+        <div className="text-sm font-medium lowercase">when to run</div>
+        <div className="text-[11px] text-muted-foreground">on a schedule, after a meeting, on a new message…</div>
       </div>
       <div className="space-y-1.5">
         {events.map((e, i) => (

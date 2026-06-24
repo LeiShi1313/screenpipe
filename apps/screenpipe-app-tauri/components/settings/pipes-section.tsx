@@ -2562,15 +2562,6 @@ export function PipesSection() {
                       {/* ═══ CONFIG TAB ═══ */}
                       <TabsContent value="config" className="mt-4 space-y-6">
 
-                        {/* Model */}
-                        <PipePresetSelector
-                          pipe={pipe}
-                          setPipes={setPipes}
-                          fetchPipes={fetchPipes}
-                          pendingConfigSaves={pendingConfigSaves}
-                          apiBase={apiBase}
-                        />
-
                         {/* Triggers — Notion-style picker (schedule, events + per-app connection sources) */}
                         <PipeTriggerPicker
                           pipeName={pipe.config.name}
@@ -2681,6 +2672,15 @@ export function PipesSection() {
                           </div>
                         </div>
 
+
+                        {/* Model — secondary; most pipes run fine on the default */}
+                        <PipePresetSelector
+                          pipe={pipe}
+                          setPipes={setPipes}
+                          fetchPipes={fetchPipes}
+                          pendingConfigSaves={pendingConfigSaves}
+                          apiBase={apiBase}
+                        />
 
                         {/* Notifications toggle */}
                         <div className="flex items-center justify-between border px-3 py-2.5">

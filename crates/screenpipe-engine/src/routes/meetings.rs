@@ -75,6 +75,58 @@ fn default_append_typed_text() -> bool {
     true
 }
 
+impl Default for StopMeetingRequest {
+    fn default() -> Self {
+        Self {
+            id: None,
+            append_typed_text: default_append_typed_text(),
+        }
+    }
+}
+
+/// Body extractor for `POST /meetings/stop` that tolerates a missing/empty
+/// request body, treating it as `StopMeetingRequest::default()` ("stop whatever
+/// meeting is currently active"). The plain `axum::Json` extractor rejects an
+/// empty body with an opaque 400 ("EOF while parsing"), which made the endpoint
+/// impossible to use for any client that didn't send a body (e.g. the MCP
+/// `stop-meeting` tool). Deriving `OaSchema` keeps the request documented in the
+/// generated OpenAPI spec.
+#[derive(OaSchema)]
+pub struct StopBody(pub StopMeetingRequest);
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequest<S> for StopBody
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, JsonResponse<Value>);
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse(json!({"error": "failed to read request body"})),
+                )
+            })?;
+        let parsed = if bytes.is_empty() {
+            StopMeetingRequest::default()
+        } else {
+            serde_json::from_slice(&bytes).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse(json!({"error": format!("invalid request body: {e}")})),
+                )
+            })?
+        };
+        Ok(StopBody(parsed))
+    }
+}
+
 #[derive(OaSchema, Deserialize, Debug)]
 pub struct ListMeetingsRequest {
     #[serde(
@@ -683,7 +735,7 @@ pub(crate) async fn start_meeting_handler(
 #[oasgen]
 pub(crate) async fn stop_meeting_handler(
     State(state): State<Arc<AppState>>,
-    axum::Json(body): axum::Json<StopMeetingRequest>,
+    StopBody(body): StopBody,
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
     let requested_id = body.id;
     let status = resolve_meeting_status(&state).await?;
@@ -692,6 +744,17 @@ pub(crate) async fn stop_meeting_handler(
             if status.stoppable_meeting_id == Some(id) || status.active_meeting_id == Some(id) {
                 id
             } else {
+                // Idempotency: a client can hold a stale meeting id after the
+                // backend's active meeting changed underneath it (e.g. the
+                // auto-detector ended a manually-started meeting). If the id
+                // refers to a meeting that is already ended, treat the stop as
+                // a success so the UI can resync instead of wedging on a 400
+                // ("manually started meeting cannot be stopped").
+                if let Ok(meeting) = state.db.get_meeting_by_id(id).await {
+                    if meeting.meeting_end.is_some() {
+                        return Ok(JsonResponse(meeting));
+                    }
+                }
                 return Err((
                     StatusCode::BAD_REQUEST,
                     JsonResponse(json!({"error": "requested meeting is not the active meeting"})),
@@ -882,6 +945,25 @@ pub(crate) async fn export_handler(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_stop_meeting_request_tolerant_body() {
+        // A missing body falls back to the default: stop the active meeting,
+        // appending typed text (historical behavior).
+        let d = StopMeetingRequest::default();
+        assert_eq!(d.id, None);
+        assert!(d.append_typed_text);
+
+        // An empty JSON object parses to the same defaults (the `{}` path).
+        let empty: StopMeetingRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.id, None);
+        assert!(empty.append_typed_text);
+
+        // A partial body still works and keeps the default for omitted fields.
+        let partial: StopMeetingRequest = serde_json::from_str(r#"{"id":5}"#).unwrap();
+        assert_eq!(partial.id, Some(5));
+        assert!(partial.append_typed_text);
+    }
 
     #[test]
     fn test_list_meetings_request_relative_dates() {

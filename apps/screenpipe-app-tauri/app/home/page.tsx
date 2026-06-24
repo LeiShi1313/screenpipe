@@ -663,6 +663,26 @@ function HomeContent() {
           return meeting;
         }
         const bodyText = await res.text().catch(() => "");
+        // Stop failed — most commonly because the cached `stoppableMeetingId`
+        // is stale (the backend's active meeting changed underneath us, e.g.
+        // the auto-detector ended a manually-started meeting). Without a
+        // resync the UI would keep showing an "active" meeting and re-send the
+        // same failing id forever — the "manually started meeting cannot be
+        // stopped" bug. Clear the optimistic grace window and refetch the
+        // authoritative status so the next click targets the real meeting (or
+        // the icon clears if nothing is active).
+        manualMeetingStartedAt.current = 0;
+        try {
+          const sres = await localFetch("/meetings/status");
+          if (sres.ok) {
+            const status = (await sres.json()) as MeetingStatusResponse;
+            setMeetingState(
+              computeMeetingActive(status, manualMeetingStartedAt.current),
+            );
+          }
+        } catch {
+          // ignore resync failures; websocket remains source of truth
+        }
         throw new Error(
           `stop meeting failed: HTTP ${res.status}${bodyText ? ` — ${bodyText}` : ""}`,
         );

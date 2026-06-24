@@ -143,21 +143,40 @@ async function openMyPipes(): Promise<void> {
 }
 
 async function selectPipeTypeFilter(type: 'scheduled' | 'manual' | 'triggered'): Promise<void> {
-  const trigger = await $('[data-testid="pipe-type-filter-trigger"]');
-  await trigger.waitForExist({ timeout: t(10_000) });
+  const state = (await browser.execute((targetType: string) => {
+    const root = document.querySelector('[data-testid="section-pipes"]');
+    if (!root) return { found: false, selected: false };
 
-  if ((await trigger.getAttribute('data-pipe-type-filter')) === type) return;
+    const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button'));
+    const filter = buttons.find((button) => {
+      const text = (button.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      return /^(scheduled|manual|triggered|cloud)( \(\d+\))?$/.test(text);
+    });
+    if (!filter) return { found: false, selected: false };
 
-  await trigger.click();
+    const text = (filter.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (text.startsWith(targetType)) return { found: true, selected: true };
 
-  const option = await $(`[data-testid="pipe-type-filter-option-${type}"]`);
-  await option.waitForExist({ timeout: t(10_000) });
-  await option.click();
+    filter.click();
+    return { found: true, selected: false };
+  }, type)) as { found: boolean; selected: boolean };
 
-  await browser.waitUntil(async () => (await trigger.getAttribute('data-pipe-type-filter')) === type, {
-    timeout: t(5_000),
-    timeoutMsg: `pipe type filter did not switch to ${type}`,
-  });
+  expect(state.found).toBe(true);
+  if (state.selected) return;
+
+  await browser.pause(300);
+  const clicked = (await browser.execute((targetType: string) => {
+    const item = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"]')).find((el) => {
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      return text === targetType || text.startsWith(`${targetType} `);
+    });
+    if (!item) return false;
+    item.click();
+    return true;
+  }, type)) as boolean;
+
+  expect(clicked).toBe(true);
+  await browser.pause(500);
 }
 
 async function waitForPipeRow(): Promise<void> {

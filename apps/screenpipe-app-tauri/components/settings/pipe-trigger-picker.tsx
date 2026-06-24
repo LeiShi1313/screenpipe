@@ -6,7 +6,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { localFetch } from "@/lib/api";
-import { commands } from "@/lib/utils/tauri";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { notifyConnectionsUpdated } from "@/lib/connections-events";
 import { IntegrationIcon } from "@/components/settings/connections-section";
@@ -334,6 +333,7 @@ function Detail({
             availableConnections={availableConnections}
             refreshConnections={refreshConnections}
             onAdd={onAddSource}
+            onClose={onClose}
           />
         )}
       </div>
@@ -405,11 +405,13 @@ function SourceDetail({
   availableConnections,
   refreshConnections,
   onAdd,
+  onClose,
 }: {
   app: "slack" | "notion" | "obsidian";
   availableConnections: AvailableConnection[];
   refreshConnections: () => Promise<AvailableConnection[]>;
   onAdd: (s: TriggerSource) => void;
+  onClose: () => void;
 }) {
   const [conns, setConns] = useState(availableConnections);
   const connected = !!conns.find((c) => c.id === app)?.connected;
@@ -420,9 +422,10 @@ function SourceDetail({
   useEffect(() => setConns(availableConnections), [availableConnections]);
 
   async function doConnect() {
-    setConnecting(true);
-    try {
-      if (app === "obsidian") {
+    // Obsidian is local — pick a vault folder inline.
+    if (app === "obsidian") {
+      setConnecting(true);
+      try {
         const picked = await openDialog({ directory: true, multiple: false, title: "Select Obsidian vault folder" });
         if (typeof picked !== "string") return;
         await localFetch("/connections/obsidian", {
@@ -430,17 +433,20 @@ function SourceDetail({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ credentials: { vault_path: picked } }),
         });
-      } else {
-        const res = await commands.oauthConnect(app, null, null);
-        if (res.status !== "ok" || !res.data.connected) return;
+        notifyConnectionsUpdated();
+        setConns(await refreshConnections());
+      } catch (e) {
+        console.error("connect failed", e);
+      } finally {
+        setConnecting(false);
       }
-      notifyConnectionsUpdated();
-      setConns(await refreshConnections());
-    } catch (e) {
-      console.error("connect failed", e);
-    } finally {
-      setConnecting(false);
+      return;
     }
+    // Slack/Notion OAuth needs scope-variant + account selection (read access,
+    // not the send-only default) — hand off to the full Connections flow rather
+    // than reimplement it here. Reopen this picker once connected.
+    onClose();
+    window.dispatchEvent(new CustomEvent("open-settings", { detail: { section: "connections" } }));
   }
 
   if (!connected) return <ConnectCard app={app} connecting={connecting} onConnect={doConnect} />;

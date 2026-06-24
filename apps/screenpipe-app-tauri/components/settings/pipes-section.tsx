@@ -2682,15 +2682,6 @@ export function PipesSection() {
                           apiBase={apiBase}
                         />
 
-                        {/* Notifications toggle */}
-                        <div className="flex items-center justify-between border px-3 py-2.5">
-                          <span className="text-xs font-medium cursor-help" title="allow this pipe to send notifications">notifications</span>
-                          <Switch
-                            checked={!isNotificationsDenied(promptDrafts[pipe.config.name] ?? pipe.raw_content)}
-                            onCheckedChange={(checked) => toggleNotifications(pipe.config.name, checked)}
-                          />
-                        </div>
-
                       </TabsContent>
 
                       {/* ═══ RUNS TAB ═══ */}
@@ -2806,6 +2797,15 @@ export function PipesSection() {
 
                       {/* ═══ ADVANCED TAB ═══ */}
                       <TabsContent value="advanced" className="mt-3 space-y-3">
+                      {/* Notifications toggle */}
+                      <div className="flex items-center justify-between border px-3 py-2.5">
+                        <span className="text-xs font-medium cursor-help" title="allow this pipe to send notifications">notifications</span>
+                        <Switch
+                          checked={!isNotificationsDenied(promptDrafts[pipe.config.name] ?? pipe.raw_content)}
+                          onCheckedChange={(checked) => toggleNotifications(pipe.config.name, checked)}
+                        />
+                      </div>
+
                       {/* Timeout */}
                       <div>
                         <Label className="text-xs mb-2 block cursor-help" title="max execution time before the pipe is killed — increase for slow LLMs or complex pipes">timeout</Label>

@@ -84,6 +84,37 @@ export function buildWifConfig(env: Env): WifConfig | undefined {
 	};
 }
 
+/**
+ * Fetch with transient-failure retry for the WIF token chain. STS and SA
+ * impersonation occasionally hit a Cloudflare 522 / 5xx / network blip
+ * (AI-PROXY-26); without a retry the user's whole request fails. Token minting
+ * is idempotent, so retrying is safe. A real 4xx (e.g. a bad token) is NOT
+ * retried — it's surfaced immediately. `fetchImpl`/`sleep` are injectable for tests.
+ */
+export async function wifFetchWithRetry(
+	url: string,
+	init: RequestInit,
+	label: string,
+	fetchImpl: (u: string, i: RequestInit) => Promise<Response> = (u, i) => fetch(u, i),
+	sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<Response> {
+	const MAX = 3;
+	for (let attempt = 0; attempt < MAX; attempt++) {
+		try {
+			const resp = await fetchImpl(url, init);
+			if (resp.status < 500 && resp.status !== 429) return resp; // success or a real 4xx
+			if (attempt === MAX - 1) return resp; // out of retries — let the caller surface the status
+			resp.body?.cancel().catch(() => {});
+			console.warn(`${label}: transient ${resp.status}, retry ${attempt + 1}/${MAX}`);
+		} catch (err) {
+			if (attempt === MAX - 1) throw err; // network error on the last attempt
+			console.warn(`${label}: network error, retry ${attempt + 1}/${MAX}`);
+		}
+		await sleep(200 * (attempt + 1) + Math.random() * 150);
+	}
+	return fetchImpl(url, init); // unreachable (loop returns/throws on the last attempt); keeps TS happy
+}
+
 export class VertexAIProvider implements AIProvider {
 	supportsTools = true;
 	supportsVision = true;
@@ -231,7 +262,7 @@ export class VertexAIProvider implements AIProvider {
 		const oidcJwt = `${signatureInput}.${await this.signWithRSA(signatureInput, w.signingKey)}`;
 
 		// 1) STS token exchange (OAuth 2.0 token-exchange spec)
-		const stsResp = await fetch('https://sts.googleapis.com/v1/token', {
+		const stsResp = await wifFetchWithRetry('https://sts.googleapis.com/v1/token', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
 			body: new URLSearchParams({
@@ -242,20 +273,21 @@ export class VertexAIProvider implements AIProvider {
 				subject_token: oidcJwt,
 				subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
 			}),
-		});
+		}, 'WIF STS exchange');
 		if (!stsResp.ok) {
 			throw new Error(`WIF STS exchange failed: ${stsResp.status} ${await stsResp.text()}`);
 		}
 		const sts = (await stsResp.json()) as { access_token: string };
 
 		// 2) impersonate the service account
-		const impResp = await fetch(
+		const impResp = await wifFetchWithRetry(
 			`https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${w.saEmail}:generateAccessToken`,
 			{
 				method: 'POST',
 				headers: { Authorization: `Bearer ${sts.access_token}`, 'Content-Type': 'application/json' },
 				body: JSON.stringify({ scope: ['https://www.googleapis.com/auth/cloud-platform'], lifetime: '3600s' }),
 			},
+			'WIF SA impersonation',
 		);
 		if (!impResp.ok) {
 			throw new Error(`WIF SA impersonation failed: ${impResp.status} ${await impResp.text()}`);

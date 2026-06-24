@@ -1291,7 +1291,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                         let state = app.state::<std::sync::Arc<crate::updates::UpdatesManager>>();
                         if state.has_update_installed().await {
                             let _ = app.emit("update-now-clicked", ());
-                        } else if let Err(e) = state.check_for_updates(true).await {
+                        } else if let Err(e) = state.check_for_updates(true, true).await {
                             tracing::error!("tray menu: check for updates failed: {}", e);
                         }
                     });

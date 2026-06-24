@@ -64,7 +64,6 @@ import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
 import { describeSchedule, type ScheduleConfig } from "@/lib/utils/schedule-builder";
-import { PipeScheduleBuilder } from "./pipe-schedule-builder";
 import {
   PipeActivityIndicator,
   formatPipeElapsed,
@@ -949,79 +948,6 @@ function pipeScheduleLabel(config: PipeConfig): string {
   return describeSchedule(config.schedule_config ?? null, config.schedule);
 }
 
-/** Schedule control: a popover trigger showing the current cadence that opens
- *  the Notion-style {@link PipeScheduleBuilder}. Saves the structured
- *  `schedule_config` (the engine runs it; the legacy `schedule` is parked at
- *  "manual"). */
-function PipeScheduleControls({
-  pipe,
-  setPipes,
-  fetchPipes,
-  pendingConfigSaves,
-  apiBase,
-}: {
-  pipe: { config: PipeConfig };
-  setPipes: React.Dispatch<React.SetStateAction<any[]>>;
-  fetchPipes: () => void;
-  pendingConfigSaves: React.MutableRefObject<Record<string, Promise<void>>>;
-  apiBase: string;
-}) {
-  const [open, setOpen] = useState(false);
-
-  const saveScheduleConfig = (cfg: ScheduleConfig | null) => {
-    const pipeName = pipe.config.name;
-    setPipes((prev: any[]) =>
-      prev.map((p: any) =>
-        p.config.name === pipeName
-          ? { ...p, config: { ...p.config, schedule_config: cfg, schedule: "manual" } }
-          : p
-      )
-    );
-    const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ schedule_config: cfg }),
-    })
-      .then(async () => {
-        await new Promise((r) => setTimeout(r, 500));
-        delete pendingConfigSaves.current[pipeName];
-        fetchPipes();
-      })
-      .catch(() => {
-        delete pendingConfigSaves.current[pipeName];
-      });
-    // Register guard so a background fetchPipes never overwrites with stale data.
-    pendingConfigSaves.current[pipeName] = savePromise;
-  };
-
-  const label = pipeHasSchedule(pipe.config) ? pipeScheduleLabel(pipe.config) : "don't run";
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="mt-1 flex h-8 w-full items-center justify-between gap-2 rounded border border-input bg-background px-2.5 text-xs hover:bg-accent/40"
-        >
-          <span className="truncate text-left">{label}</span>
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-auto p-2">
-        <PipeScheduleBuilder
-          current={(pipe.config.schedule_config as ScheduleConfig | null) ?? null}
-          currentScheduleString={pipe.config.schedule || "manual"}
-          apiBase={apiBase}
-          onSave={(cfg) => {
-            saveScheduleConfig(cfg);
-            setOpen(false);
-          }}
-          onCancel={() => setOpen(false)}
-        />
-      </PopoverContent>
-    </Popover>
-  );
-}
 
 export function PipesSection() {
   // Device selector: null = local machine, string = remote address
@@ -2645,23 +2571,47 @@ export function PipesSection() {
                           apiBase={apiBase}
                         />
 
-                        {/* Schedule */}
-                        <div>
-                      <Label className="text-xs flex items-center gap-1.5 mb-1 cursor-help" title={((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 0 ? "runs on this schedule in addition to triggers" : "how often to run this pipe"}>
-                        schedule
-                        {((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 0 && pipeHasSchedule(pipe.config) && (
-                          <span className="text-muted-foreground font-normal">+ triggers</span>
-                        )}
-                      </Label>
-                      <PipeScheduleControls
-                        pipe={pipe}
-                        setPipes={setPipes}
-                        fetchPipes={fetchPipes}
-                        pendingConfigSaves={pendingConfigSaves}
-                        apiBase={apiBase}
-                      />
-
-                        </div>
+                        {/* Triggers — Notion-style picker (schedule, events + per-app connection sources) */}
+                        <PipeTriggerPicker
+                          pipeName={pipe.config.name}
+                          trigger={pipe.config.trigger}
+                          apiBase={apiBase}
+                          scheduleConfig={pipe.config.schedule_config ?? null}
+                          scheduleString={pipe.config.schedule || "manual"}
+                          otherPipes={pipes
+                            .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
+                            .map((p) => ({ name: p.config.name }))}
+                          availableConnections={availableConnections}
+                          refreshConnections={async () => {
+                            const next = await fetchAvailablePipeConnections(apiBase, availableConnections);
+                            setAvailableConnections(next);
+                            return next;
+                          }}
+                          fetchPipes={fetchPipes}
+                          applyOptimistic={(t) =>
+                            setPipes((prev) =>
+                              prev.map((p) =>
+                                p.config.name === pipe.config.name
+                                  ? { ...p, config: { ...p.config, trigger: t } }
+                                  : p
+                              )
+                            )
+                          }
+                          onSaveSchedule={(cfg) => {
+                            setPipes((prev) =>
+                              prev.map((p) =>
+                                p.config.name === pipe.config.name
+                                  ? { ...p, config: { ...p.config, schedule_config: cfg, schedule: "manual" } }
+                                  : p
+                              )
+                            );
+                            localFetch(`/pipes/${pipe.config.name}/config`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ schedule_config: cfg }),
+                            }).then(() => fetchPipes());
+                          }}
+                        />
 
                         {/* Connections */}
                         <div>
@@ -2731,47 +2681,6 @@ export function PipesSection() {
                           </div>
                         </div>
 
-                        {/* Triggers — Notion-style picker (events + per-app connection sources) */}
-                        <PipeTriggerPicker
-                          pipeName={pipe.config.name}
-                          trigger={pipe.config.trigger}
-                          apiBase={apiBase}
-                          scheduleConfig={pipe.config.schedule_config ?? null}
-                          scheduleString={pipe.config.schedule || "manual"}
-                          otherPipes={pipes
-                            .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
-                            .map((p) => ({ name: p.config.name }))}
-                          availableConnections={availableConnections}
-                          refreshConnections={async () => {
-                            const next = await fetchAvailablePipeConnections(apiBase, availableConnections);
-                            setAvailableConnections(next);
-                            return next;
-                          }}
-                          fetchPipes={fetchPipes}
-                          applyOptimistic={(t) =>
-                            setPipes((prev) =>
-                              prev.map((p) =>
-                                p.config.name === pipe.config.name
-                                  ? { ...p, config: { ...p.config, trigger: t } }
-                                  : p
-                              )
-                            )
-                          }
-                          onSaveSchedule={(cfg) => {
-                            setPipes((prev) =>
-                              prev.map((p) =>
-                                p.config.name === pipe.config.name
-                                  ? { ...p, config: { ...p.config, schedule_config: cfg, schedule: "manual" } }
-                                  : p
-                              )
-                            );
-                            localFetch(`/pipes/${pipe.config.name}/config`, {
-                              method: "POST",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ schedule_config: cfg }),
-                            }).then(() => fetchPipes());
-                          }}
-                        />
 
                         {/* Notifications toggle */}
                         <div className="flex items-center justify-between border px-3 py-2.5">

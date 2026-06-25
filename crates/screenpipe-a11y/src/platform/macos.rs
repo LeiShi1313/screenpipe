@@ -1554,6 +1554,78 @@ fn get_focused_app_info() -> Option<(i32, String)> {
 // Accessibility Helpers
 // ============================================================================
 
+/// Normalize an AX role into a stable `AX*` string (e.g. "AXButton").
+fn role_string(elem: &ax::UiElement) -> Option<String> {
+    elem.role().ok().map(|r| {
+        let s = format!("{:?}", r);
+        if let Some(start) = s.find("AX") {
+            let rest = &s[start..];
+            let end = rest.find([')', '"', '}']).unwrap_or(rest.len());
+            rest[..end].to_string()
+        } else {
+            "Unknown".to_string()
+        }
+    })
+}
+
+/// Best-effort label for an element: title, then value, then description.
+fn element_label(elem: &ax::UiElement) -> Option<String> {
+    get_string_attr(elem, ax::attr::title())
+        .or_else(|| get_string_attr(elem, ax::attr::value()))
+        .or_else(|| get_string_attr(elem, ax::attr::desc()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A hit-test at a click point very often returns a generic, unlabeled container
+/// (`AXGroup`, `AXWebArea`, `AXScrollArea`) — especially for web content — so the
+/// recorded action is just "click AXGroup" with no idea what was clicked. This
+/// descends into the descendants whose bounds contain the cursor and returns the
+/// most specific labeled control actually under it (e.g. "AXButton" / "Continue").
+/// Bounded by `depth` and a shared node `budget` so it stays cheap on the
+/// event-tap hot path.
+fn find_labeled_descendant_at(
+    elem: &ax::UiElement,
+    x: f64,
+    y: f64,
+    depth: u8,
+    budget: &mut u32,
+) -> Option<(String, String, Option<ElementBounds>)> {
+    if depth == 0 || *budget == 0 {
+        return None;
+    }
+    let children = elem.children().ok()?;
+    let mut best: Option<(String, String, ElementBounds)> = None;
+    for child in children.iter() {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let Some(b) = get_element_bounds(&child) else {
+            continue;
+        };
+        // only descend into elements that actually contain the cursor
+        if x < b.x || x > b.x + b.width || y < b.y || y > b.y + b.height {
+            continue;
+        }
+        // prefer the deepest (most specific) labeled match
+        if let Some(found) = find_labeled_descendant_at(&child, x, y, depth - 1, budget) {
+            return Some(found);
+        }
+        if let (Some(role), Some(name)) = (role_string(&child), element_label(&child)) {
+            let area = b.width * b.height;
+            let better = best
+                .as_ref()
+                .map(|(_, _, bb)| area < bb.width * bb.height)
+                .unwrap_or(true);
+            if better {
+                best = Some((role, name, b));
+            }
+        }
+    }
+    best.map(|(r, n, b)| (r, n, Some(b)))
+}
+
 fn get_element_at_position(
     x: f64,
     y: f64,
@@ -1586,16 +1658,7 @@ fn get_element_at_position(
         }
     }
 
-    let role = elem.role().ok().map(|r| {
-        let s = format!("{:?}", r);
-        if let Some(start) = s.find("AX") {
-            let rest = &s[start..];
-            let end = rest.find([')', '"', '}']).unwrap_or(rest.len());
-            rest[..end].to_string()
-        } else {
-            "Unknown".to_string()
-        }
-    })?;
+    let role = role_string(&elem)?;
     let bounds = get_element_bounds(&elem);
 
     // Try multiple attributes to get the element name/label
@@ -1614,6 +1677,20 @@ fn get_element_at_position(
             // Try to get the title from role description
             elem.role_desc().ok().map(|s| s.to_string())
         });
+
+    // The hit-test commonly lands on an unlabeled generic container (web content
+    // returns AXGroup / AXWebArea / AXScrollArea with no title). When there is no
+    // usable label, descend to the specific labeled control under the cursor so the
+    // recorded action is "click AXButton: Continue" instead of "click AXGroup".
+    let (role, name, bounds) = if name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        let mut budget: u32 = 96;
+        match find_labeled_descendant_at(&elem, x, y, 5, &mut budget) {
+            Some((r, n, b)) => (r, Some(n), b.or(bounds)),
+            None => (role, name, bounds),
+        }
+    } else {
+        (role, name, bounds)
+    };
 
     if config.is_password_field(Some(&role), name.as_deref()) {
         // Don't capture value for password fields

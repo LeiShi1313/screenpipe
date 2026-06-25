@@ -4,9 +4,9 @@
 
 "use client";
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { SearchModal } from "@/components/rewind/search-modal";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { commands } from "@/lib/utils/tauri";
 import {
 	RECENT_CHAT_SEARCH_HANDOFF_EVENT,
@@ -21,6 +21,24 @@ export default function SearchPage() {
 
 	const handleClose = useCallback(async () => {
 		await commands.closeWindow({ Search: { query: null } });
+	}, []);
+
+	// The search window is reused across opens: Rust hides it on close (keeping
+	// the webview warm) and emits "search-reset" instead of reloading the page.
+	// Bumping the key remounts SearchModal, which replays the normal fresh-open
+	// path (clean state + autofocus) without paying a webview cold-boot — the
+	// fix for the ~10s freeze before you could type.
+	const [reopenNonce, setReopenNonce] = useState(0);
+	useEffect(() => {
+		const unlistenPromise = listen<{ query?: string | null }>("search-reset", (event) => {
+			const q = event.payload?.query ?? "";
+			const url = q ? `/search?q=${encodeURIComponent(q)}` : "/search";
+			window.history.replaceState(null, "", url);
+			setReopenNonce((n) => n + 1);
+		});
+		return () => {
+			unlistenPromise.then((f) => f());
+		};
 	}, []);
 
 	// Close on click outside
@@ -62,6 +80,7 @@ export default function SearchPage() {
 	return (
 		<div className="w-screen h-screen bg-transparent">
 			<SearchModal
+				key={reopenNonce}
 				isOpen={true}
 				standalone
 				onClose={handleClose}

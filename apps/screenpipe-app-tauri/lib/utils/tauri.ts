@@ -6,6 +6,16 @@
 
 export const commands = {
 /**
+ * Reconcile the live app + the next-boot config with the current enterprise
+ * hidden-UI policy. The frontend calls this right after pushing a freshly
+ * fetched policy via `set_enterprise_policy`, so the moment an admin turns on
+ * "hide app", the windows already on screen are retracted and the dock icon
+ * drops — without waiting for a restart. Best-effort: never returns an error.
+ */
+async applyEnterpriseUiVisibility() : Promise<void> {
+    await TAURI_INVOKE("apply_enterprise_ui_visibility");
+},
+/**
  * Frontend-callable gate. The banner awaits this before calling
  * `downloadAndInstall` (Windows: triggers process::exit internally) or
  * `relaunch`. Returns one of `"proceed"`, `"errored"`, or `"pending"`

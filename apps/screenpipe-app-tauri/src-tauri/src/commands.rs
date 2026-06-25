@@ -886,6 +886,71 @@ pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Persist the resolved "hide app UI" decision into `~/.screenpipe/enterprise.json`
+/// so the NEXT launch starts hidden *before* any window is created.
+///
+/// `is_app_ui_hidden()` is true for the running session as soon as the policy
+/// is pushed (the hidden sections live in a process global), but Rust resolves
+/// it on the very first window-gate check at startup — before the frontend has
+/// fetched the network policy. Mirroring the decision into the same file that
+/// `enterprise_policy::enterprise_json_hides_app_ui()` already reads at boot
+/// closes that gap, so a managed-background device never flashes its UI on
+/// subsequent launches.
+///
+/// We only ever touch the user-writable file; a bundled MDM `enterprise.json`
+/// (checked first at boot) keeps precedence. To avoid littering consumer
+/// machines we skip writing a `false` when there's nothing to clear.
+fn persist_enterprise_hide_app(hidden: bool) {
+    let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
+
+    let mut json = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let currently_set = json
+        .get("hide_app")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if hidden == currently_set {
+        return; // already in sync — nothing to write
+    }
+    if !hidden && !path.exists() {
+        return; // never create a file just to record "not hidden"
+    }
+
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("enterprise: could not create dir for enterprise.json: {}", e);
+            return;
+        }
+    }
+    json["hide_app"] = serde_json::Value::Bool(hidden);
+    match serde_json::to_string_pretty(&json) {
+        Ok(body) => {
+            if let Err(e) = std::fs::write(&path, body) {
+                warn!("enterprise: failed to persist hide_app to {}: {}", path.display(), e);
+            } else {
+                info!("enterprise: persisted hide_app={} to {}", hidden, path.display());
+            }
+        }
+        Err(e) => warn!("enterprise: failed to serialize enterprise.json: {}", e),
+    }
+}
+
+/// Reconcile the live app + the next-boot config with the current enterprise
+/// hidden-UI policy. The frontend calls this right after pushing a freshly
+/// fetched policy via `set_enterprise_policy`, so the moment an admin turns on
+/// "hide app", the windows already on screen are retracted and the dock icon
+/// drops — without waiting for a restart. Best-effort: never returns an error.
+#[tauri::command]
+#[specta::specta]
+pub fn apply_enterprise_ui_visibility(app: tauri::AppHandle) {
+    let hidden = crate::enterprise_policy::is_app_ui_hidden();
+    persist_enterprise_hide_app(hidden);
+    crate::window::enforce_enterprise_ui_visibility(&app);
+}
+
 /// Read the enterprise admin API token (`team_api_token`) from
 /// `~/.screenpipe/enterprise.json`. Returns None when the file is
 /// missing, malformed, or the field is empty.

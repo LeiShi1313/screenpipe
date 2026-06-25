@@ -515,6 +515,12 @@ export function useEnterprisePolicy() {
       // Push hidden sections to Rust so tray menu can use them
       try {
         await commands.setEnterprisePolicy(result.hiddenSections);
+        // Reconcile the live app with the policy we just pushed: if it turns on
+        // hidden-UI mode, retract any windows already on screen and drop the
+        // dock icon now (set_enterprise_policy only updates state — it doesn't
+        // hide what's already visible). Also persists the decision so the next
+        // launch starts hidden before any window renders. No-op when not hidden.
+        await commands.applyEnterpriseUiVisibility();
       } catch (e) {
         console.warn("[enterprise] failed to push policy to Rust:", e);
       }

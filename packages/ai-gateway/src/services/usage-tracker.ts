@@ -182,6 +182,17 @@ export function getModelWeight(model?: string): number {
   return bestKey ? MODEL_WEIGHTS[bestKey] : 1;
 }
 
+/**
+ * A "free" model is one with query_weight 0 — the Vertex MaaS models (glm-5,
+ * kimi-k2.5), the fast Gemini/Qwen flashes, and `auto`. These cost no daily
+ * quota and are what we tell users to switch to "to avoid limits". They get a
+ * separate, much higher per-minute RPM bucket (`TierLimits.freeRpm`) so that
+ * promise actually holds at the per-minute layer, not just the daily layer.
+ */
+export function isFreeModel(model?: string): boolean {
+  return getModelWeight(model) === 0;
+}
+
 // Default limits (overridable via env vars in CF dashboard — no redeploy needed)
 const DEFAULT_IP_DAILY_LIMIT = 1500;
 
@@ -189,6 +200,10 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
   anonymous: {
     dailyQueries: 25,
     rpm: 15,
+    // Free (weight-0) models get their own, much higher per-minute bucket so a
+    // user picking "the free model to avoid limits" actually avoids them. The
+    // low `rpm` above still guards paid models. Daily cost cap is the backstop.
+    freeRpm: 60,
     allowedModels: [
       'auto',
       'claude-haiku-4-5',
@@ -215,6 +230,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
   logged_in: {
     dailyQueries: 30,
     rpm: 25,
+    freeRpm: 120,
     allowedModels: [
       'auto',
       'claude-haiku-4-5',
@@ -234,6 +250,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
   subscribed: {
     dailyQueries: 1500,
     rpm: 60,
+    freeRpm: 240,
     allowedModels: ['*'], // all models
   },
 };
@@ -246,16 +263,19 @@ export function getTierConfig(env?: Env): Record<UserTier, TierLimits> {
       ...DEFAULT_TIER_CONFIG.anonymous,
       dailyQueries: parseInt(env.LIMIT_ANONYMOUS_DAILY || '') || DEFAULT_TIER_CONFIG.anonymous.dailyQueries,
       rpm: parseInt(env.LIMIT_ANONYMOUS_RPM || '') || DEFAULT_TIER_CONFIG.anonymous.rpm,
+      freeRpm: parseInt(env.LIMIT_ANONYMOUS_FREE_RPM || '') || DEFAULT_TIER_CONFIG.anonymous.freeRpm,
     },
     logged_in: {
       ...DEFAULT_TIER_CONFIG.logged_in,
       dailyQueries: parseInt(env.LIMIT_LOGGED_IN_DAILY || '') || DEFAULT_TIER_CONFIG.logged_in.dailyQueries,
       rpm: parseInt(env.LIMIT_LOGGED_IN_RPM || '') || DEFAULT_TIER_CONFIG.logged_in.rpm,
+      freeRpm: parseInt(env.LIMIT_LOGGED_IN_FREE_RPM || '') || DEFAULT_TIER_CONFIG.logged_in.freeRpm,
     },
     subscribed: {
       ...DEFAULT_TIER_CONFIG.subscribed,
       dailyQueries: parseInt(env.LIMIT_SUBSCRIBED_DAILY || '') || DEFAULT_TIER_CONFIG.subscribed.dailyQueries,
       rpm: parseInt(env.LIMIT_SUBSCRIBED_RPM || '') || DEFAULT_TIER_CONFIG.subscribed.rpm,
+      freeRpm: parseInt(env.LIMIT_SUBSCRIBED_FREE_RPM || '') || DEFAULT_TIER_CONFIG.subscribed.freeRpm,
     },
   };
 }

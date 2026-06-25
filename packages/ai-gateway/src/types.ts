@@ -207,6 +207,11 @@ export interface Env {
 	LIMIT_SUBSCRIBED_DAILY?: string;
 	LIMIT_SUBSCRIBED_RPM?: string;
 	LIMIT_IP_DAILY?: string;
+	// Per-minute RPM for free (weight-0) models — a separate, much higher bucket
+	// so heavy free usage never trips the low paid-model limit. Tunable per tier.
+	LIMIT_ANONYMOUS_FREE_RPM?: string;
+	LIMIT_LOGGED_IN_FREE_RPM?: string;
+	LIMIT_SUBSCRIBED_FREE_RPM?: string;
 }
 
 // User tier for rate limiting and model access
@@ -225,6 +230,13 @@ export interface AuthResult {
 export interface TierLimits {
 	dailyQueries: number;
 	rpm: number;
+	/**
+	 * Per-minute RPM for free (weight-0) models. Tracked in a separate bucket
+	 * from `rpm` (paid models), so free traffic never consumes the low paid
+	 * limit and vice-versa. Always >= `rpm`. The daily *cost* cap remains the
+	 * real backstop against runaway free loops.
+	 */
+	freeRpm: number;
 	allowedModels: string[];
 }
 

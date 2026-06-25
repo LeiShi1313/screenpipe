@@ -7,7 +7,7 @@ import { Env, RequestBody, AuthResult } from './types';
 import { handleOptions, createSuccessResponse, createErrorResponse, addCorsHeaders } from './utils/cors';
 import { validateAuth } from './utils/auth';
 import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
-import { trackUsage, getUsageStatus, isModelAllowed, resolveModelGate, getTierConfig, getCreditBalance } from './services/usage-tracker';
+import { trackUsage, getUsageStatus, isModelAllowed, isFreeModel, resolveModelGate, getTierConfig, getCreditBalance } from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
@@ -46,10 +46,16 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 		const authResult = await validateAuth(request, env);
 		console.log('auth result:', { tier: authResult.tier, deviceId: authResult.deviceId });
 
-		// Check rate limit with tier info
-		const rateLimit = await checkRateLimit(request, env, authResult);
-		if (!rateLimit.allowed && rateLimit.response) {
-			return rateLimit.response;
+		// Check rate limit with tier info. Chat completions are checked inside
+		// their own block instead — there we know the model, so free (weight-0)
+		// models get routed to the high `freeRpm` bucket rather than the low
+		// paid-model `rpm`. Every other endpoint uses the standard tier limit.
+		const isChatCompletion = path === '/v1/chat/completions' && request.method === 'POST';
+		if (!isChatCompletion) {
+			const rateLimit = await checkRateLimit(request, env, authResult);
+			if (!rateLimit.allowed && rateLimit.response) {
+				return rateLimit.response;
+			}
 		}
 
 		// Usage status endpoint - returns current usage without incrementing
@@ -130,6 +136,19 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					tier: authResult.tier,
 					allowed_models: allowedModels,
 				})));
+			}
+
+			// Per-minute rate limit. Now that the model is resolved (a 'downgrade'
+			// already rewrote it to free 'auto'), free weight-0 models meter
+			// against the high `freeRpm` bucket — so "switch to a free model to
+			// avoid rate limits" actually works. Paid models keep the low `rpm`.
+			// The two buckets are independent; the daily cost cap below is the
+			// real backstop against runaway free loops.
+			const rateLimit = await checkRateLimit(request, env, authResult, {
+				freeModel: isFreeModel(body.model),
+			});
+			if (!rateLimit.allowed && rateLimit.response) {
+				return rateLimit.response;
 			}
 
 			// Per-user daily cost cap (account-wide $ ceiling, credit-extended).

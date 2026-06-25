@@ -416,6 +416,11 @@ export type Settings = SettingsStore & {
 	 * visible. Read by reset_to_regular_and_refresh_tray in
 	 * src-tauri/src/window/panel.rs at startup and on window events. Default off. */
 	hideDockIcon?: boolean;
+	/** True once the in-app first-run guide (shown after onboarding on the Home
+	 * window) has been completed or skipped. Stored here — not in a Tauri
+	 * command/state — so it persists in the normal settings store with no
+	 * bindings regen. Gating lives in app/home/page.tsx. Default off. */
+	firstRunGuideDone?: boolean;
 }
 
 export function getEffectiveFilters(settings: Settings) {
@@ -655,6 +660,7 @@ let DEFAULT_SETTINGS: Settings = {
 			overlayMode: "fullscreen",
 			showOverlayInScreenRecording: false,
 			disableTimeline: false,
+			firstRunGuideDone: false,
 			videoQuality: "balanced",
 			transcriptionMode: "batch",
 			cloudArchiveEnabled: false,

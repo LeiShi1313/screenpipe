@@ -51,6 +51,7 @@ import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
+import FirstRunGuide from "@/components/onboarding/first-run-guide";
 import { useRunningPipes } from "@/lib/hooks/use-running-pipes";
 import { commands } from "@/lib/utils/tauri";
 import { shouldAcceptTitleSource } from "@/lib/utils/chat-title";
@@ -118,8 +119,15 @@ function HomeContent() {
   });
   const [connectionFocusRequest, setConnectionFocusRequest] = useState<ConnectionFocusRequest | null>(null);
 
-  const { settings } = useSettings();
+  const { settings, updateSettings, isSettingsLoaded } = useSettings();
   const { isTranslucent } = useSidebarContext();
+
+  // One-time in-app first-run guide. Gate on isSettingsLoaded so the full-bleed
+  // overlay never flashes before the store hydrates the (already-done) flag.
+  const showFirstRunGuide = isSettingsLoaded && !settings.firstRunGuideDone;
+  const markFirstRunGuideDone = useCallback(() => {
+    void updateSettings({ firstRunGuideDone: true });
+  }, [updateSettings]);
   const teamState = useTeam();
   const { isSectionHidden, isSettingLocked, needsLicenseKey, submitLicenseKey } = useEnterprisePolicy();
   const runningPipes = useRunningPipes();
@@ -1219,6 +1227,13 @@ function HomeContent() {
           </div>
       </div>
 
+      {showFirstRunGuide && (
+        <FirstRunGuide
+          onDone={markFirstRunGuideDone}
+          onGoToAutomations={() => setActiveSection("pipes")}
+          onEnsureChatVisible={() => setActiveSection("home")}
+        />
+      )}
     </div>
   );
 }

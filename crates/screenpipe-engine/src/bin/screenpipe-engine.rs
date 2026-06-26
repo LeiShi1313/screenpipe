@@ -493,6 +493,12 @@ async fn main() -> anyhow::Result<()> {
                         [
                             // User hasn't granted screen recording permission (CLI-49)
                             r"Screen recording permission denied",
+                            // User hasn't granted microphone access — Windows WASAPI
+                            // E_ACCESSDENIED building the input stream (CLI-F4: top live
+                            // engine issue, 45 users / 200+ events). The OS (or another
+                            // app holding the device exclusively) refuses capture;
+                            // retrying can't clear it, so it's not an actionable bug.
+                            r"backend-specific error has occurred: Access is denied",
                             // Local DB corruption — user dropped/restored part of their db.sqlite
                             r"no such table: main\.speaker_embeddings",
                             // Concurrent DB access / user ran CLI while app was running

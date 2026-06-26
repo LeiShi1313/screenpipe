@@ -12,9 +12,11 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 // `CpalError` here so call sites don't carry the version-specific name.
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 use cpal::StreamError as CpalError;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use tokio::sync::{broadcast, oneshot};
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 use tracing::{error, info, warn};
@@ -497,7 +499,22 @@ impl AudioStream {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to build input stream: {}", e);
+                    let err_str = e.to_string();
+                    if is_mic_access_denied(&err_str) {
+                        // Don't error!→Sentry on an unactionable, retry-proof OS
+                        // permission denial; log the actual remedy once per device.
+                        if first_access_denied_for_device(&device_name) {
+                            warn!(
+                                "microphone access denied for {device_name} ({err_str}) — \
+                                 grant microphone access to screenpipe in your OS privacy \
+                                 settings (Windows: Settings ▸ Privacy & security ▸ Microphone; \
+                                 macOS: System Settings ▸ Privacy & Security ▸ Microphone), then \
+                                 restart recording"
+                            );
+                        }
+                    } else {
+                        error!("Failed to build input stream: {}", e);
+                    }
                     None
                 }
             };
@@ -767,6 +784,26 @@ fn is_wasapi_unsupported_format(err: &anyhow::Error) -> bool {
 }
 
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+/// True when a build-stream failure is the OS refusing microphone access —
+/// Windows WASAPI `E_ACCESSDENIED` (0x80070005), or a denied mic-privacy
+/// setting. Retrying can never clear it (the user must grant access), so it
+/// must not be reported to Sentry as an error: it's a self-inflicted,
+/// unactionable-by-us flood (SCREENPIPE-CLI-F4, 45 users / 200+ events).
+fn is_mic_access_denied(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("access is denied") || e.contains("0x80070005")
+}
+
+/// Returns true the first time a device name is seen this process, so the
+/// access-denied remedy is logged once instead of on every retry.
+fn first_access_denied_for_device(device: &str) -> bool {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut s| s.insert(device.to_string()))
+        .unwrap_or(true)
+}
+
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -957,6 +994,30 @@ impl Drop for AudioStream {
 mod from_wav_tests {
     use super::*;
     use std::time::Duration;
+
+    // SCREENPIPE-CLI-F4: the Windows WASAPI permission denial must be classified
+    // so it stops flooding Sentry; genuine build failures must still error.
+    #[test]
+    fn detects_mic_access_denied() {
+        assert!(is_mic_access_denied(
+            "A backend-specific error has occurred: Access is denied. (0x80070005)"
+        ));
+        assert!(is_mic_access_denied("access is denied"));
+        assert!(is_mic_access_denied("Error 0x80070005"));
+        // genuine, non-permission build failures stay errors
+        assert!(!is_mic_access_denied("device not found"));
+        assert!(!is_mic_access_denied("invalid sample format"));
+    }
+
+    #[test]
+    fn access_denied_remedy_logged_once_per_device() {
+        let dev = "unit-test-mic-f4";
+        assert!(first_access_denied_for_device(dev), "first sighting logs");
+        assert!(
+            !first_access_denied_for_device(dev),
+            "repeat sighting is suppressed"
+        );
+    }
 
     #[test]
     fn device_disconnect_stop_mode_defers_teardown() {

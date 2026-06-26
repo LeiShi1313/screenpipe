@@ -790,6 +790,13 @@ pub(crate) struct ArtifactListResponse {
 }
 
 fn artifact_matches_query(item: &ArtifactItem, q: &str) -> bool {
+    // Case-insensitive on BOTH sides: lowercase the query too, not just the
+    // fields. Without this, a query with any uppercase (e.g. "Weekly Summary")
+    // never matches because the haystack is lowercased but the needle isn't —
+    // case-sensitive artifact search. The HTTP caller already lowercases, so
+    // this is defensive (and is what the unit tests rely on).
+    let q = q.to_lowercase();
+    let q = q.as_str();
     item.title.to_lowercase().contains(q)
         || item.source.to_lowercase().contains(q)
         || item.path.to_lowercase().contains(q)

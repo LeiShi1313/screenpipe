@@ -71,6 +71,14 @@ try this before reinstalling:
 
 if the app still says free after purchase, include the purchase email and the currently signed-in email when contacting support.
 
+### Google connection shows "This app is blocked"
+
+connecting Gmail, Google Calendar, or Google Docs fails with **"This app is blocked — this app tried to access sensitive info in your Google account"** and gives you no way to continue.
+
+this is a **known server-side issue, not fixable on your end**: screenpipe's Google OAuth app is pending Google's verification review. restarting, reinstalling, or disabling a VPN/firewall will not help — the block comes from Google.
+
+in the meantime, connect a non-Google calendar — **Apple Calendar**, **Microsoft 365 / Outlook**, or an **ICS link** — which are unaffected. the Google connection starts working once verification is approved. see [connections → Google OAuth](/connections#google-oauth-this-app-is-blocked).
+
 ### screenpipe is running but not capturing
 
 check the health endpoint:

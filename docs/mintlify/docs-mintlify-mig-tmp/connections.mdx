@@ -45,7 +45,7 @@ this takes you straight to where you need to be — no more hunting through docs
 | **Slack** | access messages, channels, and threads |
 | **Discord** | access server messages and channels |
 | **Email** | connect your email for context |
-| **Gmail** | OAuth connection to your Google email |
+| **Gmail** | OAuth connection to your Google email (Google connections are temporarily blocked pending Google verification — see [troubleshooting](#google-oauth-this-app-is-blocked)) |
 | **Telegram** | access Telegram messages |
 | **WhatsApp** | access WhatsApp conversations |
 | **Microsoft Teams** | access Teams messages and channels |
@@ -183,19 +183,18 @@ this makes pipes significantly more accurate and useful.
 
 ## troubleshooting
 
-### Google OAuth: "app isn't verified" or "unsafe"
+### Google OAuth: "This app is blocked"
 
-when connecting Gmail, Google Calendar, or Google Docs, you may see a warning that says the app is "unverified" or "unsafe." this is normal — screenpipe is a local app and Google requires additional verification steps for third-party apps.
+when connecting a Google service (Gmail, Google Calendar, or Google Docs) you may see **"This app is blocked — this app tried to access sensitive info in your Google account."** with no way to continue.
 
-**how to proceed:**
-1. on the Google warning screen, click **Advanced** (bottom-left corner)
-2. click **Go to Screenpipe (unsafe)** to continue with the connection
-3. screenpipe will not be marked unsafe once you verify the connection — this is a standard OAuth security flow
+this is a **known issue on our side, not something you can fix**: screenpipe's Google OAuth app is pending Google's verification review for sensitive scopes, so Google currently blocks the connection. restarting, reinstalling, or disabling your VPN/firewall will not change this — the block comes from Google.
 
-if the page closes or doesn't load, check that:
-- you have internet connectivity
-- no browser extensions are blocking the OAuth redirect
-- your firewall isn't blocking `localhost:3030` (the local callback endpoint)
+**what to do in the meantime:**
+- use a non-Google calendar instead — **Apple Calendar** (macOS), **Microsoft 365 / Outlook**, or an **ICS subscription link** — these are unaffected.
+- if you specifically need Google data captured, note that screenpipe already captures whatever is on your screen (including Gmail/Calendar open in a browser) through normal screen capture.
+- the Google connection will work as soon as verification is approved. if you'd like to be notified, reach out in [Discord](https://discord.gg/screenpipe) or via in-app support with the email you sign in with.
+
+<Note>an older "app isn't verified / unsafe → click **Advanced**" warning no longer applies — Google now hard-blocks the flow until verification completes, so there is no "proceed anyway" option to click.</Note>
 
 ### connection fails silently
 

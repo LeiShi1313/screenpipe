@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Custom vocabulary entry for transcription biasing and word replacement.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct VocabEntry {
     /// The word or phrase to bias toward during transcription.
@@ -15,6 +15,43 @@ pub struct VocabEntry {
     /// Optional replacement — if set, the transcribed `word` is replaced with this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_with: Option<String>,
+}
+
+// Backwards compatibility: legacy `store.bin` files stored `vocabularyWords` as a
+// list of plain strings (see `RecordingSettings::vocabulary`). Accept both a bare
+// string (mapped to `VocabEntry { word, replace_with: None }`) and the struct form
+// so existing settings deserialize without migration.
+impl<'de> Deserialize<'de> for VocabEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Helper mirrors the struct form so its field names/defaults stay in sync.
+        #[derive(Deserialize)]
+        struct VocabEntryStruct {
+            word: String,
+            #[serde(default)]
+            replace_with: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrStruct {
+            String(String),
+            Struct(VocabEntryStruct),
+        }
+
+        Ok(match StringOrStruct::deserialize(deserializer)? {
+            StringOrStruct::String(word) => VocabEntry {
+                word,
+                replace_with: None,
+            },
+            StringOrStruct::Struct(s) => VocabEntry {
+                word: s.word,
+                replace_with: s.replace_with,
+            },
+        })
+    }
 }
 
 /// A single schedule rule: a day-of-week + time range + what to record.

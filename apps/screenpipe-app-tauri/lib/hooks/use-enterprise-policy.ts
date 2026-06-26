@@ -204,15 +204,19 @@ async function applyPiiPolicy(lockedSettings: Record<string, unknown>): Promise<
 }
 
 /**
- * Apply enterprise-forced input-capture settings (keyboard / click rows) to
- * the local settings store so the recording engine honors them. The admin
- * sets these in the workspace policy's Managed settings
- * (lockedSettings.disableKeyboardCapture / disableClickCapture — "true" |
- * "false" strings like every managed value). Unlike the PII policy, the
- * engine only reads these at spawn, so when a forced value actually changes
- * the device's effective setting we restart the engine once. The matching
- * privacy-section toggles are disabled separately so the employee can't
- * override a forced value.
+ * Apply enterprise-forced capture settings (keyboard / click / audio) to the
+ * local settings store so the recording engine honors them. The admin sets
+ * these in the workspace policy's Managed settings (lockedSettings.
+ * disableKeyboardCapture / disableClickCapture / disableAudio — "true" | "false"
+ * strings like every managed value). Unlike the PII policy, the engine only
+ * reads these at spawn, so when a forced value actually changes the device's
+ * effective setting we restart the engine once. The matching privacy-section
+ * toggles are disabled separately so the employee can't override a forced value.
+ *
+ * `disableAudio` ("Audio recording: Always off") was previously NOT applied here
+ * at all, so the managed toggle was silently a no-op — devices kept recording
+ * and uploading audio despite the policy. It's handled exactly like the other
+ * capture toggles now.
  */
 let inputCaptureRestartInFlight = false;
 
@@ -229,15 +233,21 @@ async function applyInputCapturePolicy(lockedSettings: Record<string, unknown>):
     updates.disableClickCapture = clicks === "true";
   }
 
+  const audio = lockedSettings.disableAudio;
+  if (audio === "true" || audio === "false") {
+    updates.disableAudio = audio === "true";
+  }
+
   if (Object.keys(updates).length === 0) return;
 
   const store = await getStore();
   const settings = (await store.get<Record<string, unknown>>("settings")) || {};
   // Defaults when the key was never persisted mirror the app defaults:
-  // keyboard rows off, click rows on.
+  // keyboard rows off, click rows on, audio on (disableAudio off).
   const current: Record<string, boolean> = {
     disableKeyboardCapture: (settings.disableKeyboardCapture as boolean | undefined) ?? true,
     disableClickCapture: (settings.disableClickCapture as boolean | undefined) ?? false,
+    disableAudio: (settings.disableAudio as boolean | undefined) ?? false,
   };
   const changed = Object.entries(updates).some(([key, value]) => current[key] !== value);
   if (!changed) return;

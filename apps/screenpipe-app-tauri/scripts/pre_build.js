@@ -316,7 +316,7 @@ async function downloadStaticLinuxFfmpeg() {
 		}
 	}
 
-	await $`wget --no-config ${config.linux.ffmpegUrl} -O ${archive}`
+	await downloadFile(config.linux.ffmpegUrl, archive, { retries: 8, timeoutMs: 120000 })
 	await $`tar xf ${archive}`
 
 	const entries = await fs.readdir(cwd, { withFileTypes: true });

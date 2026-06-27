@@ -795,6 +795,19 @@ async fn execute_batch(
             }
         };
 
+        // Proactively clear any transaction a prior batch left open on this
+        // pooled connection (sqlx's SQLite pool does not reset connections on
+        // release). Without this, the BEGIN IMMEDIATE below fails with
+        // "cannot start a transaction within a transaction" (SQLITE code 1) and
+        // the batch errors out *before* the reactive rollback handler can recover
+        // it — the first-failure event still reaching Sentry as
+        // SCREENPIPE-CLI-RC / CLI-SR. A ROLLBACK on a clean connection is a
+        // harmless no-op ("cannot rollback - no transaction is active"), so the
+        // result is ignored; it never discards committed data, only an orphaned
+        // uncommitted transaction that was already doomed. The reactive handler
+        // below stays as a belt-and-suspenders net.
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+
         match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
             Ok(_) => {
                 conn_opt = Some(conn);
@@ -2554,6 +2567,41 @@ mod tests {
         assert!(
             !(should_recycle_sqlite_connection(&benign) || is_nested_transaction_error(&benign))
         );
+    }
+
+    /// Proves the proactive `ROLLBACK` before `BEGIN IMMEDIATE` in the drain
+    /// loop: a connection left mid-transaction (the poison behind CLI-RC/CLI-SR)
+    /// makes the next BEGIN fail with the nested-transaction error; a ROLLBACK
+    /// clears it so BEGIN then succeeds, and a ROLLBACK on a clean connection is
+    /// a harmless ignorable error (never a panic, never data loss).
+    #[tokio::test]
+    async fn rollback_before_begin_clears_a_stale_transaction() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+
+        // Poison: leave a transaction open (as a returned-mid-batch connection would).
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        // Without clearing, the next BEGIN IMMEDIATE fails as a nested transaction.
+        let nested = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await;
+        assert!(is_nested_transaction_error(&nested.unwrap_err()));
+
+        // The proactive rollback clears the orphaned transaction...
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        // ...so BEGIN IMMEDIATE now succeeds.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        // Clean-up, then confirm a ROLLBACK with no active txn is a harmless error.
+        sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
+        assert!(sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err());
     }
 
     /// `Database` errors flow through `is_fatal_sqlite_message`: a

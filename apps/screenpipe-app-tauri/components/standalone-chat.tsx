@@ -127,7 +127,7 @@ export function StandaloneChat({
   const { items: tagItems, isLoading: tagsLoading, refresh: refreshTagItems } = useTagAutocomplete();
   const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
   const { templatePipes } = usePipes();
-  // Connected integrations (gmail, google-sheets, slack, etc.) surfaced in the
+  // Connected integrations (google-calendar, google-docs, slack, etc.) surfaced in the
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
   const [showConnectBanner, setShowConnectBanner] = useState(() => {

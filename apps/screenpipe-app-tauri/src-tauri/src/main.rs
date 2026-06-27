@@ -1889,7 +1889,7 @@ async fn main() {
 
             // Start Google Calendar publisher (polls /connections/google-calendar/events
             // every 60s and pushes into the calendar_events bus). Required for the
-            // 2-3 min prewarm toast to work for users on gmail/gcal.
+            // 2-3 min prewarm toast to work for users on Google Calendar.
             let gcal_app_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 google_calendar::start_google_calendar_publisher(gcal_app_handle).await;

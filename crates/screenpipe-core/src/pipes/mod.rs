@@ -7844,7 +7844,7 @@ mod tests {
 
     #[test]
     fn test_no_duplicate_keys_all_fields() {
-        let content = "---\nschedule: every 2h\nenabled: true\nmodel: claude-haiku-4-5\nprovider: openai\npreset: my-preset\nconnections:\n  - slack\n  - gmail\ntimeout: 600\ntrigger:\n  events:\n    - test_event\nsource_slug: my-pipe\ninstalled_version: 5\nsource_hash: abc123\n---\n\nFull config";
+        let content = "---\nschedule: every 2h\nenabled: true\nmodel: claude-haiku-4-5\nprovider: openai\npreset: my-preset\nconnections:\n  - slack\n  - google-calendar\ntimeout: 600\ntrigger:\n  events:\n    - test_event\nsource_slug: my-pipe\ninstalled_version: 5\nsource_hash: abc123\n---\n\nFull config";
         let (config, body) = parse_frontmatter(content).unwrap();
 
         let serialized = serialize_pipe(&config, &body).unwrap();

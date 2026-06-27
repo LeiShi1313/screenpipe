@@ -801,12 +801,21 @@ async fn execute_batch(
         // "cannot start a transaction within a transaction" (SQLITE code 1) and
         // the batch errors out *before* the reactive rollback handler can recover
         // it — the first-failure event still reaching Sentry as
-        // SCREENPIPE-CLI-RC / CLI-SR. A ROLLBACK on a clean connection is a
-        // harmless no-op ("cannot rollback - no transaction is active"), so the
-        // result is ignored; it never discards committed data, only an orphaned
-        // uncommitted transaction that was already doomed. The reactive handler
-        // below stays as a belt-and-suspenders net.
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        // SCREENPIPE-CLI-RC / CLI-SR. It never discards committed data, only an
+        // orphaned uncommitted transaction that was already doomed. The reactive
+        // handler below stays as a belt-and-suspenders net.
+        //
+        // `Ok` means the ROLLBACK actually cleared an orphaned transaction — i.e.
+        // a poisoned connection was detected and recovered. Surface that at warn!
+        // (a breadcrumb, NOT a Sentry issue under the default tracing
+        // EventFilter), so the poisoning stays observable instead of silently
+        // masked — without re-flooding Sentry. The common `Err` is the harmless
+        // "no transaction is active" no-op on a clean connection; ignore it.
+        if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok() {
+            warn!(
+                "write_queue: cleared an orphaned transaction on a pooled connection before BEGIN (recovered a poisoned connection that would have failed 'cannot start a transaction within a transaction')"
+            );
+        }
 
         match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
             Ok(_) => {

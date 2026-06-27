@@ -204,21 +204,37 @@ pub async fn process_transcription_result(
                     // chunk+transcription insert was dropped under write-pool
                     // saturation, so there is no audio_chunks row — invisible to
                     // the timeline AND to the reconciliation candidate query
-                    // (which only sees existing rows). Persist an orphaned-chunk
-                    // marker so the sweep re-inserts the row (and re-transcribes)
-                    // once the pool recovers — mirrors the audio_manager path.
-                    // SCREENPIPE-CLI-RC. device is a structured field so Sentry
-                    // dedups across devices into a single issue. Kept at error!
-                    // (not warn!) on purpose: the data is recovered, but a dropped
-                    // live insert means the write pool saturated badly, which we
-                    // still want visible in Sentry — recovery shouldn't silence the
-                    // degradation signal (and would mask a true loss if the sweep
-                    // is disabled or the marker cap is hit).
+                    // (which only sees existing rows). Persist a marker carrying
+                    // the original transcript so the sweep replays the exact
+                    // chunk+transcription insert once the pool recovers — the
+                    // recovered chunk comes back already transcribed and never
+                    // re-enters the re-transcribe candidate set (no redundant
+                    // Whisper pass). SCREENPIPE-CLI-RC. device is a structured
+                    // field so Sentry dedups across devices into a single issue.
+                    // Kept at error! (not warn!) on purpose: the data is
+                    // recovered, but a dropped live insert means the write pool
+                    // saturated badly, which we still want visible in Sentry —
+                    // recovery shouldn't silence the degradation signal (and would
+                    // mask a true loss if the sweep is disabled or the cap is hit).
                     if let Some(dir) = data_dir {
-                        crate::audio_manager::reconciliation::persist_orphaned_chunk(
+                        let payload =
+                            crate::audio_manager::reconciliation::PendingChunkTranscription {
+                                text: transcription.clone(),
+                                engine: transcription_engine.clone(),
+                                device_name: result.input.device.name.clone(),
+                                is_input: matches!(
+                                    result.input.device.device_type,
+                                    crate::core::device::DeviceType::Input
+                                ),
+                                speaker_id,
+                                start_time: Some(result.start_time),
+                                end_time: Some(result.end_time),
+                            };
+                        crate::audio_manager::reconciliation::persist_transcribed_chunk(
                             dir,
                             result.path.clone(),
                             capture_ts,
+                            payload,
                         )
                         .await;
                         error!(

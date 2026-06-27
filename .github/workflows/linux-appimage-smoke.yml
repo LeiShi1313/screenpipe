@@ -235,11 +235,26 @@ jobs:
               squashfs-root/usr/bin/ffprobe -version
               squashfs-root/usr/bin/tesseract --version
 
-              ldd squashfs-root/usr/bin/ffmpeg | tee /tmp/ffmpeg.ldd
-              ldd squashfs-root/usr/bin/ffprobe | tee /tmp/ffprobe.ldd
-              ldd squashfs-root/usr/bin/tesseract | tee /tmp/tesseract.ldd
+              check_ldd() {
+                local target="$1"
+                local output="$2"
+
+                set +e
+                ldd "${target}" > "${output}" 2>&1
+                local status="$?"
+                set -e
+
+                cat "${output}"
+                if [ "${status}" -ne 0 ] && ! grep -qi "not a dynamic executable" "${output}"; then
+                  return "${status}"
+                fi
+              }
+
+              check_ldd squashfs-root/usr/bin/ffmpeg /tmp/ffmpeg.ldd
+              check_ldd squashfs-root/usr/bin/ffprobe /tmp/ffprobe.ldd
+              check_ldd squashfs-root/usr/bin/tesseract /tmp/tesseract.ldd
               if [ -e squashfs-root/usr/lib/libopenblas.so.0 ]; then
-                ldd squashfs-root/usr/lib/libopenblas.so.0 | tee /tmp/openblas.ldd
+                check_ldd squashfs-root/usr/lib/libopenblas.so.0 /tmp/openblas.ldd
               fi
               if grep -R "not found" /tmp/ffmpeg.ldd /tmp/ffprobe.ldd /tmp/tesseract.ldd /tmp/openblas.ldd 2>/dev/null; then
                 exit 1
@@ -248,7 +263,7 @@ jobs:
               find squashfs-root/usr/bin -maxdepth 1 -type f -executable -print
               app_bin="$(find squashfs-root/usr/bin -maxdepth 1 -type f -executable -iname "*screenpipe*" -print -quit)"
               test -n "${app_bin}"
-              ldd "${app_bin}" | tee /tmp/app.ldd
+              check_ldd "${app_bin}" /tmp/app.ldd
               if grep -q "not found" /tmp/app.ldd; then
                 exit 1
               fi

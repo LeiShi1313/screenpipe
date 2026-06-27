@@ -334,6 +334,30 @@ async function copySystemLinuxFfmpeg() {
 	await fs.mkdir(config.ffmpegRealname, { recursive: true });
 	await copySystemBinary('ffmpeg', path.join(config.ffmpegRealname, 'ffmpeg'));
 	await copySystemBinary('ffprobe', path.join(config.ffmpegRealname, 'ffprobe'));
+
+	const qtFaststartDest = path.join(config.ffmpegRealname, 'qt-faststart');
+	const qtFaststart = await findOnPath('qt-faststart');
+	if (qtFaststart) {
+		await copyFile(qtFaststart, qtFaststartDest);
+		console.log(`using system qt-faststart: ${qtFaststart} -> ${qtFaststartDest}`);
+		return;
+	}
+
+	await fs.writeFile(
+		qtFaststartDest,
+		`#!/usr/bin/env sh
+set -eu
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: qt-faststart input output" >&2
+  exit 2
+fi
+
+exec "$(dirname "$0")/ffmpeg" -y -i "$1" -c copy -movflags faststart "$2"
+`
+	);
+	await fs.chmod(qtFaststartDest, 0o755);
+	console.log(`created ffmpeg-backed qt-faststart wrapper at ${qtFaststartDest}`);
 }
 
 async function copySystemBinary(binaryName, destination) {

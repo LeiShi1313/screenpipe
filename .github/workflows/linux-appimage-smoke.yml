@@ -273,8 +273,11 @@ jobs:
                 exit 1
               fi
 
+              app_ld_library_path="${LD_LIBRARY_PATH}"
+              unset LD_LIBRARY_PATH
+
               set +e
-              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} && timeout 20 dbus-run-session -- xvfb-run -a squashfs-root/AppRun --help"
+              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && timeout 20 dbus-run-session -- xvfb-run -a env LD_LIBRARY_PATH='${app_ld_library_path}' squashfs-root/AppRun --help"
               status="$?"
               set -e
               if [ "${status}" != "0" ] && [ "${status}" != "124" ]; then

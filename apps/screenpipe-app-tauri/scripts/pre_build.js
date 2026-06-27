@@ -329,6 +329,13 @@ async function downloadStaticLinuxFfmpeg() {
 	await fs.rm(archive, { force: true })
 }
 
+async function copySystemLinuxFfmpeg() {
+	await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
+	await fs.mkdir(config.ffmpegRealname, { recursive: true });
+	await copySystemBinary('ffmpeg', path.join(config.ffmpegRealname, 'ffmpeg'));
+	await copySystemBinary('ffprobe', path.join(config.ffmpegRealname, 'ffprobe'));
+}
+
 async function copySystemBinary(binaryName, destination) {
 	const source = await findOnPath(binaryName);
 	if (!source) {
@@ -549,7 +556,12 @@ if (platform == 'linux') {
 		if (await fs.exists(config.ffmpegRealname)) {
 			await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
 		}
-		await downloadStaticLinuxFfmpeg();
+		try {
+			await downloadStaticLinuxFfmpeg();
+		} catch (error) {
+			console.warn(`static Linux ffmpeg download failed (${error.message}); falling back to system ffmpeg`);
+			await copySystemLinuxFfmpeg();
+		}
 	} else {
 		console.log('FFMPEG already exists');
 	}

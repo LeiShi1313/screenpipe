@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use crate::oauth_result_page::render_oauth_result_page;
 use crate::routes::browser::BrowserBridge;
 use screenpipe_connect::connections::browser::{BrowserRegistry, BrowserSummary, EvalError};
 
@@ -1343,22 +1344,23 @@ pub struct OAuthCallbackQuery {
 /// via the `PENDING_OAUTH` channel map, then delivers the `code` through the channel.
 async fn oauth_callback(Query(params): Query<OAuthCallbackQuery>) -> (StatusCode, Html<String>) {
     if let Some(err) = params.error {
-        let html = format!(
-            "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-            <h2>Connection failed</h2><p>{}</p></body></html>",
-            err
+        return oauth_callback_page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "screenpipe could not finish the OAuth flow.",
+            &err,
         );
-        return (StatusCode::BAD_REQUEST, Html(html));
     }
 
     let (code, state) = match (params.code, params.state) {
         (Some(c), Some(s)) => (c, s),
         _ => {
-            let html =
-                "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-                <h2>Invalid callback</h2><p>Missing code or state parameter.</p></body></html>"
-                    .to_string();
-            return (StatusCode::BAD_REQUEST, Html(html));
+            return oauth_callback_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid callback",
+                "screenpipe could not verify this authorization response.",
+                "Missing code or state parameter.",
+            );
         }
     };
 
@@ -1376,24 +1378,38 @@ async fn oauth_callback(Query(params): Query<OAuthCallbackQuery>) -> (StatusCode
                 None => code,
             };
             let _ = pending.sender.send(payload);
-            let html =
-                "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-                <h2>Connected!</h2>\
-                <p>You can close this tab and return to screenpipe.</p>\
-                <script>window.close()</script>\
-                </body></html>"
-                    .to_string();
-            (StatusCode::OK, Html(html))
+            oauth_callback_page(
+                StatusCode::OK,
+                "Connected",
+                "screenpipe can now use this connection.",
+                "You can close this tab and return to screenpipe.",
+            )
         }
-        None => {
-            let html = "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-                <h2>Session expired</h2>\
-                <p>The authorization session was not found or already completed. Please try again.</p>\
-                </body></html>"
-                .to_string();
-            (StatusCode::BAD_REQUEST, Html(html))
-        }
+        None => oauth_callback_page(
+            StatusCode::BAD_REQUEST,
+            "Session expired",
+            "screenpipe could not find the waiting app session.",
+            "The authorization session was not found or already completed. Please try again.",
+        ),
     }
+}
+
+fn oauth_callback_page(
+    status: StatusCode,
+    title: &str,
+    detail: &str,
+    message: &str,
+) -> (StatusCode, Html<String>) {
+    (
+        status,
+        Html(render_oauth_result_page(
+            "screenpipe OAuth",
+            title,
+            detail,
+            message,
+            status.is_success(),
+        )),
+    )
 }
 
 // ---------------------------------------------------------------------------

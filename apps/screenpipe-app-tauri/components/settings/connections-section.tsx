@@ -3290,6 +3290,16 @@ const MCP_OAUTH_PROVIDERS: {
   { id: "jira", name: "Jira", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and manage your Jira issues (and Confluence pages). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
   { id: "notion", name: "Notion", url: "https://mcp.notion.com/mcp", description: <>Connect Notion so your AI can search, read, and write your pages and databases. Sign-in uses Notion&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
 ];
+
+export function isMcpOAuthProviderTileConnected(
+  id: string,
+  apiConnected: boolean,
+  mcpProviderConnected: Record<string, boolean>,
+): boolean {
+  if (!MCP_OAUTH_PROVIDERS.some(p => p.id === id)) return apiConnected;
+  return apiConnected || !!mcpProviderConnected[id];
+}
+
 // Excalidraw+ exposes the workspace (scenes, collections, search) over a
 // remote MCP gated by a static API key, not OAuth (no discovery metadata on
 // the host), so it uses the ApiKeyMcpPanel below instead of OAuthMcpPanel.
@@ -3965,16 +3975,18 @@ export function ConnectionsSection({
         // MCP-OAuth providers connect via their remote MCP server. The dot
         // lights for the MCP connection OR an existing API-key/connector-OAuth
         // connection, so users who connected the old way don't appear to lose it.
-        connected: MCP_OAUTH_PROVIDERS.some(p => p.id === i.id)
-          ? (!!mcpProviderConnected[i.id] || i.connected)
-          : i.connected,
+        connected: isMcpOAuthProviderTileConnected(i.id, i.connected, mcpProviderConnected),
         category: normalizeConnectionCategory(i.category),
         description: i.description || undefined,
       }));
     // Update connected status from API for hardcoded tiles that also exist in API
     for (const h of hardcoded) {
       const api = integrations.find(i => i.id === h.id);
-      if (api) h.connected = api.connected;
+      h.connected = isMcpOAuthProviderTileConnected(
+        h.id,
+        api ? api.connected : h.connected,
+        mcpProviderConnected,
+      );
     }
     // Google OAuth dots are driven by direct oauthStatus (not the cached API), so they stay
     // in sync immediately after connect/disconnect without waiting for cache expiry.

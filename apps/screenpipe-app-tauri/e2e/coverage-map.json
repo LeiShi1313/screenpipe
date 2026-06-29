@@ -224,13 +224,13 @@
     },
     {
       "spec": "chat-prefill-duplicate.spec.ts",
-      "platforms": ["windows", "macos", "linux"],
+      "platforms": ["macos"],
       "layers": ["chat-ai"],
       "features": ["chat", "chat-prefill"],
       "criticality": "medium",
       "confidence": "partial",
       "ux": "synthetic",
-      "notes": "Cross-window prefill duplicate regression."
+      "notes": "Cross-window prefill duplicate regression. macOS-only: the autoSend persist precondition doesn't complete in headless Linux/Windows CI (times out with 0 conversations, not the duplicate it guards)."
     },
     {
       "spec": "chat-prefill-context-leak.spec.ts",

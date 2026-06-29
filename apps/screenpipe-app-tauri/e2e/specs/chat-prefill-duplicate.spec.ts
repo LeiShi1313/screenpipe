@@ -115,7 +115,16 @@ async function emitUntargetedAutoSendPrefill(prompt: string): Promise<void> {
 describe("Chat prefill cross-window duplication", function () {
   this.timeout(180_000);
 
-  before(async () => {
+  before(async function () {
+    // macOS-only: the autoSend→pi→auto-save persist precondition (a conversation
+    // must reach disk before we can count it) does not complete reliably in
+    // headless Linux/Windows CI, so this consistently times out with "no
+    // conversation persisted" — 0 conversations, NOT the duplicate (2) it guards
+    // against. macOS runs the full path. Mirrors the other macOS-only chat specs
+    // (chat-streaming-performance, chat-within-session-context-loss).
+    if (process.platform !== "darwin") {
+      this.skip();
+    }
     await waitForAppReady();
     await openHomeWindow();
     // Open the chat overlay so BOTH windows have a live prefill listener —

@@ -50,6 +50,7 @@ mod enterprise_install_metadata;
 mod enterprise_policy;
 mod enterprise_sync;
 mod events;
+mod feedback_redact;
 mod google_calendar;
 mod hardware;
 mod ics_calendar;

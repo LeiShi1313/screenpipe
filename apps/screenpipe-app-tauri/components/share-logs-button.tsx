@@ -272,7 +272,7 @@ export const ShareLogsButton = ({
             if (chatData.length + entry.length > MAX_CHAT_SIZE) break;
             chatData += entry;
           }
-          chatSection = "\n\n=== Pi Chat History (PII redacted) ===\n" + redactPii(chatData);
+          chatSection = "\n\n=== Pi Chat History ===\n" + chatData;
         } catch (e) {
           console.error("failed to load chat history:", e);
         }
@@ -300,9 +300,27 @@ export const ShareLogsButton = ({
         settingsSection +
         chatSection;
 
+      // Redact PII with the real model (regex pre-pass + the same checkpoint
+      // the Tinfoil enclave runs, local ONNX preferred, enclave fallback)
+      // before anything leaves the device. If the model can't be loaded we
+      // fall back to the local regex pass — feedback must never be blocked.
+      let redactedLogs = combinedLogs;
+      try {
+        const res = await commands.redactPiiForFeedback(combinedLogs);
+        if (res.status === "ok") {
+          redactedLogs = res.data;
+        } else {
+          console.warn("model PII redaction unavailable, using local regex:", res.error);
+          redactedLogs = redactPii(combinedLogs);
+        }
+      } catch (e) {
+        console.warn("model PII redaction failed, using local regex:", e);
+        redactedLogs = redactPii(combinedLogs);
+      }
+
       await fetch(signedUrl, {
         method: "PUT",
-        body: combinedLogs,
+        body: redactedLogs,
         headers: { "Content-Type": "text/plain" },
       });
 

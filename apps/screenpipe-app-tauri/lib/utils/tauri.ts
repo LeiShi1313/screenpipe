@@ -843,6 +843,18 @@ async listCacheFiles() : Promise<Result<CacheFile[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * List `*.json` conversation files in `dir`, newest-first by mtime, in a SINGLE
+ * native directory scan.
+ *
+ * The chat list/search previously sorted by firing one `stat()` IPC call per
+ * file via `Promise.all` — with 15k+ conversations that's 15k Tauri round-trips
+ * on every cold open, which (alongside the webview cold-boot) froze the search
+ * modal for seconds before the input was usable. Doing the readdir + metadata
+ * pass in Rust collapses it to one call (~40ms for 15k files).
+ *
+ * A missing dir (first run) returns an empty list, not an error.
+ */
 async listChatEntriesByMtime(dir: string) : Promise<Result<ChatDirEntry[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_chat_entries_by_mtime", { dir }) };
@@ -1030,13 +1042,14 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 },
 /**
  * Open the screenpipe.com login page.
- * Windows: system browser + registered deep-link scheme handles the redirect.
  * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
- * Linux: in-app WebView that intercepts the screenpipe:// redirect.
- * Pass `freshSession` when switching accounts so the auth sheet/webview does
- * not reuse the previous browser session.
+ * Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
+ *
+ * `fresh_session` is used by "use different account": macOS asks
+ * ASWebAuthenticationSession for an ephemeral browser session instead of
+ * reusing Safari cookies, and Windows/Linux use a throwaway webview profile.
  */
-async openLoginWindow(freshSession?: boolean) : Promise<Result<null, string>> {
+async openLoginWindow(freshSession: boolean | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_login_window", { freshSession }) };
 } catch (e) {
@@ -1452,6 +1465,19 @@ async readAudioExclusions() : Promise<Result<ExcludedApp[], string>> {
 async readViewerFile(path: string) : Promise<Result<ViewerContent, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("read_viewer_file", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Redact a feedback/log bundle through the real PII model before it leaves
+ * the device. Returns `Err` if no redactor could be built so the caller can
+ * fall back to its own deterministic pass — submission must never be blocked.
+ */
+async redactPiiForFeedback(text: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("redact_pii_for_feedback", { text }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2316,6 +2342,10 @@ endDisplay: string; attendees: string[]; location: string | null; meetingUrl: st
  */
 source?: string }
 export type CalendarStatus = { available: boolean; authorized: boolean; authorizationStatus: string; calendarCount: number }
+/**
+ * One conversation file with its modified time (epoch millis). Returned by
+ * [`list_chat_entries_by_mtime`].
+ */
 export type ChatDirEntry = { name: string; mtime_ms: number }
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }

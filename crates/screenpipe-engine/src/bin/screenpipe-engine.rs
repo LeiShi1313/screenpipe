@@ -1846,6 +1846,30 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Opt-in (`--redact-agent-session-secrets`, default off): strip secrets the
+    // pi agent persists into its session logs at rest. A sessions-only instance of
+    // the redaction worker (no DB tables, just a session_dir) running a secrets-only
+    // regex scrub over idle `pi/sessions/*.jsonl`. Independent of the text-PII
+    // worker below; spawned for the engine's lifetime like the others here.
+    if config.redact_agent_session_secrets {
+        if let Ok(pi_dir) = screenpipe_core::agents::pi::pi_config_dir() {
+            use screenpipe_redact::worker::{Worker, WorkerConfig};
+            use std::sync::Arc;
+            // A sessions-only worker (empty tables) never uses this redactor; the
+            // session scrub runs its own secrets-only regex pipeline.
+            let placeholder = Arc::new(screenpipe_redact::Pipeline::regex_only())
+                as Arc<dyn screenpipe_redact::Redactor>;
+            let cfg = WorkerConfig {
+                tables: Vec::new(),
+                session_dir: Some(pi_dir.join("sessions")),
+                poll_interval: std::time::Duration::from_secs(5 * 60),
+                ..Default::default()
+            };
+            info!("starting pi session secret-scrub worker (--redact-agent-session-secrets)");
+            let _ = Worker::new(db.pool.clone(), placeholder, cfg).spawn();
+        }
+    }
+
     // Spawn the async PII reconciliation worker (issue #3185).
     // Off by default — only runs when `--async-pii-redaction` is set.
     // The capture path is unaffected either way.

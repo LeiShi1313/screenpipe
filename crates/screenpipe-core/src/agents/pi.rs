@@ -2247,10 +2247,19 @@ pub fn bun_version_string(bun: &str) -> String {
     }
 }
 
-fn scrub_bun_runtime_env(_cmd: &mut std::process::Command) {
-    #[cfg(target_os = "linux")]
-    {
-        _cmd.env_remove("LD_LIBRARY_PATH");
+/// Inside an AppImage, AppRun exports `LD_LIBRARY_PATH` pointing at the bundle's
+/// libs. bun is a self-contained baseline binary and must not inherit it, or it
+/// loads the bundled glibc/libstdc++ and crashes (SIGSEGV/SIGILL). Only scrub it
+/// in that environment so a normal Linux install keeps any user-set value.
+fn should_scrub_bun_runtime_env() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("APPDIR").is_some()
+}
+
+/// Strip the AppImage runtime library path from a bun command (see
+/// [`should_scrub_bun_runtime_env`]). Shared with the Tauri app crate.
+pub fn scrub_bun_runtime_env(cmd: &mut std::process::Command) {
+    if should_scrub_bun_runtime_env() {
+        cmd.env_remove("LD_LIBRARY_PATH");
     }
 }
 
@@ -2262,15 +2271,10 @@ fn std_bun_command(bun: &str) -> std::process::Command {
 
 fn tokio_bun_command(bun: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bun);
-    scrub_tokio_bun_runtime_env(&mut cmd);
-    cmd
-}
-
-fn scrub_tokio_bun_runtime_env(_cmd: &mut tokio::process::Command) {
-    #[cfg(target_os = "linux")]
-    {
-        _cmd.env_remove("LD_LIBRARY_PATH");
+    if should_scrub_bun_runtime_env() {
+        cmd.env_remove("LD_LIBRARY_PATH");
     }
+    cmd
 }
 
 /// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/` or SCREENPIPE_DATA_DIR/pi-agent).

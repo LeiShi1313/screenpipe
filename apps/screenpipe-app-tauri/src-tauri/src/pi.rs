@@ -873,16 +873,12 @@ fn apply_no_window(_cmd: &mut Command) {
     }
 }
 
-fn scrub_bun_runtime_env(_cmd: &mut Command) {
-    #[cfg(target_os = "linux")]
-    {
-        _cmd.env_remove("LD_LIBRARY_PATH");
-    }
-}
-
 fn bun_command(bun: &str) -> Command {
     let mut cmd = Command::new(bun);
-    scrub_bun_runtime_env(&mut cmd);
+    // Single source of truth in screenpipe-core: only strips LD_LIBRARY_PATH
+    // when running inside an AppImage (APPDIR set), so bun doesn't load the
+    // bundle's glibc/libstdc++ and crash.
+    screenpipe_core::agents::pi::scrub_bun_runtime_env(&mut cmd);
     cmd
 }
 

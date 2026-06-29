@@ -43,6 +43,7 @@ import { MultiSelect } from "@/components/ui/multi-select";
 import { WindowPicker } from "./window-picker";
 import { InputMonitoringPanel } from "./input-monitoring-card";
 import { ApplyRestartBar } from "./apply-restart-bar";
+import { PrivacyAtAGlance } from "./privacy-at-a-glance";
 import { useSettings, Settings } from "@/lib/hooks/use-settings";
 import { ScheduleSettings } from "./schedule-settings";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
@@ -1016,6 +1017,19 @@ export function PrivacySection() {
             </Button>
           )}
       </div>
+
+      {/* At a glance — plain-language summary of the live privacy posture, so
+          users can answer "what is screenpipe doing right now?" without parsing
+          the long stack of toggles below (the panel's #1 rage-click driver). */}
+      <PrivacyAtAGlance
+        usePiiRemoval={settings.usePiiRemoval}
+        piiBackend={settings.piiBackend}
+        ignoredWindows={settings.ignoredWindows}
+        includedWindows={settings.includedWindows}
+        ignoredUrls={settings.ignoredUrls}
+        apiAuth={settings.apiAuth}
+        analyticsEnabled={settings.analyticsEnabled}
+      />
 
       {/* Security */}
       <div className="space-y-2">

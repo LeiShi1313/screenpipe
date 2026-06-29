@@ -45,6 +45,7 @@ mod chatgpt_oauth;
 #[allow(deprecated)]
 mod commands;
 mod disk_usage;
+mod e2e_seed;
 mod embedded_server;
 mod enterprise_install_metadata;
 mod enterprise_policy;
@@ -1681,6 +1682,13 @@ async fn main() {
                                     db_wedge_breaker.clone(),
                                 ),
                             );
+
+                            // E2E: seed deterministic searchable frames so the
+                            // search-UI repro tests run against real data with
+                            // no recording required (SCREENPIPE_E2E_SEED=...,search-fixture).
+                            if get_e2e_seed_flags().iter().any(|f| f == "search-fixture") {
+                                crate::e2e_seed::seed_search_fixture(&server.db).await;
+                            }
 
                             // Phase 2: Start capture session
                             let capture = match capture_session::CaptureSession::start(&server, &config, true).await {

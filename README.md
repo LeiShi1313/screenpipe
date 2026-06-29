@@ -150,6 +150,7 @@ Thanks to all contributors:
 - [Español (Spanish)](translated_readmes/README-es.md)
 - [Português BR (Brazilian Portuguese)](translated_readmes/README-pt_BR.md)
 - [Deutsch (German)](translated_readmes/README-de.md)
+- [Українська (Ukrainian)](translated_readmes/README-uk.md)
 
 Want to translate screenpipe into another language? See [`translated_readmes/`](translated_readmes/README.md).
 

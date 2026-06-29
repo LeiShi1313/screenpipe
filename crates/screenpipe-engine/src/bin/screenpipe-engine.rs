@@ -499,6 +499,16 @@ async fn main() -> anyhow::Result<()> {
                             // app holding the device exclusively) refuses capture;
                             // retrying can't clear it, so it's not an actionable bug.
                             r"backend-specific error has occurred: Access is denied",
+                            // device_monitor's periodic capture-device check failing with an
+                            // OS backend error — overwhelmingly a denied macOS TCC permission
+                            // (screen/audio capture), which the OS reports in the user's
+                            // LOCALE, so the English "Screen recording permission denied"
+                            // pattern above misses it (CLI-WH: 1 user / 126 events, a
+                            // Japanese TCC-denied string). The check re-runs each cycle, so a
+                            // standing denial floods Sentry. Matching the English wrapper
+                            // prefix catches every locale; device-check backend errors
+                            // (permission, unplugged) are user-environment, not our bug.
+                            r"device check error: A backend-specific error has occurred",
                             // Local DB corruption — user dropped/restored part of their db.sqlite
                             r"no such table: main\.speaker_embeddings",
                             // Concurrent DB access / user ran CLI while app was running
@@ -1834,6 +1844,30 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // Opt-in (`--redact-agent-session-secrets`, default off): strip secrets the
+    // pi agent persists into its session logs at rest. A sessions-only instance of
+    // the redaction worker (no DB tables, just a session_dir) running a secrets-only
+    // regex scrub over idle `pi/sessions/*.jsonl`. Independent of the text-PII
+    // worker below; spawned for the engine's lifetime like the others here.
+    if config.redact_agent_session_secrets {
+        if let Ok(pi_dir) = screenpipe_core::agents::pi::pi_config_dir() {
+            use screenpipe_redact::worker::{Worker, WorkerConfig};
+            use std::sync::Arc;
+            // A sessions-only worker (empty tables) never uses this redactor; the
+            // session scrub runs its own secrets-only regex pipeline.
+            let placeholder = Arc::new(screenpipe_redact::Pipeline::regex_only())
+                as Arc<dyn screenpipe_redact::Redactor>;
+            let cfg = WorkerConfig {
+                tables: Vec::new(),
+                session_dir: Some(pi_dir.join("sessions")),
+                poll_interval: std::time::Duration::from_secs(5 * 60),
+                ..Default::default()
+            };
+            info!("starting pi session secret-scrub worker (--redact-agent-session-secrets)");
+            let _ = Worker::new(db.pool.clone(), placeholder, cfg).spawn();
+        }
     }
 
     // Spawn the async PII reconciliation worker (issue #3185).

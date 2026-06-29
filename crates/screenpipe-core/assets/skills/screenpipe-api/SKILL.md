@@ -153,7 +153,9 @@ curl -X POST http://localhost:3030/raw_sql -H "Content-Type: application/json" \
   -d '{"query": "SELECT ... LIMIT 100"}'
 ```
 
-**Rules:** every SELECT needs LIMIT · always filter by time (`datetime('now','-24 hours')`) · read-only. **Never use frame counts for time estimates** — frames are event-driven; use `/activity-summary` for screen time.
+**Rules:** every SELECT needs LIMIT · always filter by time · read-only. **Never use frame counts for time estimates** — frames are event-driven; use `/activity-summary` for screen time.
+
+**Timestamp caveat:** DB timestamps are stored as RFC3339 strings — usually `2026-06-26T18:01:14.214586+00:00` (frames / audio_transcriptions / ui_events), though some tables (e.g. `meetings.meeting_start`, memories) use a `Z` suffix with milliseconds: `2026-06-26T18:01:14.214Z`. Do not compare either form directly to SQLite `datetime()` strings like `timestamp > datetime('now','-10 seconds')`: the `T` vs space makes it a lexical string comparison and can include stale same-day rows. Use `datetime(timestamp) > datetime('now','-10 seconds')` (works for both forms), or for indexed string comparisons use an RFC3339-shaped cutoff: `timestamp > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-10 seconds')`.
 
 | Table | Key Columns | Time Column |
 |-------|-------------|-------------|
@@ -171,12 +173,12 @@ curl -X POST http://localhost:3030/raw_sql -H "Content-Type: application/json" \
 ```sql
 -- Most used apps (last 24h)
 SELECT app_name, COUNT(*) AS frames FROM frames
-WHERE timestamp > datetime('now','-24 hours') AND app_name IS NOT NULL
+WHERE timestamp > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours') AND app_name IS NOT NULL
 GROUP BY app_name ORDER BY frames DESC LIMIT 20;
 
 -- Context switches per hour
 SELECT strftime('%H:00', timestamp) AS hour, COUNT(*) AS switches
-FROM ui_events WHERE event_type='app_switch' AND timestamp > datetime('now','-24 hours')
+FROM ui_events WHERE event_type='app_switch' AND timestamp > strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-24 hours')
 GROUP BY hour ORDER BY hour LIMIT 24;
 ```
 

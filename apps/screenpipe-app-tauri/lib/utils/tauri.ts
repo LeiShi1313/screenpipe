@@ -2849,6 +2849,17 @@ usePiiRemoval: boolean;
  */
 asyncPiiRedaction?: boolean;
 /**
+ * Strip secrets from coding-agent (pi) session logs at rest. The
+ * agent persists full sessions — bash output, file reads, tool
+ * results — unredacted, so any credential it touches lands in
+ * plaintext on disk. When `true`, a background worker periodically
+ * runs a secrets-only regex scrub over `pi/sessions/*.jsonl` (idle
+ * files only, so a live run is never rewritten). Secrets-only and
+ * on-device — independent of `async_pii_redaction` (the
+ * model-backed text path). Off by default. See `screenpipe-redact`.
+ */
+redactAgentSessionSecrets?: boolean;
+/**
  * Enable image-PII redaction on captured screen frames. When
  * `true`, the `screenpipe_redact::image::worker` runs alongside
  * the text reconciliation worker, scans the `frames` table, runs

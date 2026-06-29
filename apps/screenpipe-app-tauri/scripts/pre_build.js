@@ -308,6 +308,10 @@ async function downloadStaticLinuxFfmpeg() {
 		}
 	}
 
+	// johnvansickle.com intermittently returns a transient HTTP 415 (and the odd
+	// 5xx). downloadFile() retries on any curl failure — including HTTP error
+	// codes via curl -f — so those transient responses fall inside the retry
+	// budget instead of hard-failing the build.
 	await downloadFile(config.linux.ffmpegUrl, archive, { retries: 5, timeoutMs: 120000 })
 	await $`tar xf ${archive}`
 
@@ -584,7 +588,7 @@ if (platform == 'linux') {
 		// Setup TESSERACT
 	if (!(await fs.exists(config.linux.tesseractName)) || (await isSymlink(config.linux.tesseractName))) {
 		await fs.rm(config.linux.tesseractName, { force: true });
-		await $`wget --no-config -nc ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
+		await $`wget --no-config -nc --tries=5 --waitretry=10 --retry-on-http-error=415,429,500,502,503,504 --timeout=60 ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
 		await $`chmod +x ${config.linux.tesseractName}` // Make the Tesseract binary executable
 	} else {
 		console.log('TESSERACT already exists');

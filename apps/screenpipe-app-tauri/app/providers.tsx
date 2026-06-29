@@ -17,6 +17,7 @@ import { useUpdateListener } from "@/components/update-banner";
 import { AppEntitlementGate } from "@/components/app-entitlement-gate";
 import { DeeplinkHandler } from "@/components/deeplink-handler";
 import { usePathname } from "next/navigation";
+import { readCachedAnalyticsId } from "@/lib/analytics-id";
 
 /// Global mount point for the updater event listener. Lives here (not in
 /// per-page hooks) so the listener is registered for the lifetime of the
@@ -61,10 +62,22 @@ export const Providers = forwardRef<
     if (typeof window !== "undefined") {
       const isDebug = process.env.TAURI_ENV_DEBUG === "true";
       if (isDebug) return;
+      // Bootstrap with the stable per-install id (mirrors settings.analyticsId,
+      // cached by the identify() effect in use-settings) so EVERY event — incl.
+      // ones fired by overlay windows like the floating search bar before the
+      // async settings/identify effect runs — attaches to one durable person.
+      // Without it, posthog mints a fresh anonymous id per webview/session and a
+      // single install fragments into many person_ids (~6-27x WAU overcount,
+      // ~0% week-over-week retention). isIdentifiedID lets the bootstrapped id
+      // create a person profile under `person_profiles: "identified_only"`.
+      const cachedAnalyticsId = readCachedAnalyticsId();
       posthog.init("phc_z7FZXE8vmXtdTQ78LMy3j1BQWW4zP6PGDUP46rgcdnb", {
         api_host: "https://us.i.posthog.com",
         person_profiles: "identified_only",
         capture_pageview: false,
+        ...(cachedAnalyticsId
+          ? { bootstrap: { distinctID: cachedAnalyticsId, isIdentifiedID: true } }
+          : {}),
       });
     }
   }, []);

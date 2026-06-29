@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Custom vocabulary entry for transcription biasing and word replacement.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct VocabEntry {
     /// The word or phrase to bias toward during transcription.
@@ -15,6 +15,43 @@ pub struct VocabEntry {
     /// Optional replacement — if set, the transcribed `word` is replaced with this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_with: Option<String>,
+}
+
+// Backwards compatibility: legacy `store.bin` files stored `vocabularyWords` as a
+// list of plain strings (see `RecordingSettings::vocabulary`). Accept both a bare
+// string (mapped to `VocabEntry { word, replace_with: None }`) and the struct form
+// so existing settings deserialize without migration.
+impl<'de> Deserialize<'de> for VocabEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Helper mirrors the struct form so its field names/defaults stay in sync.
+        #[derive(Deserialize)]
+        struct VocabEntryStruct {
+            word: String,
+            #[serde(default)]
+            replace_with: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrStruct {
+            String(String),
+            Struct(VocabEntryStruct),
+        }
+
+        Ok(match StringOrStruct::deserialize(deserializer)? {
+            StringOrStruct::String(word) => VocabEntry {
+                word,
+                replace_with: None,
+            },
+            StringOrStruct::Struct(s) => VocabEntry {
+                word: s.word,
+                replace_with: s.replace_with,
+            },
+        })
+    }
 }
 
 /// A single schedule rule: a day-of-week + time range + what to record.
@@ -369,6 +406,17 @@ pub struct RecordingSettings {
     #[serde(rename = "asyncPiiRedaction", default)]
     pub async_pii_redaction: bool,
 
+    /// Strip secrets from coding-agent (pi) session logs at rest. The
+    /// agent persists full sessions — bash output, file reads, tool
+    /// results — unredacted, so any credential it touches lands in
+    /// plaintext on disk. When `true`, a background worker periodically
+    /// runs a secrets-only regex scrub over `pi/sessions/*.jsonl` (idle
+    /// files only, so a live run is never rewritten). Secrets-only and
+    /// on-device — independent of `async_pii_redaction` (the
+    /// model-backed text path). Off by default. See `screenpipe-redact`.
+    #[serde(rename = "redactAgentSessionSecrets", default)]
+    pub redact_agent_session_secrets: bool,
+
     /// Enable image-PII redaction on captured screen frames. When
     /// `true`, the `screenpipe_redact::image::worker` runs alongside
     /// the text reconciliation worker, scans the `frames` table, runs
@@ -635,6 +683,7 @@ impl Default for RecordingSettings {
             languages: vec![],
             use_pii_removal: false,
             async_pii_redaction: false,
+            redact_agent_session_secrets: false,
             async_image_pii_redaction: false,
             pii_backend: default_pii_backend(),
             pii_redaction_labels: default_pii_redaction_labels(),
@@ -932,6 +981,23 @@ mod tests {
         let json = r#"{"audioChunkDuration": 0}"#;
         let s: RecordingSettings = serde_json::from_str(json).unwrap();
         assert_eq!(s.audio_chunk_duration, 0);
+    }
+
+    #[test]
+    fn vocab_entry_accepts_bare_string_and_struct_mixed() {
+        // Regression for SCREENPIPE-APP-DN: legacy store.bin stored vocabularyWords
+        // as bare strings; the current app stores structs. A mixed list (with a
+        // non-ASCII bare string, the exact crashing input) must all deserialize
+        // instead of failing the whole RecordingSettings object.
+        let json = r#"{"vocabularyWords": ["せばんぬ", {"word": "screenpipe"}, {"word": "foo", "replace_with": "bar"}]}"#;
+        let s: RecordingSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.vocabulary.len(), 3);
+        assert_eq!(s.vocabulary[0].word, "せばんぬ");
+        assert_eq!(s.vocabulary[0].replace_with, None);
+        assert_eq!(s.vocabulary[1].word, "screenpipe");
+        assert_eq!(s.vocabulary[1].replace_with, None);
+        assert_eq!(s.vocabulary[2].word, "foo");
+        assert_eq!(s.vocabulary[2].replace_with.as_deref(), Some("bar"));
     }
 
     #[test]

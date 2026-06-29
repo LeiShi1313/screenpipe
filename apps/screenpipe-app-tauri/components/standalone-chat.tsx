@@ -27,6 +27,8 @@ import { useSqlAutocomplete, useTagAutocomplete } from "@/lib/hooks/use-sql-auto
 import {
   buildAppMentionSuggestions,
   buildTagMentionSuggestions,
+  isConversationHistorySyncPrompt,
+  isInjectedTitleSourcePrompt,
 } from "@/lib/chat-utils";
 import { useAutoSuggestions } from "@/lib/hooks/use-auto-suggestions";
 import {
@@ -947,6 +949,20 @@ export function StandaloneChat({
     turnIntentTextValuesMatch,
   });
 
+  const messageHistory = React.useMemo(
+    () =>
+      messages
+        .filter(
+          (message) =>
+            message.role === "user" &&
+            message.content.trim() &&
+            !isInjectedTitleSourcePrompt(message.content) &&
+            !isConversationHistorySyncPrompt(message.content),
+        )
+        .map((message) => message.content),
+    [messages],
+  );
+
   const {
     handleKeyDown,
     handlePaste,
@@ -973,6 +989,7 @@ export function StandaloneChat({
     pastedImages,
     pendingDocsRef,
     attachedDocsRef,
+    messageHistory,
     queuedPrompts,
     steerShortcutInFlightRef,
     isKnownConnectionId: (id) => INTEGRATION_ICON_KEYS.has(id),

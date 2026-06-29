@@ -233,6 +233,16 @@
       "notes": "Cross-window prefill duplicate regression."
     },
     {
+      "spec": "chat-prefill-context-leak.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai"],
+      "features": ["chat", "chat-prefill"],
+      "criticality": "medium",
+      "confidence": "partial",
+      "ux": "synthetic",
+      "notes": "Pending auto-send prefill must render only the clean prompt, not the internal model context, as the user message."
+    },
+    {
       "spec": "chat-streaming-performance.spec.ts",
       "platforms": ["macos"],
       "layers": ["chat-ai", "performance"],

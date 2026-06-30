@@ -607,7 +607,7 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
 
   const handleUpgradeToPro = useCallback(async () => {
     if (!settings.user?.id || !settings.user?.token) {
-      await commands.openLoginWindow();
+      await commands.openLoginWindow(null);
       return;
     }
 

@@ -441,7 +441,7 @@ export function StandaloneChat({
     });
 
     try {
-      await commands.openLoginWindow();
+      await commands.openLoginWindow(null);
     } catch (e) {
       console.warn("failed to open login after Pi auth error:", e);
     }
@@ -1139,7 +1139,7 @@ export function StandaloneChat({
         hasValidModel={hasValidModel}
         needsLogin={needsLogin}
         onOpenLogin={async () => {
-          await commands.openLoginWindow();
+          await commands.openLoginWindow(null);
         }}
         onOpenSettings={async () => {
           await commands.showWindow({ Home: { page: null } });

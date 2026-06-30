@@ -11,6 +11,11 @@ import { computeManagedSettingUpdates } from "./managed-settings";
 import { getVersion } from "@tauri-apps/api/app";
 import { localFetch } from "@/lib/api";
 import { platform as getPlatform } from "@tauri-apps/plugin-os";
+import {
+  parseCollectLogsRequest,
+  shouldHandleCollectLogs,
+} from "@/lib/enterprise/remote-commands";
+import { collectAndUploadLogs } from "@/lib/enterprise/collect-logs";
 
 import { syncManagedPipes, gatherPipeStatuses, type ManagedPipe } from "./use-enterprise-pipes";
 import {
@@ -59,6 +64,31 @@ const ENTERPRISE_DEFAULT_HIDDEN = ["referral"];
 
 // Re-fetch policy every 5 minutes so admin changes propagate without app restart
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
+
+// Tracks the last remote "collect logs" request we acted on + the ack we owe the
+// server, so a standing request doesn't re-upload every heartbeat and the admin
+// dashboard can show completion. Persisted so it survives app restarts.
+const COLLECT_LOGS_STATE_KEY = "enterprise_collect_logs_state";
+
+interface CollectLogsState {
+  handledRequestedAt?: string; // dedupe key — the request we last serviced
+  fulfilledAt?: string; // echoed back to the server to clear the command
+  path?: string; // uploaded log bundle path (for the dashboard)
+}
+
+function readCollectLogsState(): CollectLogsState {
+  try {
+    const raw = localStorage.getItem(COLLECT_LOGS_STATE_KEY);
+    if (raw) return JSON.parse(raw) as CollectLogsState;
+  } catch {}
+  return {};
+}
+
+function writeCollectLogsState(state: CollectLogsState) {
+  try {
+    localStorage.setItem(COLLECT_LOGS_STATE_KEY, JSON.stringify(state));
+  } catch {}
+}
 
 const CACHE_KEY = "enterprise-policy-cache";
 
@@ -285,7 +315,12 @@ async function sendHeartbeat(licenseKey: string): Promise<void> {
       pipeStatuses = await gatherPipeStatuses();
     } catch {}
 
-    await tauriFetch("https://screenpipe.com/api/enterprise/heartbeat", {
+    // Acknowledge any remote log-collection we've completed. Sent idempotently on
+    // every heartbeat until the request is superseded — the server clears the
+    // command once fulfilled_at catches up to requested_at.
+    const collectState = readCollectLogsState();
+
+    const res = await tauriFetch("https://screenpipe.com/api/enterprise/heartbeat", {
       method: "POST",
       headers: {
         "X-License-Key": licenseKey,
@@ -308,9 +343,64 @@ async function sendHeartbeat(licenseKey: string): Promise<void> {
           channel: appUpdatePolicy.channel,
         },
         pipe_statuses: pipeStatuses,
+        log_upload_fulfilled_at: collectState.fulfilledAt ?? null,
+        log_upload_path: collectState.path ?? null,
       }),
     });
+
+    // The heartbeat response may carry remote commands. Today: collect_logs.
+    let responseBody: unknown = null;
+    try {
+      responseBody = await res.json();
+    } catch {}
+    await handleHeartbeatCommands(
+      responseBody,
+      deviceId,
+      settings.analyticsId as string | undefined
+    );
   } catch {}
+}
+
+/**
+ * Act on remote commands returned by the heartbeat. Currently supports
+ * `collect_logs`: an admin asked this device to upload its diagnostic logs.
+ * Runs at most once per distinct request (dedup via persisted state), then
+ * stages an ack the next heartbeat sends back to clear the command. Never
+ * throws — a failed upload leaves the request unacknowledged so a later
+ * heartbeat retries it.
+ */
+async function handleHeartbeatCommands(
+  responseBody: unknown,
+  deviceId: string,
+  analyticsId: string | undefined
+): Promise<void> {
+  const requestedAt = parseCollectLogsRequest(responseBody);
+  const state = readCollectLogsState();
+  if (!shouldHandleCollectLogs(requestedAt, state.handledRequestedAt ?? null)) {
+    return;
+  }
+
+  // Mark handled BEFORE the (slow) upload so the next heartbeat doesn't
+  // double-trigger. On failure we roll back so a later heartbeat retries.
+  writeCollectLogsState({ ...state, handledRequestedAt: requestedAt! });
+
+  try {
+    const result = await collectAndUploadLogs({
+      identifier: deviceId,
+      screenpipeId: analyticsId,
+      reason: "enterprise remote log collection",
+    });
+    // Echo requested_at back as fulfilled_at so the server's
+    // (requested_at > fulfilled_at) gate flips to done.
+    writeCollectLogsState({
+      handledRequestedAt: requestedAt!,
+      fulfilledAt: requestedAt!,
+      path: result?.path,
+    });
+  } catch {
+    // Roll back the handled marker so a future heartbeat retries this request.
+    writeCollectLogsState(state);
+  }
 }
 
 function cachePolicy(policy: EnterprisePolicy) {

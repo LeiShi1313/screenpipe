@@ -24,7 +24,6 @@ import {
 import { localFetch } from "@/lib/api";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { loadAllConversations } from "@/lib/chat-storage";
-import { redactPii, redactSettingsForSharing } from "@/lib/utils/redact-pii";
 import { firstImageFile } from "@/lib/utils/clipboard-image";
 
 // Read an image File and return a compressed JPEG data URL (max 1920px wide).
@@ -278,51 +277,38 @@ export const ShareLogsButton = ({
         }
       }
 
-      // Settings snapshot — invaluable for debugging ("did you change the
-      // transcription engine / a privacy filter?"), which the logs alone don't
-      // reveal. Secrets (API keys, tokens, credentials) are stripped and PII
-      // scrubbed by `redactSettingsForSharing` before it leaves the device.
-      let settingsSection = "";
-      try {
-        settingsSection =
-          "\n\n=== Settings (secrets & PII redacted) ===\n" +
-          redactSettingsForSharing(settings);
-      } catch (e) {
-        console.error("failed to serialize settings:", e);
-      }
-
-      // Bulk, mostly-structured logs: scrub with the fast on-device regex
-      // pass. Routing hundreds of KB through the cloud enclave (~10-15s/2KB)
-      // would hang submission for minutes, so the enclave is reserved for the
-      // PII-dense free text below.
-      const bulkLogs = redactPii(
-        logContents
-          .map((log) => `\n=== ${log.name} ===\n${log.content}`)
-          .join("\n\n") +
-          "\n\n=== Browser Console Logs ===\n" +
-          consoleLog
-      );
-
-      // PII-dense free text (chat + settings) → the cloud PII model running in
-      // the Tinfoil confidential-compute enclave. The command chunks + time-
-      // budgets the enclave calls and falls back to the local regex pass for
-      // any overflow / failure, so feedback is never blocked.
-      const piiDense = chatSection + settingsSection;
-      let redactedPiiDense = redactPii(piiDense);
-      if (piiDense.trim()) {
+      // Settings are included raw here and redacted in Rust (see below) — the
+      // settings snapshot is invaluable for debugging ("did they change the
+      // transcription engine / a privacy filter?"), which logs alone don't show.
+      const settingsJson = (() => {
         try {
-          const res = await commands.redactPiiForFeedback(piiDense);
-          if (res.status === "ok") {
-            redactedPiiDense = res.data;
-          } else {
-            console.warn("cloud PII redaction unavailable, using local regex:", res.error);
-          }
+          return JSON.stringify(settings);
         } catch (e) {
-          console.warn("cloud PII redaction failed, using local regex:", e);
+          console.error("failed to serialize settings:", e);
+          return "";
         }
-      }
+      })();
 
-      const redactedLogs = bulkLogs + redactedPiiDense;
+      // Raw bundle (chat first so the enclave budget is spent on the PII-dense
+      // content before the bulk logs). ALL redaction happens in Rust — the
+      // `redact_pii_for_feedback` command strips config secrets by field name
+      // and runs the text through the screenpipe-redact pipeline (regex + the
+      // Tinfoil enclave model). No redaction is done here in the webview.
+      const rawBundle =
+        chatSection +
+        logContents
+          .map((log) => `\n\n=== ${log.name} ===\n${log.content}`)
+          .join("") +
+        "\n\n=== Browser Console Logs ===\n" +
+        consoleLog;
+
+      const redaction = await commands.redactPiiForFeedback(rawBundle, settingsJson);
+      if (redaction.status !== "ok") {
+        // The command never returns Err (worst case is regex-only redaction), so
+        // this means the call itself failed. Don't upload unredacted content.
+        throw new Error(`redaction failed: ${redaction.error}`);
+      }
+      const redactedLogs = redaction.data;
 
       await fetch(signedUrl, {
         method: "PUT",

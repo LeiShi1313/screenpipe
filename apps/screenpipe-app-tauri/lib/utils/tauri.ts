@@ -1471,13 +1471,17 @@ async readViewerFile(path: string) : Promise<Result<ViewerContent, string>> {
 }
 },
 /**
- * Redact a feedback/log bundle through the real PII model before it leaves
- * the device. Returns `Err` if no redactor could be built so the caller can
- * fall back to its own deterministic pass — submission must never be blocked.
+ * Redact a feedback bundle for upload.
+ *
+ * `text` is the raw logs + chat (PII-dense chat first); `settings_json` is the
+ * raw settings store. Config secrets are stripped by field name, then the whole
+ * thing goes through the crate's redaction pipeline (enclave model under a time
+ * budget, regex for the overflow). Never returns `Err` — worst case is
+ * regex-only redaction — so feedback submission is never blocked.
  */
-async redactPiiForFeedback(text: string) : Promise<Result<string, string>> {
+async redactPiiForFeedback(text: string, settingsJson: string) : Promise<Result<string, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("redact_pii_for_feedback", { text }) };
+    return { status: "ok", data: await TAURI_INVOKE("redact_pii_for_feedback", { text, settingsJson }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

@@ -301,9 +301,17 @@ curl -X POST http://localhost:11435/notify -H "Content-Type: application/json" \
 # Markdown body + action buttons. action types: "link" (web), "deeplink" (screenpipe://), "dismiss".
 curl -X POST http://localhost:11435/notify -H "Content-Type: application/json" \
   -d '{"title":"Meeting summary","body":"**Q3 Planning** saved\n\nopen [notes](~/Documents/q3.md)","actions":[{"id":"view","label":"view","type":"deeplink","url":"screenpipe://timeline"},{"id":"skip","label":"skip","type":"dismiss"}]}'
+
+# Ask permission, then run a pipe on approval — the opt-in flow. `type:"pipe"`
+# runs the TARGET pipe when clicked; `context` is injected into that pipe's
+# prompt. Set `pipe` explicitly (omit it and it falls back to the sender = no-op).
+# Actions persist to the notification bell, so the user can approve later even
+# if the toast already faded. Use `open_in_chat:true` to surface the run live.
+curl -X POST http://localhost:11435/notify -H "Content-Type: application/json" \
+  -d '{"title":"share meeting notes with the team?","body":"approve to send the adriaan call notes","actions":[{"id":"approve","label":"approve","type":"pipe","primary":true,"pipe":"share-data","context":{"meeting_id":274}},{"id":"no","label":"decline","type":"dismiss"}]}'
 ```
 
-Fields: `title`* , `body`* (markdown), `type` (default "pipe"), `timeout`/`autoDismissMs` (ms, default 20000), `actions` (buttons). Body links: web URL → browser, file path (`~/notes.md`, `/var/log/app.log`) → default app, `screenpipe://...` → in-app. Returns `{"success":true}`.
+Action types: `link` (web URL), `deeplink` (`screenpipe://`), `pipe` (run a pipe — needs `pipe`, optional `context`, optional `open_in_chat`), `api` (POST a local endpoint — needs `url`, optional `method`/`body`), `dismiss`. Fields: `title`* , `body`* (markdown), `type` (default "pipe"), `timeout`/`autoDismissMs` (ms, default 20000), `actions` (buttons; up to 5, each needs `id`/`label`/`type`). Body links: web URL → browser, file path (`~/notes.md`, `/var/log/app.log`) → default app, `screenpipe://...` → in-app. Returns `{"success":true}`.
 
 ---
 

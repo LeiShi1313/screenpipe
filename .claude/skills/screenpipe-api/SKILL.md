@@ -519,6 +519,23 @@ curl -X POST http://localhost:11435/notify \
   -H "Content-Type: application/json" \
   -d '{"title": "PR ready for review", "body": "nice work", "actions": [{"id": "open", "label": "open pr", "type": "link", "url": "https://github.com/screenpipe/screenpipe/pull/1234"}]}'
 
+# Ask permission, then run a pipe on approval — the opt-in / agent-gated flow.
+# `type: "pipe"` runs the TARGET pipe when clicked (POST /pipes/<pipe>/run); the
+# `context` is injected into that pipe's prompt as the notification action
+# context. Set `pipe` EXPLICITLY — if omitted it falls back to the sending pipe,
+# which usually does nothing. Add `"open_in_chat": true` to run it in the chat UI
+# so the user sees the output live instead of in the background.
+# Actions persist into the notification bell, so the user can still approve from
+# the bell after the ~20s toast fades.
+curl -X POST http://localhost:11435/notify \
+  -H "Content-Type: application/json" \
+  -d '{"title": "share meeting notes with the team?", "body": "approve to send the adriaan call notes", "actions": [{"id": "approve", "label": "approve", "type": "pipe", "primary": true, "pipe": "share-data", "context": {"meeting_id": 274}}, {"id": "decline", "label": "decline", "type": "dismiss"}]}'
+
+# Call a local API endpoint on click (`type: "api"`)
+curl -X POST http://localhost:11435/notify \
+  -H "Content-Type: application/json" \
+  -d '{"title": "stop recording?", "body": "tap to stop", "actions": [{"id": "stop", "label": "stop", "type": "api", "url": "/recording/stop", "method": "POST"}]}'
+
 # Custom auto-dismiss (5 seconds)
 curl -X POST http://localhost:11435/notify \
   -H "Content-Type: application/json" \
@@ -532,7 +549,15 @@ curl -X POST http://localhost:11435/notify \
 | `type` | string | No | Category (default "pipe") |
 | `timeout` | integer | No | Auto-dismiss in ms (default 20000) |
 | `autoDismissMs` | integer | No | Alias for timeout |
-| `actions` | array | No | Action buttons |
+| `actions` | array | No | Action buttons (up to 5; each needs `id`, `label`, `type`) |
+
+**Action button `type`s:**
+- `link` — open a web URL in the browser (`url`)
+- `deeplink` — navigate within screenpipe (`url` = `screenpipe://...`)
+- `pipe` — run a pipe on click (`pipe` = target pipe name, optional `context` injected into its prompt, optional `open_in_chat`). The opt-in / agent-gated-sharing primitive.
+- `api` — POST a local endpoint (`url`, optional `method`, optional `body`)
+- `dismiss` — close the notification, no side effect
+- `primary: true` renders the button filled (the recommended action). Actions persist into the notification bell, so a missed toast can still be acted on.
 
 **Supported link types in body markdown:**
 - Web URLs: `[docs](https://docs.screenpi.pe)` — opens in browser

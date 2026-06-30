@@ -1456,7 +1456,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           )}
 
           {filteredSpeakerTranscriptions.length > 0 && (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+            <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
               {filteredSpeakerTranscriptions.map((t, index) => {
                 const frameInfo = transcriptionFrames.get(t.timestamp);
                 const frameId = frameInfo?.frame_id;
@@ -1586,7 +1591,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
           {/* Tag timeline entries — thumbnail grid */}
           {isTagSearch && tagResults.length > 0 && (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+            <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
               {tagResults.map((frame) => (
                 <div
                   key={frame.frame_id}
@@ -1678,7 +1688,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 ))}
               </div>
               {/* Skeleton thumbnail grid */}
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+              <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
                     <div className="aspect-video" />
@@ -1820,7 +1835,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 <Monitor className="w-3 h-3" />
                 screen
               </p>
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+              <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
                     <div className="aspect-video" />
@@ -1997,7 +2017,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 </div>
               )}
 
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+              <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
                 {filteredResults.map((result, index) => {
                   const isActive = index === activeIndex;
                   const group = filteredGroups[index];

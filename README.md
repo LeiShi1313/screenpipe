@@ -76,7 +76,7 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 
 - **search with ai** - find anything using natural language
 - **100% local** - your data never leaves your machine
-- **open source** - inspect, modify, own
+- **source-available** - inspect, modify, audit ([LICENSE.md](LICENSE.md))
 
 <p align="center">
    <a href ="https://screenpi.pe">

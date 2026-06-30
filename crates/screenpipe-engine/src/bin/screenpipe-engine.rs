@@ -1151,7 +1151,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create VisionManager for event-driven capture on all monitors
-    let (handle, capture_trigger_tx, linker_tx) = if !config.disable_vision {
+    let (handle, capture_trigger_tx, linker_tx, vision_manager_for_server) = if !config
+        .disable_vision
+    {
         let vision_config =
             config.to_vision_manager_config(output_path_clone.to_string(), vision_metrics.clone());
         // Hot frame cache is only consumed by the timeline streaming endpoint;
@@ -1220,11 +1222,16 @@ async fn main() -> anyhow::Result<()> {
                 error!("Error shutting down VisionManager: {:?}", e);
             }
         });
-        (h, Some(trigger_tx), Some(linker_tx))
+        (
+            h,
+            Some(trigger_tx),
+            Some(linker_tx),
+            Some(vision_manager.clone()),
+        )
     } else {
         // Vision disabled — spawn a pending task so `handle` never completes
         // (otherwise the no-op future wins the tokio::select! race and shuts down the server)
-        (tokio::spawn(std::future::pending::<()>()), None, None)
+        (tokio::spawn(std::future::pending::<()>()), None, None, None)
     };
 
     let local_data_dir_clone_2 = local_data_dir_clone.clone();
@@ -1274,6 +1281,8 @@ async fn main() -> anyhow::Result<()> {
     server.hot_frame_cache = Some(hot_frame_cache);
     server.timeline_disabled = config.disable_timeline;
     server.power_manager = Some(power_manager);
+    // Share the VisionManager so /vision/device/* can pause/resume monitors.
+    server.vision_manager = vision_manager_for_server;
     server.manual_meeting = Some(manual_meeting.clone());
     server.api_auth = config.api_auth;
     server.api_auth_key = config.api_auth_key.clone();

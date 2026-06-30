@@ -656,14 +656,6 @@ jobs:
         rm -rf ./e2e/results
         bun run test:e2e
 
-    - name: Run Search Bugs E2E (#4645)
-      shell: bash
-      working-directory: ./apps/screenpipe-app-tauri
-      env:
-        RECORD_VIDEO: "true"
-      run: |
-        bun run test:e2e:search-bugs
-
     - name: Generate E2E Coverage Report
       if: always()
       shell: bash

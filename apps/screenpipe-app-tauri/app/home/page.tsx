@@ -119,7 +119,7 @@ function HomeContent() {
   });
   const [connectionFocusRequest, setConnectionFocusRequest] = useState<ConnectionFocusRequest | null>(null);
 
-  const { settings } = useSettings();
+  const { settings, updateSettings } = useSettings();
   const { isTranslucent } = useSidebarContext();
   const teamState = useTeam();
   const { isSectionHidden, isSettingLocked, needsLicenseKey, submitLicenseKey } = useEnterprisePolicy();
@@ -478,6 +478,7 @@ function HomeContent() {
   }
   const [recordingDevices, setRecordingDevices] = useState<RecordingDevice[]>([]);
   const recordingDevicesSnapshotRef = useRef("");
+  const lastKnownMonitorDevicesRef = useRef<RecordingDevice[]>([]);
 
   const refreshRecordingDevices = useCallback(async () => {
     try {
@@ -502,7 +503,25 @@ function HomeContent() {
       // display can be paused/resumed individually) and reflects user pauses.
       // A display reads as "active" unless the user explicitly paused it, so a
       // transient capture stall at boot doesn't flicker the row to "paused".
-      if (Array.isArray(visionStatus) && visionStatus.length > 0) {
+      if (settings.disableVision) {
+        const lastKnownMonitors = lastKnownMonitorDevicesRef.current;
+        devices.push(
+          ...(lastKnownMonitors.length > 0
+            ? lastKnownMonitors.map((device) => ({
+                ...device,
+                active: false,
+                id: undefined,
+              }))
+            : [
+                {
+                  name: "Screen recording",
+                  fullName: "screen-recording",
+                  kind: "monitor" as const,
+                  active: false,
+                },
+              ])
+        );
+      } else if (Array.isArray(visionStatus) && visionStatus.length > 0) {
         for (const m of visionStatus) {
           devices.push({
             name: m.name,
@@ -531,6 +550,11 @@ function HomeContent() {
           }
           devices.push({ name, fullName: name, kind: "monitor", active: true });
         }
+      }
+
+      const monitorDevices = devices.filter((device) => device.kind === "monitor");
+      if (!settings.disableVision && monitorDevices.length > 0) {
+        lastKnownMonitorDevicesRef.current = monitorDevices;
       }
 
       const visibleAudioDevices = Array.isArray(audioStatus)
@@ -573,7 +597,7 @@ function HomeContent() {
     } catch {
       // Device status is advisory UI state; keep the last known snapshot.
     }
-  }, [settings.monitorIds, settings.useAllMonitors]);
+  }, [settings.disableVision, settings.monitorIds, settings.useAllMonitors]);
 
   useEffect(() => {
     void refreshRecordingDevices();
@@ -597,6 +621,25 @@ function HomeContent() {
       void refreshRecordingDevices();
     }, 500);
   }, [refreshRecordingDevices]);
+
+  const toggleScreenRecording = useCallback(async (active: boolean) => {
+    await updateSettings({ disableVision: !active });
+
+    const stopResult = await commands.stopCapture();
+    if (stopResult.status === "error") {
+      throw new Error(String(stopResult.error));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const startResult = await commands.startCapture();
+    if (startResult.status === "error") {
+      throw new Error(String(startResult.error));
+    }
+
+    window.setTimeout(() => {
+      void refreshRecordingDevices();
+    }, 1000);
+  }, [refreshRecordingDevices, updateSettings]);
 
   // Active meeting state — lights up the phone icon for ANY active meeting
   // (manual OR auto-detected: Teams, Zoom, etc.).
@@ -1037,6 +1080,7 @@ function HomeContent() {
               meetingLoading={meetingLoading}
               onToggleMeeting={() => void toggleMeeting()}
               onPauseRecording={pauseRecording}
+              onToggleScreenRecording={toggleScreenRecording}
               isTranslucent={isTranslucent}
               floatingOverMedia={sidebarCollapsed && activeSection === "timeline"}
             />

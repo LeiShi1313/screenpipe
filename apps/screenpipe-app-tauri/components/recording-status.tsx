@@ -39,6 +39,7 @@ interface RecordingStatusProps {
   meetingLoading: boolean;
   onToggleMeeting: () => void;
   onPauseRecording?: () => void | Promise<void>;
+  onToggleScreenRecording?: (active: boolean) => void | Promise<void>;
   isTranslucent?: boolean;
   /** buttons float over full-bleed video (timeline, sidebar collapsed) */
   floatingOverMedia?: boolean;
@@ -68,6 +69,7 @@ export function RecordingStatus({
   meetingLoading,
   onToggleMeeting,
   onPauseRecording,
+  onToggleScreenRecording,
   isTranslucent,
   floatingOverMedia,
 }: RecordingStatusProps) {
@@ -91,8 +93,26 @@ export function RecordingStatus({
   // and revert on failure so the popover feels instant.
   const toggleDevice = async (device: RecordingDevice) => {
     const isMonitor = device.kind === "monitor";
-    // Monitor control needs a numeric id; older sidecars don't report one.
-    if (isMonitor && device.id == null) return;
+    // Older sidecars don't report monitor ids. Fall back to the global screen
+    // recording setting so the display row still has a pause/resume affordance.
+    if (isMonitor && device.id == null) {
+      if (!onToggleScreenRecording) return;
+      onDevicesChange((prev) =>
+        prev.map((d) =>
+          d.kind === "monitor" ? { ...d, active: !device.active } : d
+        )
+      );
+      try {
+        await onToggleScreenRecording(!device.active);
+      } catch {
+        onDevicesChange((prev) =>
+          prev.map((d) =>
+            d.kind === "monitor" ? { ...d, active: device.active } : d
+          )
+        );
+      }
+      return;
+    }
 
     const endpoint = isMonitor
       ? device.active
@@ -258,16 +278,20 @@ export function RecordingStatus({
                 >
                   {device.name}
                 </span>
-                {/* Monitors are controllable only when the sidecar reports an
-                    id (/vision/device/status); audio rows always are. */}
-                {(device.kind !== "monitor" || device.id != null) && (
+                {(device.kind !== "monitor" ||
+                  device.id != null ||
+                  onToggleScreenRecording) && (
                   <button
                     onClick={() => void toggleDevice(device)}
                     title={
                       device.kind === "monitor"
                         ? device.active
-                          ? "pause screen recording for this display"
-                          : "resume screen recording for this display"
+                          ? device.id != null
+                            ? "pause screen recording for this display"
+                            : "pause screen recording"
+                          : device.id != null
+                            ? "resume screen recording for this display"
+                            : "resume screen recording"
                         : device.active
                           ? "pause recording for this device"
                           : "resume recording for this device"

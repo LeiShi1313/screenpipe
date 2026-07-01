@@ -2247,12 +2247,14 @@ pub fn bun_version_string(bun: &str) -> String {
     }
 }
 
-/// Inside an AppImage, AppRun exports `LD_LIBRARY_PATH` pointing at the bundle's
-/// libs. bun is a self-contained baseline binary and must not inherit it, or it
-/// loads the bundled glibc/libstdc++ and crashes (SIGSEGV/SIGILL). Only scrub it
-/// in that environment so a normal Linux install keeps any user-set value.
+/// On Linux, bun is a self-contained baseline binary and should not inherit the
+/// parent process' `LD_LIBRARY_PATH`. In AppImage launches that path points at
+/// the bundle's glibc/libstdc++ and bun can crash before it prints anything
+/// (observed as SIGSEGV/SIGILL during AppImage smoke). Scrubbing unconditionally
+/// on Linux avoids relying on AppImage-specific env markers that may not survive
+/// every launcher path.
 fn should_scrub_bun_runtime_env() -> bool {
-    cfg!(target_os = "linux") && std::env::var_os("APPDIR").is_some()
+    cfg!(target_os = "linux")
 }
 
 /// Strip the AppImage runtime library path from a bun command (see
@@ -3518,5 +3520,26 @@ mod tests {
         let tail = output_tail(unicode.as_bytes(), 101);
         assert!(tail.starts_with("..."));
         assert!(tail.ends_with('é'));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scrub_bun_runtime_env_always_removes_ld_library_path_on_linux() {
+        use std::ffi::OsStr;
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.env("LD_LIBRARY_PATH", "/tmp/appimage/usr/lib");
+
+        scrub_bun_runtime_env(&mut cmd);
+
+        let env_value = cmd
+            .get_envs()
+            .find(|(key, _)| key == OsStr::new("LD_LIBRARY_PATH"))
+            .map(|(_, value)| value);
+        assert_eq!(
+            env_value,
+            Some(None),
+            "bun subprocesses on Linux must clear inherited LD_LIBRARY_PATH"
+        );
     }
 }

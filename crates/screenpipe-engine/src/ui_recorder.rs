@@ -977,6 +977,13 @@ fn cap_retained_batch(batch: &mut EventBatch, max_retained: usize) -> usize {
     }
 }
 
+fn is_retryable_write_queue_outage(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::WorkerCrashed | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed
+    )
+}
+
 async fn flush_batch(
     db: &Arc<DatabaseManager>,
     batch: &mut EventBatch,
@@ -1032,7 +1039,19 @@ async fn flush_batch(
         }
         Err(e) => {
             *consecutive_failures += 1;
-            if *consecutive_failures <= 3 {
+            if is_retryable_write_queue_outage(&e) {
+                if *consecutive_failures <= 3 {
+                    warn!(
+                        "UI recorder write queue unavailable; retaining {} events for retry (failure #{}): {}",
+                        batch.len(), *consecutive_failures, e
+                    );
+                } else {
+                    debug!(
+                        "UI recorder write queue unavailable; retaining {} events for retry (failure #{}): {}",
+                        batch.len(), *consecutive_failures, e
+                    );
+                }
+            } else if *consecutive_failures <= 3 {
                 error!("Failed to insert UI events batch: {}", e);
             } else {
                 // Reduce log spam during contention storms
@@ -1303,6 +1322,17 @@ mod event_batch_tests {
         assert!(b.is_empty());
         assert_eq!(b.events.len(), 0);
         assert_eq!(b.correlation_ids.len(), 0);
+    }
+
+    #[test]
+    fn retryable_write_queue_outage_classifies_transport_failures_only() {
+        assert!(is_retryable_write_queue_outage(&sqlx::Error::WorkerCrashed));
+        assert!(is_retryable_write_queue_outage(&sqlx::Error::PoolTimedOut));
+        assert!(is_retryable_write_queue_outage(&sqlx::Error::PoolClosed));
+        assert!(
+            !is_retryable_write_queue_outage(&sqlx::Error::RowNotFound),
+            "query/schema/data errors should stay error-level"
+        );
     }
 
     #[test]

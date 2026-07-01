@@ -327,6 +327,20 @@ async fn tick(
             None => continue,
         };
 
+        // The secrets store also contains app-local OAuth slots such as
+        // `oauth:chatgpt` that are refreshed by their own dedicated codepath,
+        // not the generic connect proxy. Skip anything that is not a
+        // registered screenpipe-connect integration so we do not spam
+        // permanent "unsupported provider" errors on every tick.
+        let Some(policy) = policies.get(integration_id).copied() else {
+            debug!(
+                key = %key,
+                integration_id = %integration_id,
+                "oauth refresh scheduler: skipping unregistered oauth secret"
+            );
+            continue;
+        };
+
         // Honour backoff for this key.
         {
             let g = failures.lock().await;
@@ -346,7 +360,6 @@ async fn tick(
             }
         };
 
-        let policy = policies.get(integration_id).copied().unwrap_or_default();
         if !needs_refresh_now(&value, policy, now) {
             continue;
         }
@@ -597,7 +610,9 @@ mod tests {
         let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
         let metrics = Arc::new(MetricsInner::default());
         let failures = Arc::new(Mutex::new(HashMap::new()));
-        tick(&store, &runner, &metrics, &failures, &empty_policies()).await;
+        let mut policies = HashMap::new();
+        policies.insert("google-calendar".to_string(), RefreshPolicy::default());
+        tick(&store, &runner, &metrics, &failures, &policies).await;
 
         // Down-cast via Arc::clone to peek at the recorder.
         let snap = metrics.snapshot();
@@ -622,7 +637,9 @@ mod tests {
         let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
         let metrics = Arc::new(MetricsInner::default());
         let failures = Arc::new(Mutex::new(HashMap::new()));
-        tick(&store, &runner, &metrics, &failures, &empty_policies()).await;
+        let mut policies = HashMap::new();
+        policies.insert("google-calendar".to_string(), RefreshPolicy::default());
+        tick(&store, &runner, &metrics, &failures, &policies).await;
 
         assert_eq!(metrics.snapshot().refreshes_attempted, 0);
     }
@@ -704,6 +721,23 @@ mod tests {
         let store = mem_store().await;
         store.set("cred:notion", b"some-creds").await.unwrap();
         store.set("api_auth_key", b"deadbeef").await.unwrap();
+
+        let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
+        let metrics = Arc::new(MetricsInner::default());
+        let failures = Arc::new(Mutex::new(HashMap::new()));
+        tick(&store, &runner, &metrics, &failures, &empty_policies()).await;
+
+        assert_eq!(metrics.snapshot().refreshes_attempted, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_unregistered_oauth_secret() {
+        let store = mem_store().await;
+        let now = unix_now();
+        store
+            .set_json("oauth:chatgpt", &token(true, Some(now - 60), None))
+            .await
+            .unwrap();
 
         let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
         let metrics = Arc::new(MetricsInner::default());

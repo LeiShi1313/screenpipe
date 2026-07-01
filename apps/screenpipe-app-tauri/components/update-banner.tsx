@@ -95,6 +95,7 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
   const handleUpdate = async () => {
     setIsInstalling(true);
     const os = platform();
+    let shouldRecoverWindowsBackend = false;
 
     try {
       // Windows: NSIS installer calls process::exit directly, bypassing our
@@ -121,13 +122,6 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
           duration: Infinity,
         });
 
-        // Stop screenpipe before update on Windows
-        try {
-          await commands.stopScreenpipe();
-        } catch (e) {
-          console.warn("failed to stop screenpipe:", e);
-        }
-
         // Get or check for the update
         let update = pendingUpdate;
         const { checkOptions, downloadOptions } = await getWindowsUpdateOptions();
@@ -135,20 +129,33 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
           update = await check(checkOptions as any);
         }
 
-        if (update?.available) {
-
-
-          await update.downloadAndInstall(undefined, downloadOptions);
-
+        if (!update?.available) {
+          setIsInstalling(false);
           toast({
-            title: "update complete",
-            description: "relaunching application",
-            duration: 3000,
+            title: "update no longer available",
+            description: "check for updates again to refresh the banner",
+            variant: "destructive",
           });
+          return;
         }
 
-        // Fallback relaunch only if installer didn't run (no update available
-        // at click time); normal path: downloadAndInstall already exited.
+        try {
+          await commands.stopScreenpipe();
+          shouldRecoverWindowsBackend = true;
+        } catch (e) {
+          console.warn("failed to stop screenpipe:", e);
+        }
+
+        await update.downloadAndInstall(undefined, downloadOptions);
+
+        toast({
+          title: "update complete",
+          description: "relaunching application",
+          duration: 3000,
+        });
+
+        // Fallback relaunch only if the installer returned without replacing
+        // the process. The normal path exits the app inside downloadAndInstall.
         await relaunch();
       } else {
         // macOS/Linux: bundle already staged by backend. `restart_for_update`
@@ -177,6 +184,13 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
       }
     } catch (error) {
       console.error("failed to update:", error);
+      if (os === "windows" && shouldRecoverWindowsBackend) {
+        try {
+          await commands.spawnScreenpipe(null);
+        } catch (spawnError) {
+          console.warn("failed to recover screenpipe after update error:", spawnError);
+        }
+      }
       setIsInstalling(false);
       toast({
         title: "update failed",

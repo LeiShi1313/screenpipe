@@ -85,12 +85,24 @@ export async function hasFramesForDate(date: Date): Promise<boolean> {
 			endOfDay = new Date(now.getTime() - 5 * 60 * 1000); // 5 minutes ago
 		}
 
-		// Use SELECT 1 ... LIMIT 1 instead of COUNT(*) — short-circuits after first row
+		// Use SELECT 1 ... LIMIT 1 instead of COUNT(*) — short-circuits after first row.
+		// Match the calendar picker semantics: audio-only recording days still count
+		// as navigable because the timeline can render/play them.
 		const query = `
             SELECT 1 as has_frames
-            FROM frames f
-            WHERE f.timestamp >= '${startOfDay.toISOString()}'
-            AND f.timestamp <= '${endOfDay.toISOString()}'
+            FROM (
+                SELECT timestamp
+                FROM frames
+                WHERE timestamp >= '${startOfDay.toISOString()}'
+                AND timestamp <= '${endOfDay.toISOString()}'
+
+                UNION ALL
+
+                SELECT timestamp
+                FROM audio_transcriptions
+                WHERE timestamp >= '${startOfDay.toISOString()}'
+                AND timestamp <= '${endOfDay.toISOString()}'
+            ) captured
             LIMIT 1
         `;
 
@@ -119,17 +131,17 @@ export async function hasFramesForDate(date: Date): Promise<boolean> {
 }
 
 /**
- * Find the nearest date (local calendar day) with frames in a single SQL query.
- * Replaces the recursive hasFramesForDate loop (up to 7 HTTP calls → 1).
+ * Find the nearest date (local calendar day) with captured data in a single
+ * SQL query. Replaces the recursive hasFramesForDate loop (up to 7 HTTP calls → 1).
  *
- * Returns a Date at midnight local time for the day that has frames.
+ * Returns a Date at midnight local time for the day that has captured data.
  * This matches what Calendar picker and startOfDay produce, avoiding
  * timezone bugs where a UTC timestamp maps to the wrong local date.
  *
  * @param targetDate - The date to search from (local time)
  * @param direction - "backward" searches older dates, "forward" searches newer
  * @param maxDays - Maximum number of days to search (default 7)
- * @returns A Date at midnight local time for the nearest day with frames, or null
+ * @returns A Date at midnight local time for the nearest day with captured data, or null
  */
 export async function findNearestDateWithFrames(
 	targetDate: Date,
@@ -166,18 +178,28 @@ export async function findNearestDateWithFrames(
 			}
 		}
 
-		// Single query: find the nearest frame timestamp within the range,
-		// ordered so the closest to targetDate comes first.
-		// For backward: we want the most recent frame (ORDER BY DESC)
-		// For forward: we want the earliest frame (ORDER BY ASC)
+		// Single query: find the nearest captured timestamp (screen or audio)
+		// within the range, ordered so the closest day comes first.
+		// For backward: we want the most recent timestamp (ORDER BY DESC)
+		// For forward: we want the earliest timestamp (ORDER BY ASC)
 		const order = direction === "backward" ? "DESC" : "ASC";
 
 		const query = `
-			SELECT f.timestamp
-			FROM frames f
-			WHERE f.timestamp >= '${rangeStart.toISOString()}'
-			AND f.timestamp <= '${rangeEnd.toISOString()}'
-			ORDER BY f.timestamp ${order}
+			SELECT timestamp
+			FROM (
+				SELECT timestamp
+				FROM frames
+				WHERE timestamp >= '${rangeStart.toISOString()}'
+				AND timestamp <= '${rangeEnd.toISOString()}'
+
+				UNION ALL
+
+				SELECT timestamp
+				FROM audio_transcriptions
+				WHERE timestamp >= '${rangeStart.toISOString()}'
+				AND timestamp <= '${rangeEnd.toISOString()}'
+			) captured
+			ORDER BY timestamp ${order}
 			LIMIT 1
 		`;
 

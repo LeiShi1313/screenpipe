@@ -480,12 +480,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     //
     // Fall back to the ref only when `conversationId` is briefly null
     // during startNewConversation (setConversationId(null) → … →
-    // setConversationId(newSid)); without the fallback the save would mint
-    // a fresh uuid and duplicate the conversation.
-    const convId = conversationId || piSessionIdRef.current || crypto.randomUUID();
+    // setConversationId(newSid)). If the ref is also empty, prefer the
+    // store's current id; if all three are absent, skip this save instead
+    // of minting a phantom conversation file under a brand-new uuid.
+    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const storeCurrentId = useChatStore.getState().currentId;
+    const convId = conversationId || piSessionIdRef.current || storeCurrentId;
+    if (!convId) {
+      console.warn("[chat] skipping saveConversation without a stable conversation id");
+      return;
+    }
 
     // Try to load existing conversation to preserve createdAt + title + kind.
-    const { loadConversationFile } = await import("@/lib/chat-storage");
     const existing = await loadConversationFile(convId);
     const browserState = resolveNewestBrowserState(
       existing?.browserState,

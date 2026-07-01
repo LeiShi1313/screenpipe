@@ -25,7 +25,7 @@
  * content.
  *
  * PR #3600's fix flips the order:
- *     const convId = conversationId || piSessionIdRef.current || crypto.randomUUID();
+ *     const convId = conversationId || piSessionIdRef.current || store.currentId || null;
  *
  * which keeps convId in lockstep with the `messages` argument (both
  * captured by the same render).
@@ -40,8 +40,12 @@ function pickConvIdBuggy(piRef: string | null, conversationId: string | null): s
   return piRef || conversationId || "fallback-uuid";
 }
 
-function pickConvIdFixed(piRef: string | null, conversationId: string | null): string {
-  return conversationId || piRef || "fallback-uuid";
+function pickConvIdFixed(
+  piRef: string | null,
+  conversationId: string | null,
+  storeCurrentId: string | null,
+): string | null {
+  return conversationId || piRef || storeCurrentId || null;
 }
 
 describe("chat-switch save race (issue #3636 candidate, PR #3600)", () => {
@@ -73,7 +77,7 @@ describe("chat-switch save race (issue #3636 candidate, PR #3600)", () => {
     const conversationIdState = "A";
     const messagesBeingSaved = ["A's messages"];
 
-    const convId = pickConvIdFixed(piSessionIdRefCurrent, conversationIdState);
+    const convId = pickConvIdFixed(piSessionIdRefCurrent, conversationIdState, null);
 
     // Now the save targets A (matches the messages payload).
     expect(convId).toBe("A");
@@ -91,14 +95,19 @@ describe("chat-switch save race (issue #3636 candidate, PR #3600)", () => {
     const piSessionIdRefCurrent = "C";
     const conversationIdState = null;
 
-    const convId = pickConvIdFixed(piSessionIdRefCurrent, conversationIdState);
+    const convId = pickConvIdFixed(piSessionIdRefCurrent, conversationIdState, null);
 
     expect(convId).toBe("C");
-    expect(convId).not.toBe("fallback-uuid");
+    expect(convId).not.toBeNull();
   });
 
-  it("FIX: mints a fresh uuid only when both are null (first send before any state)", () => {
-    const convId = pickConvIdFixed(null, null);
-    expect(convId).toBe("fallback-uuid");
+  it("FIX: uses store.currentId when state/ref are both transiently empty", () => {
+    const convId = pickConvIdFixed(null, null, "D");
+    expect(convId).toBe("D");
+  });
+
+  it("FIX: returns null when no stable id exists instead of minting a phantom uuid", () => {
+    const convId = pickConvIdFixed(null, null, null);
+    expect(convId).toBeNull();
   });
 });

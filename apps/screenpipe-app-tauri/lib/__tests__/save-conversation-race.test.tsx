@@ -219,6 +219,49 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
     expect(saveCalls[0].id).toBe("fresh-sid");
   });
 
+  it("uses store.currentId before inventing a stray conversation id", async () => {
+    const messages = [{ id: "u1", role: "user" as const, content: "hello", timestamp: 1 }];
+    useChatStore.setState({ sessions: {}, currentId: "store-sid", panelSessionId: null });
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: null,
+        initialPiSessionId: "",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0].id).toBe("store-sid");
+  });
+
+  it("skips the save when no stable conversation id exists", async () => {
+    const messages = [{ id: "u1", role: "user" as const, content: "hello", timestamp: 1 }];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: null,
+        initialPiSessionId: "",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[chat] skipping saveConversation without a stable conversation id",
+    );
+    warnSpy.mockRestore();
+  });
+
   it("preserves browserState from the shadow cache when the disk file does not exist yet", async () => {
     const messages = [{ id: "u1", role: "user" as const, content: "hello", timestamp: 1 }];
     setCachedBrowserState("fresh-sid", {

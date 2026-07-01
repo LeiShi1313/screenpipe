@@ -467,13 +467,10 @@ jobs:
         target: x86_64-unknown-linux-gnu
         cache-bin: false
 
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      run: |
-        echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+    # sccache's GitHub cache backend has been intermittently failing DNS /
+    # cache-service startup on Actions, which kills the compiler wrapper
+    # before Linux E2E even reaches the build. Keep rust-cache below (best
+    # effort only) but do not put sccache on the critical build path here.
 
     - name: Rust cache
       # cache restore/save is an optimization only; a transient GHA cache
@@ -590,14 +587,10 @@ jobs:
         target: aarch64-apple-darwin
         cache-bin: false
 
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      shell: bash
-      run: |
-        echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+    # sccache's GitHub cache backend has been intermittently failing DNS /
+    # cache-service startup on Actions, which kills the compiler wrapper
+    # before macOS E2E reaches the build. Keep rust-cache below (best effort
+    # only) but do not put sccache on the critical build path here.
 
     - name: Rust cache
       # cache restore/save is an optimization only; a transient GHA cache

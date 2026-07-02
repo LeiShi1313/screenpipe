@@ -229,6 +229,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
   const { settings, loadUser, updateSettings } = useSettings();
   const hasAdvanced = useRef(false);
   const reverifiedRef = useRef(false);
+  const freshSessionLoginRef = useRef(false);
   const [showSkip, setShowSkip] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [rechecking, setRechecking] = useState(false);
@@ -285,6 +286,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
   const useDifferentAccount = useCallback(async () => {
     posthog.capture("onboarding_login_switch_account");
     reverifiedRef.current = false;
+    freshSessionLoginRef.current = true;
     // Match the entitlement gate's switch-account flow: clear local auth state,
     // then open a fresh browser session so Google shows the account chooser
     // instead of silently reusing the previous session.
@@ -305,8 +307,11 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
   const handleLogin = useCallback(() => {
     posthog.capture("onboarding_login_clicked");
     // Open login in an in-app WebView instead of Safari so we can intercept
-    // the screenpipe:// deep-link redirect (Safari blocks custom-scheme redirects)
-    commands.openLoginWindow(null);
+    // the screenpipe:// deep-link redirect (Safari blocks custom-scheme redirects).
+    // If the user asked to switch accounts and then cancelled the auto-opened
+    // window, the manual sign-in must also be fresh-session — otherwise Google
+    // silently reuses the previous session and re-logs the same account.
+    commands.openLoginWindow(freshSessionLoginRef.current ? true : null);
   }, []);
 
   const handleSkip = useCallback(() => {

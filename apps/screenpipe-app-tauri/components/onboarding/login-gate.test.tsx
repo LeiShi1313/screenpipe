@@ -124,6 +124,19 @@ describe("onboarding login gate", () => {
     expect(mocks.openLoginWindow).toHaveBeenCalledWith(true);
   });
 
+  it("manual sign-in after switching accounts stays fresh-session", async () => {
+    mocks.settings = { user: { token: "t5", id: "u5", email: "x@y.com", cloud_subscribed: true } };
+    mocks.hasAppEntitlement.mockReturnValue(false);
+    const { rerender } = render(<OnboardingLogin handleNextSlide={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /use a different account/i }));
+    await waitFor(() => expect(mocks.openLoginWindow).toHaveBeenCalledWith(true));
+    // user cancelled the auto-opened window; settings now hold the cleared user
+    mocks.settings = { user: null };
+    rerender(<OnboardingLogin handleNextSlide={vi.fn()} />);
+    fireEvent.click(screen.getByText(/^sign in$/i));
+    expect(mocks.openLoginWindow).toHaveBeenLastCalledWith(true);
+  });
+
   it("shows the sign-in button when not signed in", () => {
     mocks.settings = { user: null };
     mocks.hasAppEntitlement.mockReturnValue(false);

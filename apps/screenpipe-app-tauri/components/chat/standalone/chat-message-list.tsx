@@ -102,9 +102,22 @@ export function ChatMessageList({
           const renderItems = buildCollapsedSteerRenderItems(visibleMessages, {
             canCollapseSteerWork: !isLoading && !isStreaming && !activeSourceFooterMessageId,
           });
+          // Fall back to the newest visible assistant message — but only when
+          // it is also the newest assistant message overall. Right after a
+          // send, the fresh assistant row is still the invisible
+          // "Processing..." placeholder (filtered above), so the newest
+          // *visible* assistant is the previous turn's completed answer;
+          // marking that one live would hide its action bar and tick a bogus
+          // "Working for …" header on it until the first token arrives.
+          const lastVisibleAssistantId = [...visibleMessages]
+            .reverse()
+            .find((candidate) => candidate.role === "assistant")?.id;
+          const lastAssistantId = [...messages]
+            .reverse()
+            .find((candidate) => candidate.role === "assistant")?.id;
           const activeAssistantMessageId =
             activeSourceFooterMessageId ??
-            [...visibleMessages].reverse().find((candidate) => candidate.role === "assistant")?.id;
+            (lastVisibleAssistantId === lastAssistantId ? lastVisibleAssistantId : undefined);
 
           return renderItems.map((item) => {
             if (item.type === "collapsed-steer-work") {

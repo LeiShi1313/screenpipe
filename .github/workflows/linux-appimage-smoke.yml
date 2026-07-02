@@ -251,8 +251,8 @@ jobs:
               squashfs-root/usr/bin/ffprobe -version
               squashfs-root/usr/bin/tesseract --version
               # The app relocates bundled bun out of the AppImage mount before
-              # executing it. In-place execution keeps bun's $ORIGIN/../lib
-              # RUNPATH pointed at the AppImage bundle and can SIGSEGV on newer
+              # executing it. In-place execution keeps the relative RUNPATH
+              # pointed at the AppImage bundle and can SIGSEGV on newer
               # hosts. Mirror the runtime path here instead of asserting the
               # extracted in-place binary is directly runnable.
               install -d /tmp/smoke-bun

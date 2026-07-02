@@ -6,9 +6,17 @@ import type { Options } from '@wdio/types';
 import { mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Agent, setGlobalDispatcher } from 'undici';
 import { startApp, stopApp, WEBDRIVER_PORT } from './helpers/app-launcher.js';
 import { getReporters, getMochaTimeout } from './helpers/reporter-utils.js';
 import { TestRecorder } from './helpers/test-recorder.js';
+
+// Codex/Desktop can install a wrapped undici dispatcher in the parent process.
+// WebdriverIO passes the current dispatcher explicitly into every WebDriver
+// fetch; that wrapper rejects the explicit `dispatcher` option with
+// UND_ERR_INVALID_ARG. E2E only talks to the local Tauri WebDriver server, so use
+// a plain Agent here.
+setGlobalDispatcher(new Agent());
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

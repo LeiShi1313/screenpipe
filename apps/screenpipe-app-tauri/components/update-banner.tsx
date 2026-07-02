@@ -5,7 +5,6 @@ import { Sparkles, X } from "lucide-react";
 import { create } from "zustand";
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { commands } from "@/lib/utils/tauri";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { platform, arch } from "@tauri-apps/plugin-os";
@@ -115,18 +114,6 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
           });
           return;
         }
-        toast({
-          title: "downloading update...",
-          description: "please wait while the update is downloaded",
-          duration: Infinity,
-        });
-
-        // Stop screenpipe before update on Windows
-        try {
-          await commands.stopScreenpipe();
-        } catch (e) {
-          console.warn("failed to stop screenpipe:", e);
-        }
 
         // Get or check for the update
         let update = pendingUpdate;
@@ -135,21 +122,65 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
           update = await check(checkOptions as any);
         }
 
-        if (update?.available) {
-
-
-          await update.downloadAndInstall(undefined, downloadOptions);
-
-          toast({
-            title: "update complete",
-            description: "relaunching application",
-            duration: 3000,
+        if (!update?.available) {
+          // The visible banner can outlive the actual remote update state
+          // (failed/retracted/stale check). Don't stop recording or try a bare
+          // relaunch in that case — clear the banner and let the normal
+          // background checker re-surface a real update later.
+          useUpdateBanner.setState({
+            isVisible: false,
+            updateInfo: null,
+            isInstalling: false,
+            pendingUpdate: null,
+            authRequired: null,
           });
+          toast({
+            title: "update no longer available",
+            description: "screenpipe will check again in the background",
+          });
+          return;
         }
 
-        // Fallback relaunch only if installer didn't run (no update available
-        // at click time); normal path: downloadAndInstall already exited.
-        await relaunch();
+        toast({
+          title: "downloading update...",
+          description: "please wait while the update is downloaded",
+          duration: Infinity,
+        });
+
+        // Stop screenpipe only once we know an installer is actually about to
+        // run. This avoids stale-banner clicks creating recording gaps.
+        try {
+          await commands.stopScreenpipe();
+        } catch (e) {
+          console.warn("failed to stop screenpipe:", e);
+        }
+
+        await update.downloadAndInstall(undefined, downloadOptions);
+
+        // The Windows installer usually exits the process internally. If it
+        // returns instead, use the backend restart path that sets
+        // QUIT_REQUESTED rather than the old bare relaunch fallback.
+        const restartRes = await commands.restartForUpdate(60);
+        const restartOutcome =
+          restartRes.status === "ok" ? restartRes.data : "errored";
+        if (restartOutcome !== "proceed") {
+          setIsInstalling(false);
+          toast({
+            title: "screenpipe is still starting up",
+            description:
+              restartOutcome === "errored"
+                ? "startup error — open settings to see details before restarting"
+                : "finish startup first, then click update again",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        toast({
+          title: "update complete",
+          description: "relaunching application",
+          duration: 3000,
+        });
       } else {
         // macOS/Linux: bundle already staged by backend. `restart_for_update`
         // gates internally, so no separate `awaitSafeRestart` call needed.

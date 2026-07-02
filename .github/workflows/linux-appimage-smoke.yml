@@ -195,6 +195,14 @@ jobs:
                 squashfs-root/usr/lib/libsharpyuv.so* \
                 squashfs-root/usr/lib/libavif.so*
 
+          # linuxdeploy rewrites the bundled bun sidecar with
+          # RUNPATH=$ORIGIN/../lib during AppImage assembly. That makes bun load
+          # the AppImage's bundled libc/libstdc++ set and SIGSEGV on newer hosts
+          # (Debian 13 Sentry/CI repro). Restore the pristine baseline bun that
+          # pre_build.js downloaded so screenpipe can continue scrubbing
+          # LD_LIBRARY_PATH and run bun against the host runtime.
+          install -m 0755 src-tauri/bun-x86_64-unknown-linux-gnu squashfs-root/usr/bin/bun
+
           # Guard the libavif/libsharpyuv fix: an orphan bundled libsharpyuv
           # shadows the host one and breaks Arch (libavif 1.4.2) with
           # "undefined symbol: SharpYuvConvertWithOptions". Fail if either
@@ -250,15 +258,7 @@ jobs:
               squashfs-root/usr/bin/ffmpeg -version
               squashfs-root/usr/bin/ffprobe -version
               squashfs-root/usr/bin/tesseract --version
-              # The app relocates bundled bun out of the AppImage mount before
-              # executing it. In-place execution keeps the relative RUNPATH
-              # pointed at the AppImage bundle and can SIGSEGV on newer
-              # hosts. Mirror the runtime path here instead of asserting the
-              # extracted in-place binary is directly runnable.
-              install -d /tmp/smoke-bun
-              cp squashfs-root/usr/bin/bun /tmp/smoke-bun/bun
-              chmod +x /tmp/smoke-bun/bun
-              env -u LD_LIBRARY_PATH /tmp/smoke-bun/bun --version
+              env -u LD_LIBRARY_PATH squashfs-root/usr/bin/bun --version
 
               check_ldd() {
                 local target="$1"

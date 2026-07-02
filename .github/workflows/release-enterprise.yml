@@ -486,6 +486,7 @@ jobs:
                   squashfs-root/usr/lib/libpcre2-8.so* \
                   squashfs-root/usr/lib/libsharpyuv.so* \
                   squashfs-root/usr/lib/libavif.so*
+            install -m 0755 src-tauri/bun-x86_64-unknown-linux-gnu squashfs-root/usr/bin/bun
             echo "Removed bundled GLib libs, repacking AppImage..."
             ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
             rm -rf squashfs-root

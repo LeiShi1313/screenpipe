@@ -2105,7 +2105,10 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert!(!e.on_fatal(t0));
         assert!(!e.on_fatal(t0 + Duration::from_secs(30)));
-        assert!(!e.on_fatal(t0 + Duration::from_secs(60)), "min-fatals met but wall not elapsed");
+        assert!(
+            !e.on_fatal(t0 + Duration::from_secs(60)),
+            "min-fatals met but wall not elapsed"
+        );
         assert!(
             e.on_fatal(t0 + PERSISTENT_FAILURE_AFTER_WALL),
             "fires once the run spans the wall threshold"

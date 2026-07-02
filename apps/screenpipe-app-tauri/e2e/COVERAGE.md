@@ -45,7 +45,7 @@ pass/fail/skip counts.
 | os-integration | 4 specs / 16 tests / 15.1 pts | 4 specs / 3 tests / 0.9 pts | - |
 | performance | 2 specs / 43 tests / 43.0 pts | 4 specs / 33 tests / 29.5 pts | 1 specs / 28 tests / 28.0 pts |
 | pipes | 2 specs / 11 tests / 11.0 pts | 2 specs / 11 tests / 11.0 pts | 2 specs / 11 tests / 11.0 pts |
-| real-ui-e2e | 32 specs / 106 tests / 85.0 pts | 33 specs / 93 tests / 74.5 pts | 28 specs / 86 tests / 72.1 pts |
+| real-ui-e2e | 31 specs / 105 tests / 84.5 pts | 32 specs / 92 tests / 74.0 pts | 28 specs / 86 tests / 72.1 pts |
 | settings | 12 specs / 29 tests / 26.9 pts | 13 specs / 23 tests / 20.2 pts | 11 specs / 21 tests / 18.9 pts |
 | storage-privacy | 6 specs / 20 tests / 19.1 pts | 5 specs / 12 tests / 11.1 pts | 4 specs / 12 tests / 11.1 pts |
 | tauri-command | 8 specs / 17 tests / 10.3 pts | 9 specs / 19 tests / 10.8 pts | 8 specs / 17 tests / 10.3 pts |
@@ -100,7 +100,7 @@ pass/fail/skip counts.
 | audio-fallback.spec.ts | macos | audio-device, settings, notifications | audio-device-health, settings-recording, notifications | medium | conditional | real-user-flow | 1 | Opt-in macOS cloud audio fallback seed. |
 | brain-section.spec.ts | windows, macos, linux | real-ui-e2e | brain, artifacts, memories, viewer-deeplink | medium | strong | real-user-flow | 10 | Brain coverage for filters, search, delete flows, selection pruning, add memory, and inline artifact markdown preview. |
 | chat-composer-isolation.spec.ts | windows, macos, linux | chat-ai, real-ui-e2e | chat, chat-drafts | medium | partial | mixed | 1 | Composer draft isolation across conversations. |
-| chat-connections-context-duplicate.spec.ts | windows, macos | chat-ai, real-ui-e2e | chat | medium | partial | mixed | 1 | Reproducer for #4689: connections-context blob must not spawn a duplicate chat or leak into titles. Skipped on Linux: background persist never lands on WebKitGTK. |
+| chat-connections-context-duplicate.spec.ts | windows, macos | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Connections-context wrapper stripping regression: echoed user turns must persist and title chats from the real request, not the injected integrations blob. Skipped on Linux: the background persist never lands on WebKitGTK. |
 | chat-newchat-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Synthetic chat event regression for duplicate sidebar rows. |
 | chat-parallel-jobs-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Parallel auto-send prefill dedupe regression. |
 | chat-prefill-context-leak.spec.ts | windows, macos, linux | chat-ai | chat, chat-prefill | medium | partial | synthetic | 1 | Pending auto-send prefill must render only the clean prompt, not the internal model context, as the user message. |

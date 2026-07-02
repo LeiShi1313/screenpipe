@@ -462,8 +462,8 @@ jobs:
 
           bunx tauri build -v \
             --target x86_64-unknown-linux-gnu \
-            --no-default-features \
-            --features custom-protocol,enterprise-build,redact-onnx-cpu
+            --features custom-protocol,enterprise-build,redact-onnx-cpu \
+            -- --no-default-features
 
           # Strip bundled GLib/libmount/libblkid/libpcre2 (ABI mismatch on newer
           # distros) plus libavif/libsharpyuv: linuxdeploy bundles the old Ubuntu

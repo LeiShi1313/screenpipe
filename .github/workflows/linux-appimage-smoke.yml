@@ -169,8 +169,8 @@ jobs:
 
           bunx tauri build -v \
             --target x86_64-unknown-linux-gnu \
-            --no-default-features \
-            --features custom-protocol,enterprise-build,redact-onnx-cpu
+            --features custom-protocol,enterprise-build,redact-onnx-cpu \
+            -- --no-default-features
 
       - name: Repack AppImage with bundled runtime deps
         working-directory: apps/screenpipe-app-tauri

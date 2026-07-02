@@ -192,9 +192,9 @@ jobs:
             target: aarch64-pc-windows-msvc
             os_type: "windows"
           - platform: "ubuntu-24.04"
-            args: "--target x86_64-unknown-linux-gnu --no-default-features --features custom-protocol,redact-onnx-cpu"
+            args: "--target x86_64-unknown-linux-gnu --features custom-protocol,redact-onnx-cpu -- --no-default-features"
             target: x86_64-unknown-linux-gnu
-            tauri-args: "--target x86_64-unknown-linux-gnu --no-default-features --features custom-protocol,official-build,redact-onnx-cpu"
+            tauri-args: "--target x86_64-unknown-linux-gnu --features custom-protocol,official-build,redact-onnx-cpu -- --no-default-features"
             os_type: "linux"
 
     runs-on: ${{ matrix.platform == 'windows-desktop-test' && fromJSON('["self-hosted", "windows-desktop-test"]') || matrix.platform }}

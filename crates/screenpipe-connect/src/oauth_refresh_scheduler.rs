@@ -121,6 +121,13 @@ pub fn parse_oauth_key(key: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+fn should_skip_scheduler_refresh(integration_id: &str) -> bool {
+    // ChatGPT OAuth uses its own direct refresh flow (`chatgpt_oauth.rs`)
+    // and stores a legacy `oauth:chatgpt` secret. The generic proxy-backed
+    // refresh path rejects that provider id, so the scheduler must ignore it.
+    integration_id == "chatgpt"
+}
+
 // ---------------------------------------------------------------------------
 // Refresh adapter — injectable for tests
 // ---------------------------------------------------------------------------
@@ -326,6 +333,9 @@ async fn tick(
             Some(parts) => parts,
             None => continue,
         };
+        if should_skip_scheduler_refresh(integration_id) {
+            continue;
+        }
 
         // Honour backoff for this key.
         {
@@ -539,6 +549,12 @@ mod tests {
         assert_eq!(parse_oauth_key("api_auth_key"), None);
     }
 
+    #[test]
+    fn skip_scheduler_refresh_for_legacy_chatgpt_secret() {
+        assert!(should_skip_scheduler_refresh("chatgpt"));
+        assert!(!should_skip_scheduler_refresh("google-calendar"));
+    }
+
     // -- tick (integration: in-mem store + recording runner) -----------------
 
     /// Mock `RefreshRunner` that records every call and emits a configurable
@@ -615,6 +631,26 @@ mod tests {
             .set_json(
                 "oauth:google-calendar",
                 &token(true, Some(now + HOUR), Some(now - 60)),
+            )
+            .await
+            .unwrap();
+
+        let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
+        let metrics = Arc::new(MetricsInner::default());
+        let failures = Arc::new(Mutex::new(HashMap::new()));
+        tick(&store, &runner, &metrics, &failures, &empty_policies()).await;
+
+        assert_eq!(metrics.snapshot().refreshes_attempted, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_legacy_chatgpt_secret_even_when_due() {
+        let store = mem_store().await;
+        let now = unix_now();
+        store
+            .set_json(
+                "oauth:chatgpt",
+                &token(true, Some(now - 60), Some(now - HOUR)),
             )
             .await
             .unwrap();

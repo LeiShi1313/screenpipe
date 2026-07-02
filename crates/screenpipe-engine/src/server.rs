@@ -119,7 +119,7 @@ pub async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 // Re-export types from route modules for backward compatibility
 pub use crate::routes::content::{ContentItem, PaginatedResponse};
 pub use crate::routes::health::{HealthCheckResponse, MonitorInfo};
-pub use crate::routes::search::SearchResponse;
+pub use crate::routes::search::{SearchCacheEntry, SearchResponse};
 
 // Re-export handlers that are referenced from lib.rs
 pub use crate::routes::health::{
@@ -129,7 +129,7 @@ pub use crate::routes::health::{
 pub type FrameImageCache = LruCache<i64, (String, std::time::Instant)>;
 
 /// Cache key for search results (hash of query parameters)
-pub type SearchCache = MokaCache<u64, Arc<SearchResponse>>;
+pub type SearchCache = MokaCache<u64, Arc<SearchCacheEntry>>;
 
 pub struct AppState {
     pub db: Arc<DatabaseManager>,

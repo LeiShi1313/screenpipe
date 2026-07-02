@@ -13,12 +13,7 @@
 import { existsSync } from "node:fs";
 import { saveScreenshot } from "../helpers/screenshot-utils.js";
 import { openHomeWindow, waitForAppReady, t } from "../helpers/test-utils.js";
-import {
-  closeWindow,
-  invokeOrThrow,
-  waitForWindowHandle,
-  waitForWindowUrl,
-} from "../helpers/tauri.js";
+import { closeWindow, invokeOrThrow, waitForWindowHandle, waitForWindowUrl } from "../helpers/tauri.js";
 
 const isWindows = process.platform === "win32";
 const SEARCH_QUERY = "screenpipe windows ux journey";
@@ -30,29 +25,17 @@ type MainWindowLabel = (typeof MAIN_WINDOW_LABELS)[number];
 
 async function appServerRequest(
   path: string,
-  options: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  } = {},
+  options: { method?: string; headers?: Record<string, string>; body?: string } = {},
 ): Promise<{ ok: boolean; status: number; text: string }> {
   return (await browser.executeAsync(
     (
       url: string,
-      request: {
-        method?: string;
-        headers?: Record<string, string>;
-        body?: string;
-      },
+      request: { method?: string; headers?: Record<string, string>; body?: string },
       done: (r: { ok: boolean; status: number; text: string }) => void,
     ) => {
       void fetch(url, request)
         .then(async (response) =>
-          done({
-            ok: response.ok,
-            status: response.status,
-            text: await response.text(),
-          }),
+          done({ ok: response.ok, status: response.status, text: await response.text() }),
         )
         .catch((error) =>
           done({
@@ -67,11 +50,7 @@ async function appServerRequest(
   )) as { ok: boolean; status: number; text: string };
 }
 
-async function postNotification(
-  id: string,
-  title: string,
-  body: string,
-): Promise<void> {
+async function postNotification(id: string, title: string, body: string): Promise<void> {
   const response = await appServerRequest("/notify", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -97,10 +76,7 @@ async function openPipesView(): Promise<void> {
   await navPipes.click();
 }
 
-async function clickFirstDisplayed(
-  selector: string,
-  timeoutMs = t(15_000),
-): Promise<void> {
+async function clickFirstDisplayed(selector: string, timeoutMs = t(15_000)): Promise<void> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -117,10 +93,7 @@ async function clickFirstDisplayed(
   throw new Error(`No displayed element found for ${selector}`);
 }
 
-async function clickFirstButtonWithText(
-  text: string,
-  timeoutMs = t(15_000),
-): Promise<void> {
+async function clickFirstButtonWithText(text: string, timeoutMs = t(15_000)): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const expected = text.toLowerCase();
 
@@ -129,9 +102,7 @@ async function clickFirstButtonWithText(
     for (const button of buttons) {
       if (!(await button.isDisplayed().catch(() => false))) continue;
 
-      const label = (await button.getText().catch(() => ""))
-        .trim()
-        .toLowerCase();
+      const label = (await button.getText().catch(() => "")).trim().toLowerCase();
       if (label !== expected) continue;
 
       await button.scrollIntoView();
@@ -151,9 +122,7 @@ async function waitForSearchResultsSurface(): Promise<void> {
       const state = (await browser.execute(
         (selector: string, query: string) => {
           const input = document.querySelector<HTMLInputElement>(selector);
-          const hasResultRegion = Array.from(
-            document.querySelectorAll<HTMLElement>("div"),
-          ).some((node) => {
+          const hasResultRegion = Array.from(document.querySelectorAll<HTMLElement>("div")).some((node) => {
             const className = node.getAttribute("class") ?? "";
             return (
               className.includes("flex-1") &&
@@ -166,9 +135,7 @@ async function waitForSearchResultsSurface(): Promise<void> {
           return {
             inputValue: input?.value ?? "",
             hasResultRegion,
-            hasEmptyState: bodyText.includes(
-              `no results for "${query.toLowerCase()}"`,
-            ),
+            hasEmptyState: bodyText.includes(`no results for "${query.toLowerCase()}"`),
           };
         },
         SEARCH_INPUT_SELECTOR,
@@ -179,16 +146,12 @@ async function waitForSearchResultsSurface(): Promise<void> {
         hasEmptyState: boolean;
       };
 
-      return (
-        state.inputValue === SEARCH_QUERY &&
-        (state.hasResultRegion || state.hasEmptyState)
-      );
+      return state.inputValue === SEARCH_QUERY && (state.hasResultRegion || state.hasEmptyState);
     },
     {
       timeout: t(20_000),
       interval: 250,
-      timeoutMsg:
-        "Search did not show a results or empty-state surface after typing",
+      timeoutMsg: "Search did not show a results or empty-state surface after typing",
     },
   );
 }
@@ -199,9 +162,7 @@ async function expectTimelineShell(): Promise<void> {
 
   await browser.waitUntil(
     async () => {
-      const bodyText = (
-        (await browser.execute(() => document.body.innerText || "")) as string
-      ).toLowerCase();
+      const bodyText = ((await browser.execute(() => document.body.innerText || "")) as string).toLowerCase();
       return (
         bodyText.includes("screen recording is off") ||
         bodyText.includes("recording... timeline will appear soon") ||
@@ -218,20 +179,21 @@ async function expectTimelineShell(): Promise<void> {
 }
 
 async function getBodyTextLower(): Promise<string> {
-  return (
-    (await browser.execute(() => document.body.innerText || "")) as string
-  ).toLowerCase();
+  return ((await browser.execute(() => document.body.innerText || "")) as string).toLowerCase();
 }
 
 async function waitForBodyText(
   predicate: (bodyText: string) => boolean,
   timeoutMsg: string,
 ): Promise<void> {
-  await browser.waitUntil(async () => predicate(await getBodyTextLower()), {
-    timeout: t(20_000),
-    interval: 500,
-    timeoutMsg,
-  });
+  await browser.waitUntil(
+    async () => predicate(await getBodyTextLower()),
+    {
+      timeout: t(20_000),
+      interval: 500,
+      timeoutMsg,
+    },
+  );
 }
 
 function hasLiveMeetingNoteState(bodyText: string): boolean {
@@ -256,16 +218,12 @@ function hasLiveMeetingNoteState(bodyText: string): boolean {
 async function switchIsChecked(selector: string): Promise<boolean> {
   return (await browser.execute(
     (switchSelector: string) =>
-      document.querySelector(switchSelector)?.getAttribute("aria-checked") ===
-      "true",
+      document.querySelector(switchSelector)?.getAttribute("aria-checked") === "true",
     selector,
   )) as boolean;
 }
 
-async function setSwitchChecked(
-  selector: string,
-  checked: boolean,
-): Promise<void> {
+async function setSwitchChecked(selector: string, checked: boolean): Promise<void> {
   const toggle = await $(selector);
   await toggle.waitForExist({ timeout: t(15_000) });
   await toggle.scrollIntoView();
@@ -291,10 +249,7 @@ async function isDataStateSwitchChecked(selector: string): Promise<boolean> {
   return (await toggle.getAttribute("data-state")) === "checked";
 }
 
-async function setDataStateSwitchChecked(
-  selector: string,
-  checked: boolean,
-): Promise<void> {
+async function setDataStateSwitchChecked(selector: string, checked: boolean): Promise<void> {
   const toggle = await $(selector);
   await toggle.waitForDisplayed({ timeout: t(15_000) });
 
@@ -327,9 +282,7 @@ async function stopMeetingIfVisible(): Promise<void> {
 }
 
 async function shortcutRecorderForTitle(title: string) {
-  const row = await $(
-    `//h4[normalize-space(.)="${title}"]/ancestor::div[contains(@class, "justify-between")][1]`,
-  );
+  const row = await $(`//h4[normalize-space(.)="${title}"]/ancestor::div[contains(@class, "justify-between")][1]`);
   await row.waitForDisplayed({ timeout: t(15_000) });
 
   const recorder = await row.$('.//button[not(@role="switch")]');
@@ -337,19 +290,13 @@ async function shortcutRecorderForTitle(title: string) {
   return recorder;
 }
 
-async function expectShortcutReminderVisible(
-  expected: boolean,
-  timeoutMs = t(15_000),
-): Promise<void> {
+async function expectShortcutReminderVisible(expected: boolean, timeoutMs = t(15_000)): Promise<void> {
   await browser.waitUntil(
     async () => {
       if ((await browser.getWindowHandles()).includes("home")) {
         await browser.switchToWindow("home").catch(() => {});
       }
-      return (
-        (await invokeOrThrow<boolean>("e2e_shortcut_reminder_visible")) ===
-        expected
-      );
+      return (await invokeOrThrow<boolean>("e2e_shortcut_reminder_visible")) === expected;
     },
     {
       timeout: timeoutMs,
@@ -367,16 +314,12 @@ async function waitForSearchInputFocus(timeoutMs = t(15_000)): Promise<void> {
     async () =>
       (await browser.execute(() => {
         const active = document.activeElement;
-        return (
-          active instanceof HTMLInputElement &&
-          active.placeholder.toLowerCase().includes("search memory")
-        );
+        return active instanceof HTMLInputElement && active.placeholder.toLowerCase().includes("search memory");
       })) as boolean,
     {
       timeout: timeoutMs,
       interval: 250,
-      timeoutMsg:
-        "Search input did not receive focus after opening from the shortcut reminder",
+      timeoutMsg: "Search input did not receive focus after opening from the shortcut reminder",
     },
   );
 }
@@ -389,9 +332,7 @@ async function expectChatComposerAcceptsTyping(message: string): Promise<void> {
   expect(await composer.getValue()).toContain(message);
 }
 
-async function waitForAnyMainWindowHandle(
-  timeoutMs = t(20_000),
-): Promise<MainWindowLabel> {
+async function waitForAnyMainWindowHandle(timeoutMs = t(20_000)): Promise<MainWindowLabel> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -402,22 +343,14 @@ async function waitForAnyMainWindowHandle(
     await browser.pause(t(250));
   }
 
-  throw new Error(
-    `Main window handle did not appear (${MAIN_WINDOW_LABELS.join(", ")})`,
-  );
+  throw new Error(`Main window handle did not appear (${MAIN_WINDOW_LABELS.join(", ")})`);
 }
 
-async function expectCurrentSettingsSection(
-  section: string,
-  timeoutMs = t(15_000),
-): Promise<void> {
+async function expectCurrentSettingsSection(section: string, timeoutMs = t(15_000)): Promise<void> {
   await browser.waitUntil(
     async () => {
       const url = new URL(await browser.getUrl());
-      return (
-        url.pathname === "/settings" &&
-        url.searchParams.get("section") === section
-      );
+      return url.pathname === "/settings" && url.searchParams.get("section") === section;
     },
     {
       timeout: timeoutMs,
@@ -463,9 +396,7 @@ describe("Windows user journey", function () {
     await searchInput.setValue(SEARCH_QUERY);
     await waitForSearchResultsSurface();
 
-    const searchScreenshot = await saveScreenshot(
-      "windows-user-journey-search",
-    );
+    const searchScreenshot = await saveScreenshot("windows-user-journey-search");
     expect(existsSync(searchScreenshot)).toBe(true);
 
     await browser.keys(["Escape"]);
@@ -477,9 +408,7 @@ describe("Windows user journey", function () {
     await timelineNav.click();
     await expectTimelineShell();
 
-    const timelineScreenshot = await saveScreenshot(
-      "windows-user-journey-timeline",
-    );
+    const timelineScreenshot = await saveScreenshot("windows-user-journey-timeline");
     expect(existsSync(timelineScreenshot)).toBe(true);
 
     const homeNav = await $('[data-testid="nav-home"]');
@@ -532,9 +461,7 @@ describe("Windows user journey", function () {
         "Windows-specific AEC mode did not appear after opening the echo cancellation picker",
       );
 
-      const recordingScreenshot = await saveScreenshot(
-        "windows-user-journey-recording-settings",
-      );
+      const recordingScreenshot = await saveScreenshot("windows-user-journey-recording-settings");
       expect(existsSync(recordingScreenshot)).toBe(true);
     } finally {
       if (!audioWasEnabled) {
@@ -568,9 +495,7 @@ describe("Windows user journey", function () {
         "Manual meeting did not enter the visible live recording note state",
       );
 
-      const liveMeetingScreenshot = await saveScreenshot(
-        "windows-user-journey-meeting-live",
-      );
+      const liveMeetingScreenshot = await saveScreenshot("windows-user-journey-meeting-live");
       expect(existsSync(liveMeetingScreenshot)).toBe(true);
 
       await clickFirstButtonWithText("stop", t(15_000));
@@ -580,9 +505,7 @@ describe("Windows user journey", function () {
         "Manual meeting did not transition to the saved state after stop",
       );
 
-      const savedMeetingScreenshot = await saveScreenshot(
-        "windows-user-journey-meeting-saved",
-      );
+      const savedMeetingScreenshot = await saveScreenshot("windows-user-journey-meeting-saved");
       expect(existsSync(savedMeetingScreenshot)).toBe(true);
     } finally {
       await stopMeetingIfVisible().catch(() => {});
@@ -611,9 +534,7 @@ describe("Windows user journey", function () {
     );
 
     const recorder = await shortcutRecorderForTitle("open search");
-    const initialShortcutLabel = (await recorder.getText())
-      .replace(/\s+/g, " ")
-      .trim();
+    const initialShortcutLabel = (await recorder.getText()).replace(/\s+/g, " ").trim();
 
     await recorder.scrollIntoView();
     await recorder.click();
@@ -623,9 +544,7 @@ describe("Windows user journey", function () {
       "Shortcut recorder did not enter the visible key-capture state",
     );
 
-    const recordingScreenshot = await saveScreenshot(
-      "windows-user-journey-shortcut-recording",
-    );
+    const recordingScreenshot = await saveScreenshot("windows-user-journey-shortcut-recording");
     expect(existsSync(recordingScreenshot)).toBe(true);
 
     await browser.keys(["Escape"]);
@@ -635,20 +554,15 @@ describe("Windows user journey", function () {
       {
         timeout: t(10_000),
         interval: 250,
-        timeoutMsg:
-          "Shortcut recorder stayed in key-capture state after Escape",
+        timeoutMsg: "Shortcut recorder stayed in key-capture state after Escape",
       },
     );
 
     const restoredRecorder = await shortcutRecorderForTitle("open search");
-    const restoredShortcutLabel = (await restoredRecorder.getText())
-      .replace(/\s+/g, " ")
-      .trim();
+    const restoredShortcutLabel = (await restoredRecorder.getText()).replace(/\s+/g, " ").trim();
     expect(restoredShortcutLabel).toBe(initialShortcutLabel);
 
-    const shortcutsScreenshot = await saveScreenshot(
-      "windows-user-journey-shortcuts",
-    );
+    const shortcutsScreenshot = await saveScreenshot("windows-user-journey-shortcuts");
     expect(existsSync(shortcutsScreenshot)).toBe(true);
   });
 
@@ -693,18 +607,10 @@ describe("Windows user journey", function () {
         async () => {
           const state = (await browser.execute(() => ({
             path: window.location.pathname,
-            hasTimelineButton: !!document.querySelector(
-              'button[title="Open timeline"]',
-            ),
-            hasChatButton: !!document.querySelector(
-              'button[title="Open chat"]',
-            ),
-            hasSearchButton: !!document.querySelector(
-              'button[title="Open search"]',
-            ),
-            hasHideButton: !!document.querySelector(
-              'button[title="Hide shortcut reminder"]',
-            ),
+            hasTimelineButton: !!document.querySelector('button[title="Open timeline"]'),
+            hasChatButton: !!document.querySelector('button[title="Open chat"]'),
+            hasSearchButton: !!document.querySelector('button[title="Open search"]'),
+            hasHideButton: !!document.querySelector('button[title="Hide shortcut reminder"]'),
           }))) as {
             path: string;
             hasTimelineButton: boolean;
@@ -724,14 +630,11 @@ describe("Windows user journey", function () {
         {
           timeout: t(15_000),
           interval: 250,
-          timeoutMsg:
-            "Shortcut reminder window did not render its visible shortcut controls",
+          timeoutMsg: "Shortcut reminder window did not render its visible shortcut controls",
         },
       );
 
-      const reminderScreenshot = await saveScreenshot(
-        "windows-user-journey-shortcut-reminder",
-      );
+      const reminderScreenshot = await saveScreenshot("windows-user-journey-shortcut-reminder");
       expect(existsSync(reminderScreenshot)).toBe(true);
 
       const openSearchButton = await $('button[title="Open search"]');
@@ -742,9 +645,7 @@ describe("Windows user journey", function () {
       await browser.switchToWindow("search");
       await waitForSearchInputFocus(t(20_000));
 
-      const searchFromReminderScreenshot = await saveScreenshot(
-        "windows-user-journey-shortcut-reminder-search",
-      );
+      const searchFromReminderScreenshot = await saveScreenshot("windows-user-journey-shortcut-reminder-search");
       expect(existsSync(searchFromReminderScreenshot)).toBe(true);
 
       if ((await browser.getWindowHandles()).includes("home")) {
@@ -760,13 +661,9 @@ describe("Windows user journey", function () {
       await waitForWindowHandle("chat", t(20_000));
       await browser.switchToWindow("chat");
       await waitForWindowUrl("/chat", undefined, t(20_000));
-      await expectChatComposerAcceptsTyping(
-        `shortcut reminder chat ${Date.now()}`,
-      );
+      await expectChatComposerAcceptsTyping(`shortcut reminder chat ${Date.now()}`);
 
-      const chatFromReminderScreenshot = await saveScreenshot(
-        "windows-user-journey-shortcut-reminder-chat",
-      );
+      const chatFromReminderScreenshot = await saveScreenshot("windows-user-journey-shortcut-reminder-chat");
       expect(existsSync(chatFromReminderScreenshot)).toBe(true);
 
       if ((await browser.getWindowHandles()).includes("home")) {
@@ -783,9 +680,7 @@ describe("Windows user journey", function () {
       await browser.switchToWindow(mainWindowLabel);
       await waitForWindowUrl("/overlay", undefined, t(20_000));
 
-      const timelineFromReminderScreenshot = await saveScreenshot(
-        "windows-user-journey-shortcut-reminder-timeline",
-      );
+      const timelineFromReminderScreenshot = await saveScreenshot("windows-user-journey-shortcut-reminder-timeline");
       expect(existsSync(timelineFromReminderScreenshot)).toBe(true);
 
       if ((await browser.getWindowHandles()).includes("home")) {
@@ -794,9 +689,7 @@ describe("Windows user journey", function () {
       }
 
       await browser.switchToWindow("shortcut-reminder");
-      const hideReminderButton = await $(
-        'button[title="Hide shortcut reminder"]',
-      );
+      const hideReminderButton = await $('button[title="Hide shortcut reminder"]');
       await hideReminderButton.waitForDisplayed({ timeout: t(10_000) });
       await hideReminderButton.click();
 
@@ -807,17 +700,14 @@ describe("Windows user journey", function () {
         {
           timeout: t(15_000),
           interval: 250,
-          timeoutMsg:
-            "Display settings did not reflect hiding the shortcut reminder from the overlay",
+          timeoutMsg: "Display settings did not reflect hiding the shortcut reminder from the overlay",
         },
       );
     } finally {
       if ((await browser.getWindowHandles()).includes("home")) {
         await browser.switchToWindow("home").catch(() => {});
       }
-      await setSwitchChecked(shortcutReminderSelector, initiallyChecked).catch(
-        () => {},
-      );
+      await setSwitchChecked(shortcutReminderSelector, initiallyChecked).catch(() => {});
       if (!initiallyChecked) {
         await expectShortcutReminderVisible(false, t(10_000)).catch(() => {});
       }
@@ -832,16 +722,11 @@ describe("Windows user journey", function () {
     const notificationId = `windows-e2e-bell-${Date.now()}`;
     const notificationTitle = "Windows UX notification";
     const notificationBody = "Notification body visible from the bell history.";
-    const displayChangesSelector =
-      '[data-testid="notification-pref-displayChanges"]';
+    const displayChangesSelector = '[data-testid="notification-pref-displayChanges"]';
     let initialDisplayChanges: boolean | null = null;
 
     try {
-      await postNotification(
-        notificationId,
-        notificationTitle,
-        notificationBody,
-      );
+      await postNotification(notificationId, notificationTitle, notificationBody);
       if ((await browser.getWindowHandles()).includes("home")) {
         await browser.switchToWindow("home").catch(() => {});
       }
@@ -878,9 +763,7 @@ describe("Windows user journey", function () {
               if (document.querySelector(expandedSel)) return true;
               const row = document.querySelector(itemSel);
               if (!row) {
-                (
-                  document.querySelector(bellSel) as HTMLElement | null
-                )?.click();
+                (document.querySelector(bellSel) as HTMLElement | null)?.click();
                 return false;
               }
               (row.firstElementChild as HTMLElement | null)?.click();
@@ -902,23 +785,17 @@ describe("Windows user journey", function () {
       const expandedText = (await expanded.getText()).toLowerCase();
       expect(expandedText).toContain(notificationBody.toLowerCase());
 
-      const bellScreenshot = await saveScreenshot(
-        "windows-user-journey-notification-bell",
-      );
+      const bellScreenshot = await saveScreenshot("windows-user-journey-notification-bell");
       expect(existsSync(bellScreenshot)).toBe(true);
 
-      const manageSettings = await $(
-        '[data-testid="notification-bell-manage-settings"]',
-      );
+      const manageSettings = await $('[data-testid="notification-bell-manage-settings"]');
       await manageSettings.waitForDisplayed({ timeout: t(10_000) });
       await manageSettings.click();
 
       await expectCurrentSettingsSection("notifications", t(20_000));
       await waitForBodyText(
         (bodyText) =>
-          bodyText.includes(
-            "control which notifications screenpipe sends you",
-          ) &&
+          bodyText.includes("control which notifications screenpipe sends you") &&
           bodyText.includes("display changes") &&
           bodyText.includes("meeting live notes"),
         "Notification settings did not open from the bell footer",
@@ -926,19 +803,13 @@ describe("Windows user journey", function () {
 
       initialDisplayChanges = await switchIsChecked(displayChangesSelector);
       await setSwitchChecked(displayChangesSelector, !initialDisplayChanges);
-      expect(await switchIsChecked(displayChangesSelector)).toBe(
-        !initialDisplayChanges,
-      );
+      expect(await switchIsChecked(displayChangesSelector)).toBe(!initialDisplayChanges);
       await setSwitchChecked(displayChangesSelector, initialDisplayChanges);
 
-      const settingsScreenshot = await saveScreenshot(
-        "windows-user-journey-notification-settings",
-      );
+      const settingsScreenshot = await saveScreenshot("windows-user-journey-notification-settings");
       expect(existsSync(settingsScreenshot)).toBe(true);
 
-      const backToApp = await $(
-        '//button[.//span[normalize-space(.)="Back to app"]]',
-      );
+      const backToApp = await $('//button[.//span[normalize-space(.)="Back to app"]]');
       await backToApp.waitForDisplayed({ timeout: t(10_000) });
       await backToApp.click();
 
@@ -956,42 +827,28 @@ describe("Windows user journey", function () {
       await reopenedItem.moveTo();
       await reopenedItem.click();
 
-      const dismissButton = await $(
-        `[data-testid="notification-bell-dismiss-${notificationId}"]`,
-      );
+      const dismissButton = await $(`[data-testid="notification-bell-dismiss-${notificationId}"]`);
       await dismissButton.waitForDisplayed({ timeout: t(10_000) });
       await dismissButton.click();
 
       await browser.waitUntil(
-        async () =>
-          !(await $(itemSelector)
-            .isExisting()
-            .catch(() => false)),
+        async () => !(await $(itemSelector).isExisting().catch(() => false)),
         {
           timeout: t(10_000),
           interval: 250,
-          timeoutMsg:
-            "Notification bell row stayed visible after clicking dismiss",
+          timeoutMsg: "Notification bell row stayed visible after clicking dismiss",
         },
       );
 
-      const dismissedScreenshot = await saveScreenshot(
-        "windows-user-journey-notification-dismissed",
-      );
+      const dismissedScreenshot = await saveScreenshot("windows-user-journey-notification-dismissed");
       expect(existsSync(dismissedScreenshot)).toBe(true);
     } finally {
       if (initialDisplayChanges !== null) {
-        await setSwitchChecked(
-          displayChangesSelector,
-          initialDisplayChanges,
-        ).catch(() => {});
+        await setSwitchChecked(displayChangesSelector, initialDisplayChanges).catch(() => {});
       }
-      await appServerRequest(
-        `/notifications/${encodeURIComponent(notificationId)}`,
-        {
-          method: "DELETE",
-        },
-      ).catch(() => {});
+      await appServerRequest(`/notifications/${encodeURIComponent(notificationId)}`, {
+        method: "DELETE",
+      }).catch(() => {});
     }
   });
 
@@ -1021,9 +878,7 @@ describe("Windows user journey", function () {
     await mediaRetentionMode.scrollIntoView();
     await mediaRetentionMode.click();
 
-    const confirmation = await $(
-      '[data-testid="retention-mode-confirm-dialog"]',
-    );
+    const confirmation = await $('[data-testid="retention-mode-confirm-dialog"]');
     await confirmation.waitForDisplayed({ timeout: t(20_000) });
 
     await waitForBodyText(
@@ -1040,10 +895,7 @@ describe("Windows user journey", function () {
     await cancel.click();
 
     await browser.waitUntil(
-      async () =>
-        !(await $('[data-testid="retention-mode-confirm-dialog"]')
-          .isExisting()
-          .catch(() => false)),
+      async () => !(await $('[data-testid="retention-mode-confirm-dialog"]').isExisting().catch(() => false)),
       {
         timeout: t(10_000),
         interval: 250,
@@ -1051,9 +903,7 @@ describe("Windows user journey", function () {
       },
     );
 
-    const retentionScreenshot = await saveScreenshot(
-      "windows-user-journey-storage-retention",
-    );
+    const retentionScreenshot = await saveScreenshot("windows-user-journey-storage-retention");
     expect(existsSync(retentionScreenshot)).toBe(true);
   });
 
@@ -1084,9 +934,7 @@ describe("Windows user journey", function () {
       this.skip();
     }
 
-    const initiallyChecked = await isDataStateSwitchChecked(
-      apiAuthSwitchSelector,
-    );
+    const initiallyChecked = await isDataStateSwitchChecked(apiAuthSwitchSelector);
     try {
       await setDataStateSwitchChecked(apiAuthSwitchSelector, !initiallyChecked);
 
@@ -1101,15 +949,10 @@ describe("Windows user journey", function () {
         "Privacy API auth toggle did not explain the restart requirement",
       );
 
-      const privacyScreenshot = await saveScreenshot(
-        "windows-user-journey-privacy-api-auth-restart",
-      );
+      const privacyScreenshot = await saveScreenshot("windows-user-journey-privacy-api-auth-restart");
       expect(existsSync(privacyScreenshot)).toBe(true);
     } finally {
-      await setDataStateSwitchChecked(
-        apiAuthSwitchSelector,
-        initiallyChecked,
-      ).catch(() => {});
+      await setDataStateSwitchChecked(apiAuthSwitchSelector, initiallyChecked).catch(() => {});
     }
   });
 });

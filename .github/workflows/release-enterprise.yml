@@ -460,7 +460,10 @@ jobs:
           echo "Cleaning stale bundle artifacts from ${BUNDLE_DIR}..."
           rm -rf "${BUNDLE_DIR}" 2>/dev/null || true
 
-          bunx tauri build -v --target x86_64-unknown-linux-gnu --features enterprise-build,redact-onnx-cpu
+          bunx tauri build -v \
+            --target x86_64-unknown-linux-gnu \
+            --no-default-features \
+            --features custom-protocol,enterprise-build,redact-onnx-cpu
 
           # Strip bundled GLib/libmount/libblkid/libpcre2 (ABI mismatch on newer
           # distros) plus libavif/libsharpyuv: linuxdeploy bundles the old Ubuntu

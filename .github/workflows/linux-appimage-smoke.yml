@@ -167,7 +167,10 @@ jobs:
           BUNDLE_DIR="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
           rm -rf "${BUNDLE_DIR}" 2>/dev/null || true
 
-          bunx tauri build -v --target x86_64-unknown-linux-gnu --features enterprise-build,redact-onnx-cpu
+          bunx tauri build -v \
+            --target x86_64-unknown-linux-gnu \
+            --no-default-features \
+            --features custom-protocol,enterprise-build,redact-onnx-cpu
 
       - name: Repack AppImage with bundled runtime deps
         working-directory: apps/screenpipe-app-tauri

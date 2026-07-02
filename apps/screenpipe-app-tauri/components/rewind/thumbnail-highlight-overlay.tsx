@@ -11,6 +11,23 @@ interface ThumbnailHighlightOverlayProps {
 	highlightTerms: string[];
 }
 
+function escapeHighlightTerm(term: string) {
+	return term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function textContainsHighlightTerm(text: string, term: string) {
+	const normalizedText = text.toLowerCase().trim();
+	const normalizedTerm = term.toLowerCase().trim();
+	if (!normalizedText || !normalizedTerm) return false;
+
+	const pattern = new RegExp(
+		`(^|[^\\p{L}\\p{N}])${escapeHighlightTerm(normalizedTerm)}(?=$|[^\\p{L}\\p{N}])`,
+		"iu"
+	);
+
+	return pattern.test(normalizedText);
+}
+
 /**
  * Fetches text positions for a thumbnail and renders yellow boxes
  * over matching text blocks. Uses the shared text LRU cache so repeated
@@ -35,8 +52,7 @@ export const ThumbnailHighlightOverlay = memo(function ThumbnailHighlightOverlay
 		if (terms.length === 0) return [];
 
 		const matches = textPositions.filter((pos) => {
-			const textLower = pos.text.toLowerCase();
-			return terms.some((term) => textLower.includes(term));
+			return terms.some((term) => textContainsHighlightTerm(pos.text, term));
 		});
 
 		// Sort by area (smallest first) and take the 3 smallest matches.

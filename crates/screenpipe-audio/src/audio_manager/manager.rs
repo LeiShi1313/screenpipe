@@ -1199,6 +1199,15 @@ impl AudioManager {
             .map(|o| o.transcription_mode.clone())
     }
 
+    /// Non-blocking read of the configured transcription engine. Returns `None`
+    /// if the options lock is momentarily contended so `/health` can stay fast.
+    pub fn configured_transcription_engine(&self) -> Option<AudioTranscriptionEngine> {
+        self.options
+            .try_read()
+            .ok()
+            .map(|o| o.transcription_engine.as_ref().clone())
+    }
+
     pub async fn enabled_devices(&self) -> HashSet<String> {
         self.options.read().await.enabled_devices.clone()
     }

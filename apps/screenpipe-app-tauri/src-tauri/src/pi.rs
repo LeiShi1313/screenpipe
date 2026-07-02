@@ -3222,7 +3222,7 @@ mod tests {
     #[cfg(windows)]
     use super::parse_where_output;
     #[cfg(not(windows))]
-    use super::{find_bun_executable, find_pi_executable};
+    use super::{bun_command, find_bun_executable, find_pi_executable};
     use serde_json::{json, Value};
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};

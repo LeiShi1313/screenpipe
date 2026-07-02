@@ -826,13 +826,16 @@ pub async fn start_ui_recording(
                     // so they're paced by the backoff instead of re-attempted on
                     // every incoming event (which would hammer a stalled DB).
                     if batch.len() >= batch_size && consecutive_failures == 0 {
-                        flush_batch(
+                        let outcome = flush_batch(
                             &db,
                             &mut batch,
                             &mut consecutive_failures,
                             linker_tx.as_ref(),
                         )
                         .await;
+                        if outcome == FlushBatchOutcome::QueueClosed {
+                            break;
+                        }
                         last_flush = std::time::Instant::now();
                     }
                 }
@@ -841,13 +844,16 @@ pub async fn start_ui_recording(
                     // retries of a retained (previously failed) batch, paced by
                     // the backoff at the end of the block.
                     if !batch.is_empty() && last_flush.elapsed() >= batch_timeout {
-                        flush_batch(
+                        let outcome = flush_batch(
                             &db,
                             &mut batch,
                             &mut consecutive_failures,
                             linker_tx.as_ref(),
                         )
                         .await;
+                        if outcome == FlushBatchOutcome::QueueClosed {
+                            break;
+                        }
                         last_flush = std::time::Instant::now();
 
                         // Exponential backoff on consecutive failures
@@ -920,7 +926,7 @@ pub async fn start_ui_recording(
 
         // Final flush
         if !batch.is_empty() {
-            flush_batch(
+            let _ = flush_batch(
                 &db,
                 &mut batch,
                 &mut consecutive_failures,
@@ -977,14 +983,47 @@ fn cap_retained_batch(batch: &mut EventBatch, max_retained: usize) -> usize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushBatchOutcome {
+    Flushed,
+    Retained,
+    QueueClosed,
+}
+
+fn handle_flush_batch_error(
+    batch: &mut EventBatch,
+    consecutive_failures: &mut u32,
+    error: &sqlx::Error,
+) -> FlushBatchOutcome {
+    if matches!(error, sqlx::Error::PoolClosed) {
+        warn!(
+            "UI recorder: write queue closed during flush; ending UI recording loop without retry"
+        );
+        batch.clear();
+        return FlushBatchOutcome::QueueClosed;
+    }
+
+    *consecutive_failures += 1;
+    if *consecutive_failures <= 3 {
+        error!("Failed to insert UI events batch: {}", error);
+    } else {
+        // Reduce log spam during contention storms
+        debug!(
+            "Failed to insert UI events batch (failure #{}): {}",
+            consecutive_failures, error
+        );
+    }
+    FlushBatchOutcome::Retained
+}
+
 async fn flush_batch(
     db: &Arc<DatabaseManager>,
     batch: &mut EventBatch,
     consecutive_failures: &mut u32,
     linker_tx: Option<&LinkerSender>,
-) {
+) -> FlushBatchOutcome {
     if batch.is_empty() {
-        return;
+        return FlushBatchOutcome::Flushed;
     }
 
     // The DB call borrows the events slice directly — no clones.
@@ -1029,21 +1068,9 @@ async fn flush_batch(
             // sustained stall is bounded by the caller (max_retained /
             // max_batch_age).
             batch.clear();
+            FlushBatchOutcome::Flushed
         }
-        Err(e) => {
-            *consecutive_failures += 1;
-            if *consecutive_failures <= 3 {
-                error!("Failed to insert UI events batch: {}", e);
-            } else {
-                // Reduce log spam during contention storms
-                debug!(
-                    "Failed to insert UI events batch (failure #{}): {}",
-                    consecutive_failures, e
-                );
-            }
-            // Retain the batch (do NOT clear) so the next flush retries it.
-            // See the comment in the Ok arm.
-        }
+        Err(e) => handle_flush_batch_error(batch, consecutive_failures, &e),
     }
 }
 
@@ -1392,6 +1419,30 @@ mod event_batch_tests {
         assert_eq!(b.len(), 2);
     }
 
+    #[test]
+    fn handle_flush_batch_error_clears_batch_when_queue_closed() {
+        let mut batch = EventBatch::with_capacity(4);
+        batch.push(evt(), Some(1));
+        batch.push(evt(), None);
+        let mut consecutive_failures = 2u32;
+
+        let outcome = handle_flush_batch_error(
+            &mut batch,
+            &mut consecutive_failures,
+            &sqlx::Error::PoolClosed,
+        );
+
+        assert_eq!(outcome, FlushBatchOutcome::QueueClosed);
+        assert!(
+            batch.is_empty(),
+            "terminal queue shutdown should drop the stale batch"
+        );
+        assert_eq!(
+            consecutive_failures, 2,
+            "shutdown should not be counted as a retryable write failure"
+        );
+    }
+
     /// Regression for SCREENPIPE-CLI-FZ: a failed insert must NOT discard the
     /// captured events. Before the fix `flush_batch` cleared unconditionally,
     /// so any transient write-pool stall (PoolTimedOut) silently dropped the
@@ -1415,8 +1466,9 @@ mod event_batch_tests {
         batch.push(evt(), None);
         let mut consecutive_failures = 0u32;
 
-        flush_batch(&db, &mut batch, &mut consecutive_failures, None).await;
+        let outcome = flush_batch(&db, &mut batch, &mut consecutive_failures, None).await;
 
+        assert_eq!(outcome, FlushBatchOutcome::Retained);
         assert_eq!(
             batch.len(),
             3,
@@ -1444,8 +1496,9 @@ mod event_batch_tests {
         batch.push(evt(), None);
         let mut consecutive_failures = 3u32;
 
-        flush_batch(&db, &mut batch, &mut consecutive_failures, None).await;
+        let outcome = flush_batch(&db, &mut batch, &mut consecutive_failures, None).await;
 
+        assert_eq!(outcome, FlushBatchOutcome::Flushed);
         assert!(batch.is_empty(), "a successful flush clears the batch");
         assert_eq!(
             consecutive_failures, 0,

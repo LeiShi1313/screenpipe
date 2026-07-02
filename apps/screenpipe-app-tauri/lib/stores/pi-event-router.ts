@@ -83,6 +83,7 @@ import {
 let mounted = false;
 let mountPromise: Promise<() => void> | null = null;
 let unregistrations: Unregister[] = [];
+const CHAT_HISTORY_BACKGROUND_BATCH_SIZE = 200;
 
 // Local aliases to keep `applyEventToSessionContent` / `statusForEvent`
 // loosely typed against the inner event without having to thread
@@ -320,6 +321,26 @@ export function handleTerminated(payload: AgentTerminatedPayload) {
 
 /** Hydrate the store from on-disk chat history once at boot. The router
  *  keeps this in sync afterwards via incremental events. */
+export async function hydrateRemainingConversationHistory(
+  startOffset = CHAT_HISTORY_INITIAL_LIMIT,
+  batchSize = CHAT_HISTORY_BACKGROUND_BATCH_SIZE,
+) {
+  const pageSize = Math.max(1, Math.floor(batchSize));
+  let offset = Math.max(0, Math.floor(startOffset));
+
+  while (true) {
+    const metas = await listConversations({
+      limit: pageSize,
+      offset,
+      includeHidden: false,
+    });
+    if (metas.length === 0) break;
+    const records: SessionRecord[] = metas.map(sessionRecordFromMeta);
+    useChatStore.getState().actions.hydrateFromDisk(records);
+    offset += pageSize;
+  }
+}
+
 async function hydrate() {
   try {
     const metas = await listConversations({
@@ -328,6 +349,7 @@ async function hydrate() {
     });
     const records: SessionRecord[] = metas.map(sessionRecordFromMeta);
     useChatStore.getState().actions.hydrateFromDisk(records);
+    void hydrateRemainingConversationHistory();
   } catch {
     // Storage may not be ready yet on first launch — non-fatal.
     useChatStore.getState().actions.markDiskHydrated();

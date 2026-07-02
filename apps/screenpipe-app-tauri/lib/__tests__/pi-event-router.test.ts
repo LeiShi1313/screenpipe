@@ -26,11 +26,12 @@ vi.mock("@/lib/chat-storage", () => ({
   saveConversationFile: vi.fn(async () => undefined),
 }));
 
-import { saveConversationFile } from "@/lib/chat-storage";
+import { listConversations, saveConversationFile } from "@/lib/chat-storage";
 import {
   flushPendingSaves,
   handlePiEvent,
   handleTerminated,
+  hydrateRemainingConversationHistory,
 } from "../stores/pi-event-router";
 import { useChatStore, type SessionRecord } from "../stores/chat-store";
 import type { AgentEventEnvelope, AgentInnerEvent } from "../events/types";
@@ -162,6 +163,48 @@ describe("pi-event-router: status mirroring for backgrounded sessions", () => {
     const session = useChatStore.getState().sessions.A;
     expect(session.lastContentAt).toBeGreaterThan(100);
     expect(session.unread).toBe(true);
+  });
+});
+
+describe("pi-event-router: history hydration", () => {
+  beforeEach(reset);
+
+  it("hydrates older conversation pages after the initial sidebar batch", async () => {
+    const listConversationsMock = vi.mocked(listConversations);
+    listConversationsMock
+      .mockResolvedValueOnce([
+        {
+          id: "old-51",
+          title: "older run",
+          createdAt: 51,
+          updatedAt: 51,
+          messageCount: 1,
+          pinned: false,
+          hidden: false,
+          kind: "chat",
+        },
+      ] as any)
+      .mockResolvedValueOnce([]);
+
+    await hydrateRemainingConversationHistory(50, 50);
+
+    expect(listConversationsMock).toHaveBeenNthCalledWith(1, {
+      limit: 50,
+      offset: 50,
+      includeHidden: false,
+    });
+    expect(useChatStore.getState().sessions["old-51"]).toEqual(
+      expect.objectContaining({
+        id: "old-51",
+        title: "older run",
+        messageCount: 1,
+      }),
+    );
+    expect(listConversationsMock).toHaveBeenNthCalledWith(2, {
+      limit: 50,
+      offset: 100,
+      includeHidden: false,
+    });
   });
 });
 

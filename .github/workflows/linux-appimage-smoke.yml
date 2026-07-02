@@ -250,7 +250,15 @@ jobs:
               squashfs-root/usr/bin/ffmpeg -version
               squashfs-root/usr/bin/ffprobe -version
               squashfs-root/usr/bin/tesseract --version
-              env -u LD_LIBRARY_PATH squashfs-root/usr/bin/bun --version
+              # The app relocates bundled bun out of the AppImage mount before
+              # executing it. In-place execution keeps bun's $ORIGIN/../lib
+              # RUNPATH pointed at the AppImage bundle and can SIGSEGV on newer
+              # hosts. Mirror the runtime path here instead of asserting the
+              # extracted in-place binary is directly runnable.
+              install -d /tmp/smoke-bun
+              cp squashfs-root/usr/bin/bun /tmp/smoke-bun/bun
+              chmod +x /tmp/smoke-bun/bun
+              env -u LD_LIBRARY_PATH /tmp/smoke-bun/bun --version
 
               check_ldd() {
                 local target="$1"

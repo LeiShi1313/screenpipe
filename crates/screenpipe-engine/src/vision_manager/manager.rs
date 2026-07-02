@@ -632,6 +632,12 @@ impl VisionManager {
 
     /// Get list of currently recording monitor IDs.
     /// Removes dead tasks (finished JoinHandles) so MonitorWatcher can restart them.
+    /// DB handle for sibling vision_manager modules (the monitor watcher
+    /// persists display-layout snapshots). Cheap Arc clone.
+    pub(crate) fn db_handle(&self) -> Arc<DatabaseManager> {
+        self.db.clone()
+    }
+
     pub async fn active_monitors(&self) -> Vec<u32> {
         // Collect dead task IDs first to avoid holding DashMap refs during removal
         let dead: Vec<u32> = self

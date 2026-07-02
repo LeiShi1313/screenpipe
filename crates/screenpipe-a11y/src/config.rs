@@ -193,7 +193,11 @@ impl Default for UiCaptureConfig {
             capture_keystrokes: false, // Privacy risk
             capture_app_switch: true,
             capture_window_focus: true,
-            capture_scroll: false, // Very high volume
+            // Coalesced to one row per gesture (see `crate::scroll`), so the
+            // former "very high volume" concern (a row per 60-120 Hz tick) no
+            // longer applies — a heavy browsing day is a few thousand rows,
+            // comparable to clicks.
+            capture_scroll: true,
             capture_clipboard: true,
             capture_clipboard_content: true,
             capture_context: true,

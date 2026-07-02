@@ -151,7 +151,9 @@ impl Default for UiRecorderConfig {
             capture_clipboard_content: true,
             capture_app_switch: true,
             capture_window_focus: true,
-            capture_scroll: false,
+            // On by default now that the a11y tap coalesces bursts (one row per
+            // gesture); see screenpipe_a11y::scroll.
+            capture_scroll: true,
             capture_context: true,
             capture_on_keystroke: true,
             capture_on_clipboard: true,
@@ -1267,6 +1269,7 @@ mod event_batch_tests {
             element_description: None,
             element_automation_id: None,
             element_bounds: None,
+            element_ancestors: None,
             frame_id: None,
         }
     }
@@ -1486,6 +1489,7 @@ mod capture_trigger_kind_tests {
             element_description: None,
             element_automation_id: None,
             element_bounds: None,
+            element_ancestors: None,
             frame_id: None,
         }
     }

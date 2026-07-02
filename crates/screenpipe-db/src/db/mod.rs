@@ -297,6 +297,7 @@ async fn flush_level0_bulk(
 
 mod accessibility;
 mod audio;
+mod display_layout;
 mod elements;
 mod frames;
 mod maintenance;

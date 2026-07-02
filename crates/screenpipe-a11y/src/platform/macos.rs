@@ -9,6 +9,7 @@
 use crate::activity_feed::{ActivityFeed, ActivityKind};
 use crate::config::UiCaptureConfig;
 use crate::events::{ElementBounds, ElementContext, EventData, Modifiers, UiEvent};
+use crate::scroll::{ScrollBuffer, ScrollFlush};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -19,11 +20,11 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI8, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 use cidre::cg::event::access as cg_access;
-use cidre::{arc, ax, cf, cg, ns};
+use cidre::{arc, arc::Retained, ax, cf, cg, ns};
 use objc2_app_kit::NSPasteboard;
 
 /// Guard to serialize accessibility queries – concurrent calls to
@@ -607,6 +608,10 @@ struct TapState {
     tap_ptr: AtomicPtr<cg::EventTap>,
     last_mouse: Mutex<(f64, f64)>,
     text_buf: Mutex<TextBuffer>,
+    /// Scroll-burst coalescer — raw ~60-120 Hz wheel ticks aggregate into one
+    /// event per gesture (see `crate::scroll`), which is what makes persisting
+    /// scroll affordable enough to be on by default.
+    scroll_buf: Mutex<ScrollBuffer>,
     /// Lock-free reads for app/window context — no mutex contention in the
     /// event tap callback (the hot path for every input event).
     current_app: Arc<ArcSwap<Option<String>>>,
@@ -659,6 +664,28 @@ impl TextBuffer {
         self.last_time
             .map(|t| t.elapsed().as_millis() as u64 >= self.timeout_ms)
             .unwrap_or(false)
+    }
+}
+
+/// Convert a coalesced scroll burst into the `UiEvent` shape the recorder
+/// persists — timestamped at burst START so it orders correctly against the
+/// clicks/keys around it.
+fn scroll_flush_to_event(f: ScrollFlush) -> UiEvent {
+    UiEvent {
+        id: None,
+        timestamp: f.timestamp,
+        relative_ms: f.relative_ms,
+        data: EventData::Scroll {
+            x: f.x,
+            y: f.y,
+            delta_x: f.delta_x,
+            delta_y: f.delta_y,
+        },
+        app_name: f.app_name,
+        window_title: f.window_title,
+        browser_url: None,
+        element: None,
+        frame_id: None,
     }
 }
 
@@ -826,6 +853,7 @@ fn run_event_tap(
         tap_ptr: AtomicPtr::new(std::ptr::null_mut()),
         last_mouse: Mutex::new((0.0, 0.0)),
         text_buf: Mutex::new(TextBuffer::new(config.text_timeout_ms)),
+        scroll_buf: Mutex::new(ScrollBuffer::new()),
         current_app,
         current_window,
         current_pid,
@@ -890,6 +918,21 @@ fn run_event_tap(
             event.window_title = (**state.current_window.load()).clone();
             let _ = state.tx.try_send(event);
         }
+
+        // Drain a scroll burst whose quiet gap elapsed with no follow-up tick
+        // (the common "scrolled, then read" case). Same lock discipline as the
+        // text buffer: take the flush out, release the mutex, then send.
+        let scroll_done = {
+            let mut buf = state.scroll_buf.lock();
+            if buf.should_flush() {
+                buf.flush()
+            } else {
+                None
+            }
+        };
+        if let Some(f) = scroll_done {
+            let _ = state.tx.try_send(scroll_flush_to_event(f));
+        }
     }
 
     // Shutdown ordering matters here. The tap callback writes captured
@@ -924,6 +967,12 @@ fn run_event_tap(
         event.app_name = (**state.current_app.load()).clone();
         event.window_title = (**state.current_window.load()).clone();
         let _ = state.tx.try_send(event);
+    }
+
+    // Same for an in-flight scroll burst — the callback is inert now, so this
+    // final drain can't race a tick.
+    if let Some(f) = { state.scroll_buf.lock().flush() } {
+        let _ = state.tx.try_send(scroll_flush_to_event(f));
     }
 
     // Reclaim the TapState we `Box::leak`'d at install time. The tap is now
@@ -1094,23 +1143,25 @@ extern "C" fn tap_callback(
                 let dy = event.field_i64(cg::EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS1) as i16;
                 let dx = event.field_i64(cg::EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS2) as i16;
                 if dx != 0 || dy != 0 {
-                    let ui_event = UiEvent {
-                        id: None,
+                    // Coalesce: one row per gesture, not per 60-120 Hz tick —
+                    // this is what makes scroll capture cheap enough to default
+                    // on. `push` returns the PREVIOUS burst when this tick
+                    // starts a new one (app/window change, quiet gap, max-age
+                    // split); a quiet gap with no follow-up tick is drained by
+                    // the run loop below, same as the text buffer.
+                    let finished = state.scroll_buf.lock().push(
+                        loc.x as i32,
+                        loc.y as i32,
+                        dx,
+                        dy,
                         timestamp,
-                        relative_ms: t,
-                        data: EventData::Scroll {
-                            x: loc.x as i32,
-                            y: loc.y as i32,
-                            delta_x: dx,
-                            delta_y: dy,
-                        },
+                        t,
                         app_name,
                         window_title,
-                        browser_url: None,
-                        element: None,
-                        frame_id: None,
-                    };
-                    let _ = state.tx.try_send(ui_event);
+                    );
+                    if let Some(f) = finished {
+                        let _ = state.tx.try_send(scroll_flush_to_event(f));
+                    }
                 }
             }
         }
@@ -1694,6 +1745,16 @@ fn get_element_at_position(
         (role, name, bounds)
     };
 
+    // The element's path in the window hierarchy — what disambiguates "the
+    // Profile button in the sidebar" from "the Profile button in the modal"
+    // for downstream trajectory/workflow consumers. Walked from the hit-test
+    // element (a labeled descendant found above sits below it, so the chain
+    // is a valid prefix either way). Budgeted: <=12 hops, 15 ms wall clock.
+    let ancestors = crate::events::ancestors_to_json(
+        collect_ancestor_chain(&elem, 12, Duration::from_millis(15)),
+        12,
+    );
+
     if config.is_password_field(Some(&role), name.as_deref()) {
         // Don't capture value for password fields
         return Some(ElementContext {
@@ -1703,6 +1764,7 @@ fn get_element_at_position(
             description: None,
             automation_id: None,
             bounds,
+            ancestors,
         });
     }
 
@@ -1728,7 +1790,60 @@ fn get_element_at_position(
         description: description.map(|s| truncate(&s, 200)),
         automation_id: None,
         bounds,
+        ancestors,
     })
+}
+
+/// Walk `AXParent` upward from `elem`, collecting role (+ title/description
+/// when present) per hop — the element's "path in the window hierarchy" for
+/// recorded clicks. Returns leaf-most-first (callers serialize root-first via
+/// [`ancestors_to_json`]).
+///
+/// Cost discipline (this runs on the ctx-capture worker under AX_QUERY_LOCK,
+/// never on the tap thread): each hop is 2-3 AX IPC calls into the target app,
+/// capped at `max_hops` hops AND a wall-clock budget so one busy/unresponsive
+/// app can't stall the worker — on timeout the partial chain is returned.
+/// Read-only AXParent/AXTitle reads; never pokes AXEnhancedUserInterface (the
+/// Chromium phantom-IME-commit bug — see ENHANCED_MODE_CACHE in tree/macos.rs).
+fn collect_ancestor_chain(
+    elem: &ax::UiElement,
+    max_hops: usize,
+    budget: Duration,
+) -> Vec<crate::events::AncestorHop> {
+    use crate::events::AncestorHop;
+    let started = Instant::now();
+    let parent_attr_name = cf::String::from_str("AXParent");
+    let parent_attr = ax::Attr::with_string(&parent_attr_name);
+
+    let mut chain: Vec<AncestorHop> = Vec::with_capacity(max_hops.min(12));
+    let mut cur: Option<Retained<cf::Type>> = {
+        elem.attr_value(parent_attr)
+            .ok()
+            .filter(|p| p.get_type_id() == ax::UiElement::type_id())
+    };
+    while let Some(node) = cur {
+        if chain.len() >= max_hops || started.elapsed() >= budget {
+            break;
+        }
+        let node_elem: &ax::UiElement = unsafe { std::mem::transmute(&*node) };
+        let Some(role) = role_string(node_elem) else {
+            break;
+        };
+        let name = get_string_attr(node_elem, ax::attr::title())
+            .or_else(|| get_string_attr(node_elem, ax::attr::desc()));
+        let stop_at_window = role == "AXWindow";
+        chain.push(AncestorHop { role, name });
+        // The window is the natural chain root; going further reaches the
+        // application element, which duplicates app_name on the event.
+        if stop_at_window {
+            break;
+        }
+        cur = node_elem
+            .attr_value(parent_attr)
+            .ok()
+            .filter(|p| p.get_type_id() == ax::UiElement::type_id());
+    }
+    chain
 }
 
 fn is_own_process(pid: i32) -> bool {
@@ -1824,6 +1939,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
             description: None,
             automation_id: None,
             bounds,
+            ancestors: None,
         });
     }
 
@@ -1853,6 +1969,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
         description: None,
         automation_id: None,
         bounds,
+        ancestors: None,
     })
 }
 

@@ -119,6 +119,7 @@ fn ui_event(i: usize, timestamp: chrono::DateTime<Utc>, frame_id: Option<i64>) -
         element_description: None,
         element_automation_id: Some(format!("pressure-{}", i % 64)),
         element_bounds: Some(r#"{"x":1,"y":2,"width":300,"height":40}"#.to_string()),
+        element_ancestors: None,
         frame_id,
     }
 }

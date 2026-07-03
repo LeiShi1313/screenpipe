@@ -502,7 +502,7 @@ async fn main() {
         }
     }
 
-    // Check if telemetry is disabled via store setting (analyticsEnabled) or offline mode
+    // Check if telemetry is disabled via store setting (analyticsEnabled)
     let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
     let store_json = std::fs::read(&store_path).ok().and_then(|data| {
         if data.len() >= 8 && &data[..8] == b"SPSTORE1" {

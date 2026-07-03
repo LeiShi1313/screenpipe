@@ -106,19 +106,6 @@ jobs:
         target: x86_64-pc-windows-msvc
         cache-bin: false
 
-    # sccache, same as the Linux/macOS e2e jobs. This Build step is the
-    # slowest in all of CI (~45 min cold) and was the only e2e build
-    # without compiler-level caching. CARGO_INCREMENTAL=0 (set in the job
-    # env above) is required for sccache to cache rustc invocations.
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      shell: pwsh
-      run: |
-        echo "SCCACHE_GHA_ENABLED=true" >> $env:GITHUB_ENV
-        echo "RUSTC_WRAPPER=sccache" >> $env:GITHUB_ENV
-
     - name: Rust cache
       # cache restore/save is an optimization only; a transient GHA cache
       # service error must never fail the job (skipped build+tests, red CI)

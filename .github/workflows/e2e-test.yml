@@ -816,7 +816,7 @@ jobs:
       # + a step timeout BELOW the job timeout lets macOS run for signal but never
       # cancel the run (job-level continue-on-error does NOT cover a timeout
       # cancellation). Linux remains the hard E2E gate. Make-it-gate-again
-      # (parallelize maxInstances, cache the build, cut retries) tracked in #4688.
+      # (parallelize maxInstances, cache the build, cut retries) tracked in #4822.
       continue-on-error: true
       timeout-minutes: 70
       shell: bash

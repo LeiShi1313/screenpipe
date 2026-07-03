@@ -3339,7 +3339,7 @@ const PLAUD_MCP_URL = "https://mcp.plaud.ai/mcp";
 // (/mcp), NOT the legacy /sse transport the engine can't drive. Each id
 // must match a registered connector id so it lands on the right tile.
 // (DCR support verified live against each provider's OAuth metadata.)
-export const MCP_OAUTH_PROVIDERS: {
+const MCP_OAUTH_PROVIDERS: {
   id: string;
   name: string;
   url: string;
@@ -3908,30 +3908,17 @@ export function ConnectionsSection({
         return;
       }
       const body = await r.json();
-      const list = (body?.data ?? []) as { id: string; enabled: boolean; url?: string }[];
+      const list = (body?.data ?? []) as { enabled: boolean; url?: string }[];
       const enabled = list.filter(s => s.enabled);
       setCustomMcpServerCount(list.length);
       setCustomMcpEnabledCount(enabled.length);
       setCustomMcpConnected(enabled.length > 0);
       setKrispConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === KRISP_MCP_URL));
       setPlaudConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === PLAUD_MCP_URL));
-      const providerStatuses = await Promise.all(
-        MCP_OAUTH_PROVIDERS.map(async p => {
-          const server = list.find(s => (s.url ?? "").replace(/\/+$/, "") === p.url.replace(/\/+$/, ""));
-          if (!server) return [p.id, false] as const;
-          try {
-            const sr = await localFetch(
-              `/mcp-servers/${encodeURIComponent(server.id)}/oauth/status`
-            );
-            if (!sr.ok) return [p.id, false] as const;
-            const sb = await sr.json();
-            return [p.id, !!sb?.data?.connected] as const;
-          } catch {
-            return [p.id, false] as const;
-          }
-        })
-      );
-      setMcpProviderConnected(Object.fromEntries(providerStatuses));
+      const enabledUrls = new Set(list.filter(s => s.enabled).map(s => (s.url ?? "").replace(/\/+$/, "")));
+      setMcpProviderConnected(Object.fromEntries(
+        MCP_OAUTH_PROVIDERS.map(p => [p.id, enabledUrls.has(p.url.replace(/\/+$/, ""))])
+      ));
       setExcalidrawConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === EXCALIDRAW_MCP_URL));
     }).catch(() => {
       setCustomMcpConnected(false);

@@ -317,6 +317,10 @@ pub struct EventDrivenCaptureConfig {
     pub visual_check_interval_ms: u64,
     /// Frame difference threshold (0.0–1.0) above which a VisualChange trigger fires.
     pub visual_change_threshold: f64,
+    /// Disable screenshot pixels while keeping accessibility-tree capture.
+    /// When true, visual checks, full screenshot capture, JPEG writes, and OCR
+    /// fallback are skipped.
+    pub disable_screenshots: bool,
     /// User-pinned guaranteed-capture floor (ms). When `Some`, this is an
     /// explicit "always capture at least every N ms" choice and it must
     /// survive PowerProfile transitions — a battery-saver switch (whose
@@ -337,6 +341,7 @@ impl Default for EventDrivenCaptureConfig {
             capture_on_clipboard: true,
             visual_check_interval_ms: 3_000, // check every 3 seconds
             visual_change_threshold: 0.05,   // ~5% difference triggers capture
+            disable_screenshots: false,
             idle_capture_interval_override_ms: None, // follow PowerProfile unless pinned
         }
     }
@@ -656,10 +661,11 @@ pub async fn event_driven_capture_loop(
         monitor_id, device_name
     );
 
-    let mut visual_check_enabled = config.visual_check_interval_ms > 0;
+    let screenshots_disabled_by_config = config.disable_screenshots;
+    let mut screenshot_disabled = screenshots_disabled_by_config;
+    let mut visual_check_enabled = config.visual_check_interval_ms > 0 && !screenshot_disabled;
     let mut visual_check_interval = Duration::from_millis(config.visual_check_interval_ms);
     let mut visual_change_threshold = config.visual_change_threshold;
-    let mut screenshot_disabled = false;
 
     let mut state = EventDrivenCapture::new(config);
     let mut power_profile_rx = power_profile_rx;
@@ -1112,12 +1118,18 @@ pub async fn event_driven_capture_loop(
                 snapshot_writer.set_quality(effective_q);
                 visual_check_interval = Duration::from_millis(profile.visual_check_interval_ms);
                 visual_change_threshold = profile.visual_change_threshold;
-                visual_check_enabled = profile.visual_check_interval_ms > 0;
-                screenshot_disabled = profile.screenshot_disabled;
-                if profile.screenshot_disabled {
+                screenshot_disabled = screenshots_disabled_by_config || profile.screenshot_disabled;
+                visual_check_enabled = profile.visual_check_interval_ms > 0 && !screenshot_disabled;
+                if visual_check_enabled && frame_comparer.is_none() {
+                    frame_comparer =
+                        Some(FrameComparer::new(FrameComparisonConfig::max_performance()));
+                } else if !visual_check_enabled {
+                    frame_comparer = None;
+                }
+                if screenshot_disabled {
                     info!(
-                        "power profile {:?}: screenshots disabled for monitor {} — a11y walk continues",
-                        profile.name, monitor_id
+                        "screenshots disabled for monitor {} (power profile {:?}, managed/config={}) — a11y walk continues",
+                        monitor_id, profile.name, screenshots_disabled_by_config
                     );
                 }
             }
@@ -1450,7 +1462,9 @@ pub async fn event_driven_capture_loop(
                         // buffer. Deterministic — idle content, look-alike
                         // window switches, and other-monitor activity all still
                         // advance the sequence, so none of them can false-trip.
-                        if freeze_watch.observe(monitor.last_capture_seq(), Instant::now()) {
+                        if !screenshot_disabled
+                            && freeze_watch.observe(monitor.last_capture_seq(), Instant::now())
+                        {
                             warn!(
                                 "monitor {}: capture stream frozen — no new frame delivered for \
                                  ~{}s; invalidating persistent stream to rebuild it",
@@ -2090,20 +2104,30 @@ async fn do_capture(
     let captured_at = Utc::now();
     let bypass_capture_throttles = bypasses_capture_throttles(trigger);
 
-    // Resolve ignored windows to SCK window IDs so ScreenCaptureKit
-    // excludes them from the capture buffer (zero overhead, pixel-perfect).
-    // Sort + dedup so the persistent stream isn't needlessly recreated when
-    // transient windows (tooltips, popups) cause ordering changes.
-    let mut excluded_ids = get_excluded_sck_window_ids(&params.window_filters);
-    excluded_ids.sort_unstable();
-    excluded_ids.dedup();
+    let image = if screenshot_disabled {
+        debug!(
+            "screenshot capture skipped for monitor {} (trigger={})",
+            params.monitor_id,
+            trigger.as_str()
+        );
+        image::DynamicImage::new_rgba8(1, 1)
+    } else {
+        // Resolve ignored windows to SCK window IDs so ScreenCaptureKit
+        // excludes them from the capture buffer (zero overhead, pixel-perfect).
+        // Sort + dedup so the persistent stream isn't needlessly recreated when
+        // transient windows (tooltips, popups) cause ordering changes.
+        let mut excluded_ids = get_excluded_sck_window_ids(&params.window_filters);
+        excluded_ids.sort_unstable();
+        excluded_ids.dedup();
 
-    // Take screenshot (with ignored windows excluded at the OS level)
-    let (image, capture_dur) = capture_monitor_image(params.monitor, &excluded_ids).await?;
-    debug!(
-        "screenshot captured in {:?} for monitor {}",
-        capture_dur, params.monitor_id
-    );
+        // Take screenshot (with ignored windows excluded at the OS level)
+        let (image, capture_dur) = capture_monitor_image(params.monitor, &excluded_ids).await?;
+        debug!(
+            "screenshot captured in {:?} for monitor {}",
+            capture_dur, params.monitor_id
+        );
+        image
+    };
 
     // Skip frames that are unusable for indexing.  Two cases:
     //   1. Near-all-black — an ignored window covering the monitor; SCK fills
@@ -2116,25 +2140,27 @@ async fn do_capture(
     // write, but still return the image so the frame comparer stays updated
     // (prevents re-triggering on the same bad frame). The caller records the
     // matching telemetry counter from `corrupt`.
-    if let Some(kind) = frame_corruption(&image) {
-        match kind {
-            // Green is the notable, rarer signal — surface it at warn so it
-            // shows up in shared logs. Black is common (DRM / excluded window).
-            CorruptKind::GreenBand => warn!(
+    if !screenshot_disabled {
+        if let Some(kind) = frame_corruption(&image) {
+            match kind {
+                // Green is the notable, rarer signal — surface it at warn so it
+                // shows up in shared logs. Black is common (DRM / excluded window).
+                CorruptKind::GreenBand => warn!(
                 "captured frame has a green decode-garbage band on monitor {} — skipping DB write",
                 params.monitor_id
             ),
-            CorruptKind::Black => debug!(
-                "captured frame is mostly black on monitor {} — skipping DB write",
-                params.monitor_id
-            ),
+                CorruptKind::Black => debug!(
+                    "captured frame is mostly black on monitor {} — skipping DB write",
+                    params.monitor_id
+                ),
+            }
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+                corrupt: Some(kind),
+            });
         }
-        return Ok(CaptureOutput {
-            result: None,
-            image,
-            elements_deduped: false,
-            corrupt: Some(kind),
-        });
     }
 
     // Walk accessibility tree on blocking thread (AX APIs are synchronous).

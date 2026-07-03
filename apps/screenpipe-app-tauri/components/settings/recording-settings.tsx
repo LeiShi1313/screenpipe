@@ -26,11 +26,13 @@ export const searchIndex: SettingsField[] = [
   // conditional: platform/OS-gated (Windows-only / macOS CoreAudio tap).
   { label: "Echo cancellation mode", keywords: ["echo", "aec", "voiceprocessingio", "wasapi"], conditional: true },
   { label: "CoreAudio system audio capture", keywords: ["coreaudio", "system audio"], conditional: true },
-  { label: "Screen recording", keywords: ["screen", "video"] },
-  { label: "Use all monitors", keywords: ["monitor", "display"] },
+  { label: "Screen context capture", keywords: ["screen", "video", "accessibility"] },
+  { label: "Screenshot images", keywords: ["screenshot", "pixels", "ocr", "jpeg"] },
+  { label: "Screenshot-to-video compaction", keywords: ["screenshot", "jpeg", "mp4", "timeline", "rewind"] },
+  { label: "Use all monitors", keywords: ["monitor", "display"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
   { label: "Monitors", conditional: true },
-  { label: "Recording quality", keywords: ["fps", "quality"] },
+  { label: "Recording quality", keywords: ["fps", "quality"], conditional: true },
   // conditional: hidden when screen recording is off (same gate as Recording quality).
   { label: "Capture frequency", keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
   { label: "HD recording for meetings", keywords: ["hd", "meeting"] },
@@ -319,6 +321,7 @@ const SERVER_RESTART_SETTINGS = new Set<keyof SettingsStore>([
   "piiBackend",
   "useChineseMirror",
   "enableWorkflowEvents",
+  "disableSnapshotCompaction",
 ]);
 
 type AudioPipelineSnapshot = {
@@ -2046,6 +2049,8 @@ export function RecordingSettings() {
 
   const aecMode = getAecMode(settings, isMacOS, isWindows);
   const aecDetails = AEC_MODE_DETAILS[aecMode];
+  const screenContextEnabled = !settings.disableVision;
+  const screenshotImagesEnabled = screenContextEnabled && !(settings.disableScreenshots ?? false);
 
   const handleAecModeChange = useCallback((mode: AecMode) => {
     handleSettingsChange(getAecModeSettings(mode), true);
@@ -3711,15 +3716,15 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Screen</h2>
 
-        {/* Screen Recording Toggle */}
+        {/* Screen context capture toggle */}
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
                 <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Screen recording</h3>
-                  <p className="text-xs text-muted-foreground">Capture screenshots from your monitors</p>
+                  <h3 className="text-sm font-medium text-foreground">Screen context capture</h3>
+                  <p className="text-xs text-muted-foreground">Capture app/window context, accessibility text, screenshot images, and OCR fallback</p>
                 </div>
               </div>
               <ManagedSwitch settingKey="disableVision" id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
@@ -3727,7 +3732,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </CardContent>
         </Card>
 
-        {/* Use All Monitors - right below disable screen recording */}
         {!settings.disableVision && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
@@ -3735,8 +3739,56 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div className="flex items-center space-x-2.5">
                   <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
+                    <h3 className="text-sm font-medium text-foreground">Screenshot images</h3>
+                    <p className="text-xs text-muted-foreground">Capture screen pixels and store JPEG screenshots for visual evidence and OCR fallback</p>
+                  </div>
+                </div>
+                <ManagedSwitch
+                  settingKey="disableScreenshots"
+                  id="disableScreenshots"
+                  checked={!(settings.disableScreenshots ?? false)}
+                  onCheckedChange={(checked) => handleSettingsChange({ disableScreenshots: !checked }, true)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {!settings.disableVision && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2.5">
+                  <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                      Screenshot-to-video compaction
+                      <HelpTooltip text="Converts stored screenshot JPEGs into MP4 chunks for rewind playback. Turn this off for task-mining or accessibility-text-only deployments that do not need visual rewind playback." />
+                    </h3>
+                    <p className="text-xs text-muted-foreground">Convert screenshot JPEGs into MP4 chunks for rewind playback</p>
+                  </div>
+                </div>
+                <ManagedSwitch
+                  settingKey="disableSnapshotCompaction"
+                  id="disableSnapshotCompaction"
+                  checked={!(settings.disableSnapshotCompaction ?? false)}
+                  onCheckedChange={(checked) => handleSettingsChange({ disableSnapshotCompaction: !checked }, true)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Use All Monitors - right below screen capture toggles */}
+        {screenshotImagesEnabled && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2.5">
+                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
                     <h3 className="text-sm font-medium text-foreground">Use all monitors</h3>
-                    <p className="text-xs text-muted-foreground">Take screenshot from all available monitors</p>
+                    <p className="text-xs text-muted-foreground">Capture screenshot images from all available monitors</p>
                   </div>
                 </div>
                 <Switch id="useAllMonitors" checked={settings.useAllMonitors} onCheckedChange={(checked) => handleSettingsChange({ useAllMonitors: checked }, true)} />
@@ -3748,7 +3800,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         {/* Monitor Selection — paired directly under "Use all monitors" so
             the picker it reveals sits next to the toggle that controls it,
             not buried below the quality/frequency/HD cards. */}
-        {!settings.disableVision && !settings.useAllMonitors && (
+        {screenshotImagesEnabled && !settings.useAllMonitors && (
           <Card className="border-border bg-card overflow-hidden">
             <CardContent className="px-3 py-2.5">
               <div className="flex items-center space-x-2.5 mb-3">
@@ -3818,7 +3870,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         )}
 
         {/* Recording quality — single knob for crispness + disk cost */}
-        {!settings.disableVision && (
+        {screenshotImagesEnabled && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
               <div className="flex items-center justify-between gap-3">
@@ -3858,7 +3910,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             feel capture is too sparse. Backed by `idleCaptureIntervalMs`
             (null = follow the power profile). Needs a recording restart to
             take effect, hence handleSettingsChange(..., true). */}
-        {!settings.disableVision && (() => {
+        {screenshotImagesEnabled && (() => {
           const idleMs = settings.idleCaptureIntervalMs ?? null;
           const seconds = idleMs == null ? 0 : Math.round(idleMs / 1000);
           return (

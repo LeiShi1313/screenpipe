@@ -29,6 +29,23 @@ describe("computeManagedSettingUpdates", () => {
     expect(r.engineChanged).toBe(true);
   });
 
+  it("enforces screenshot and timeline backend controls", () => {
+    const r = computeManagedSettingUpdates(
+      {
+        disableScreenshots: "true",
+        disableTimeline: "true",
+        disableSnapshotCompaction: "true",
+      },
+      {},
+    );
+    expect(r.engineUpdates).toMatchObject({
+      disableScreenshots: true,
+      disableTimeline: true,
+      disableSnapshotCompaction: true,
+    });
+    expect(r.engineChanged).toBe(true);
+  });
+
   it("forces a valid transcription engine (string value)", () => {
     const r = computeManagedSettingUpdates(
       { audioTranscriptionEngine: "deepgram" },
@@ -53,8 +70,9 @@ describe("computeManagedSettingUpdates", () => {
   });
 
   it("forcing a value equal to the current/default does NOT trigger a restart", () => {
-    // disableVision default is false; forcing false on a fresh device = no change
+    // disabled toggles default to false; forcing false on a fresh device = no change
     expect(computeManagedSettingUpdates({ disableVision: "false" }, {}).engineChanged).toBe(false);
+    expect(computeManagedSettingUpdates({ disableScreenshots: "false" }, {}).engineChanged).toBe(false);
     // already-matching stored value
     expect(
       computeManagedSettingUpdates({ disableAudio: "true" }, { disableAudio: true }).engineChanged,

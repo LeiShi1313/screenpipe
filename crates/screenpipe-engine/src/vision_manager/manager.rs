@@ -47,6 +47,8 @@ pub struct VisionManagerConfig {
     /// snapshot max width via `screenpipe_core::video::*`. Values: "low",
     /// "balanced" (default), "high", "max".
     pub video_quality: String,
+    /// Skip screenshot pixels/JPEG/OCR while keeping accessibility-tree capture.
+    pub disable_screenshots: bool,
 
     /// Mitsukeru fork: overrides for `EventDrivenCaptureConfig`.
     /// Each field is applied only when `Some(_)`. None = follow active PowerProfile.
@@ -486,6 +488,7 @@ impl VisionManager {
         // baseline ceiling (`min(profile, baseline)`) at runtime.
         let mut capture_config = EventDrivenCaptureConfig {
             jpeg_quality: baseline_q,
+            disable_screenshots: self.config.disable_screenshots,
             ..EventDrivenCaptureConfig::default()
         };
         // Mitsukeru fork: apply per-parameter CLI / settings overrides if any.
@@ -748,6 +751,7 @@ mod tests {
             pause_on_drm_content: false,
             languages: vec![Language::English],
             video_quality: "balanced".to_string(),
+            disable_screenshots: false,
             idle_capture_interval_ms: None,
             visual_check_interval_ms: None,
             visual_change_threshold: None,

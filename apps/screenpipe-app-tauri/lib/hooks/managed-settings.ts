@@ -7,11 +7,11 @@
 // use-enterprise-policy.ts pulls in.
 //
 // History/severity: only PII + keyboard/click were ever applied. `disableAudio`
-// (#4586) and now `disableVision` / `disableMeetingDetector` / `listen_on_lan` /
-// `audioTranscriptionEngine` were exposed in the policy UI but NEVER enforced on
-// the device — silent no-ops. So a `disableVision: "Always off"` ("Screen
-// recording: Always off") policy left screens recording + uploading anyway — a
-// real privacy/compliance hole, the same bug class as the audio one.
+// (#4586) and now `disableVision` / `disableScreenshots` / timeline work /
+// `disableMeetingDetector` / `listen_on_lan` / `audioTranscriptionEngine` were
+// exposed in the policy UI but NEVER enforced on the device — silent no-ops.
+// So a `disableVision: "Always off"` policy left screens recording + uploading
+// anyway — a real privacy/compliance hole, the same bug class as the audio one.
 
 // Allowed transcription-engine values mirror the policy dropdown; an unknown
 // value is ignored rather than written to the store.
@@ -31,6 +31,9 @@ export const ENGINE_BOOL_POLICY_KEYS: Record<string, string> = {
   disableClickCapture: "disableClickCapture",
   disableAudio: "disableAudio",
   disableVision: "disableVision",
+  disableScreenshots: "disableScreenshots",
+  disableTimeline: "disableTimeline",
+  disableSnapshotCompaction: "disableSnapshotCompaction",
   disableMeetingDetector: "disableMeetingDetector",
   listen_on_lan: "listenOnLan",
 };
@@ -42,6 +45,9 @@ export const ENGINE_BOOL_DEFAULTS: Record<string, boolean> = {
   disableClickCapture: false,
   disableAudio: false,
   disableVision: false,
+  disableScreenshots: false,
+  disableTimeline: false,
+  disableSnapshotCompaction: false,
   disableMeetingDetector: false,
   listenOnLan: false,
 };

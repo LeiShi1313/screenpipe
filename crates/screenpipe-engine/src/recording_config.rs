@@ -30,6 +30,10 @@ pub struct RecordingConfig {
     // Feature toggles
     pub disable_audio: bool,
     pub disable_vision: bool,
+    /// Disable screenshot image capture while keeping accessibility/UI-event
+    /// capture alive. This skips visual-diff images, full screenshot capture,
+    /// JPEG writes, and OCR fallback.
+    pub disable_screenshots: bool,
     /// Disable the timeline / rewind feature. Skips timeline-only backend work
     /// (hot frame cache warm-up + per-frame/audio buffering into the hot cache
     /// that only the timeline streaming endpoint consumes).
@@ -271,6 +275,7 @@ impl RecordingConfig {
             disable_audio: settings.disable_audio
                 || settings.audio_capture_mode.eq_ignore_ascii_case("disabled"),
             disable_vision: settings.disable_vision,
+            disable_screenshots: settings.disable_screenshots,
             disable_timeline: settings.disable_timeline,
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
@@ -512,6 +517,7 @@ impl RecordingConfig {
             pause_on_drm_content: self.pause_on_drm_content,
             languages: self.languages.clone(),
             video_quality: self.video_quality.clone(),
+            disable_screenshots: self.disable_screenshots,
             idle_capture_interval_ms: self.idle_capture_interval_ms,
             visual_check_interval_ms: self.visual_check_interval_ms,
             visual_change_threshold: self.visual_change_threshold,
@@ -758,6 +764,7 @@ mod tests {
         assert!(vision.ignore_incognito_windows);
         assert!(vision.pause_on_drm_content);
         assert_eq!(vision.video_quality, "high");
+        assert!(!vision.disable_screenshots);
         assert_eq!(vision.idle_capture_interval_ms, Some(2_000));
         assert_eq!(vision.visual_check_interval_ms, Some(350));
         assert_eq!(vision.visual_change_threshold, Some(0.18));

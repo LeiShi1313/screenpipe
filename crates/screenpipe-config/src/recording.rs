@@ -206,9 +206,18 @@ pub struct RecordingSettings {
     pub vocabulary: Vec<VocabEntry>,
 
     // ── Vision ─────────────────────────────────────────────────────────
-    /// Disable all screen capture.
+    /// Disable the entire vision pipeline (screen images + accessibility/OCR).
+    /// Prefer `disableScreenshots` when the goal is to stop image capture while
+    /// keeping accessibility text and UI events.
     #[serde(rename = "disableVision")]
     pub disable_vision: bool,
+
+    /// Stop taking screenshot images while keeping accessibility-tree capture.
+    /// This skips visual-diff screenshots, full screenshot capture, JPEG writes,
+    /// and OCR fallback. Useful for enterprise task mining where a11y text and
+    /// UI events are enough and screen pixels are too expensive or sensitive.
+    #[serde(rename = "disableScreenshots", default)]
+    pub disable_screenshots: bool,
 
     /// Disable the timeline / rewind feature. When true, the engine skips
     /// timeline-only work: warming the hot frame cache from the DB at startup
@@ -682,6 +691,7 @@ impl Default for RecordingSettings {
             batch_max_duration_secs: None,
             vocabulary: vec![],
             disable_vision: false,
+            disable_screenshots: false,
             disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
@@ -941,6 +951,7 @@ mod tests {
             "vadSensitivity": "high",
             "filterMusic": false,
             "disableVision": false,
+            "disableScreenshots": false,
             "monitorIds": [],
             "useAllMonitors": true,
             "fps": 0.5,

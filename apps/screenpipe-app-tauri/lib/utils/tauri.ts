@@ -2736,9 +2736,17 @@ batchMaxDurationSecs?: number | null;
  */
 vocabularyWords?: VocabEntry[];
 /**
- * Disable all screen capture.
+ * Disable the entire vision pipeline (screen images + accessibility/OCR).
+ * Prefer `disableScreenshots` when the goal is to stop image capture while
+ * keeping accessibility text and UI events.
  */
 disableVision: boolean;
+/**
+ * Stop taking screenshot images while keeping accessibility-tree capture.
+ * This skips visual-diff screenshots, full screenshot capture, JPEG writes,
+ * and OCR fallback.
+ */
+disableScreenshots?: boolean;
 /**
  * Disable the timeline / rewind feature. When true, the engine skips
  * timeline-only work: warming the hot frame cache from the DB at startup

@@ -194,8 +194,13 @@ pub enum RestartGate {
     /// Boot reached the "ready" phase — safe to call `process::exit` /
     /// `app.restart()` / `download_and_install` on Windows.
     Proceed,
-    /// Boot reached the "error" phase. Restarting won't fix it; defer
-    /// and let the user investigate the boot failure first.
+    /// Boot reached the "error" phase. The failed boot is *finished* — no
+    /// audio init is in flight, so the #3557 teardown race can't happen and
+    /// restarting is safe. It's also usually the cure: a boot error like
+    /// "port 3030 in use" (a prior core's listener not yet released) only
+    /// clears with a full process relaunch. Blocking here wedged users out
+    /// of updates entirely (#4726: every banner click refused until a
+    /// manual quit).
     Errored,
     /// Boot was still pending when the timeout elapsed. Defer; the next
     /// restart trigger (next periodic check, user action) will retry.
@@ -203,8 +208,12 @@ pub enum RestartGate {
 }
 
 impl RestartGate {
-    pub fn proceed(self) -> bool {
-        matches!(self, RestartGate::Proceed)
+    /// Whether it's safe to tear down and relaunch now. True for `Proceed`
+    /// and `Errored` (see variant docs); false only while a boot is still
+    /// making progress (`DeferPending`) — exiting mid-`AudioManager::new`
+    /// is the #3557 segfault.
+    pub fn should_restart(self) -> bool {
+        !matches!(self, RestartGate::DeferPending)
     }
 
     fn as_str(self) -> &'static str {
@@ -246,7 +255,8 @@ pub async fn await_restart_gate(timeout: Duration, label: &str) -> RestartGate {
         crate::health::BootReadiness::Ready => RestartGate::Proceed,
         crate::health::BootReadiness::Errored => {
             warn!(
-                "{}: boot phase is 'error' — deferring restart (won't help) (#3622)",
+                "{}: boot phase is 'error' — restarting anyway; a relaunch is the \
+                 recovery path for a failed boot (#3622, #4726)",
                 label
             );
             RestartGate::Errored
@@ -266,16 +276,19 @@ pub async fn await_restart_gate(timeout: Duration, label: &str) -> RestartGate {
 
 /// Frontend-callable gate. The banner awaits this before calling
 /// `downloadAndInstall` (Windows: triggers process::exit internally) or
-/// `relaunch`. Returns one of `"proceed"`, `"errored"`, or `"pending"`
-/// — frontend toasts on the latter two.
+/// `relaunch`. Returns `"proceed"` when a restart may go ahead — including
+/// on an errored boot, where the relaunch IS the recovery (#4726) — or
+/// `"pending"` while a boot is still in progress (frontend toasts).
 #[tauri::command]
 #[specta::specta]
 pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
     let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
-    await_restart_gate(cap, "banner-triggered restart")
-        .await
-        .as_str()
-        .to_string()
+    let gate = await_restart_gate(cap, "banner-triggered restart").await;
+    if gate.should_restart() {
+        "proceed".to_string()
+    } else {
+        gate.as_str().to_string()
+    }
 }
 
 /// Banner-click restart. plugin-process `relaunch()` fires
@@ -291,7 +304,7 @@ pub async fn restart_for_update(
 ) -> Result<String, String> {
     let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
     let gate = await_restart_gate(cap, "banner-triggered restart").await;
-    if !gate.proceed() {
+    if !gate.should_restart() {
         return Ok(gate.as_str().to_string());
     }
 
@@ -299,8 +312,8 @@ pub async fn restart_for_update(
 
     // Non-fatal AND time-bounded: a wedged capture/audio teardown must not
     // stall the relaunch (2026-06-26 MacBook Air: VisionManager hung 10s →
-    // ~57s frozen before the update applied). server.rs retries the port bind
-    // if the next boot races teardown.
+    // ~57s frozen before the update applied). server_core.rs retries the
+    // port bind if the next boot races teardown.
     match bounded_teardown(
         PRE_EXIT_TEARDOWN_TIMEOUT,
         stop_screenpipe(app.state::<RecordingState>(), app.clone()),
@@ -929,7 +942,7 @@ impl UpdatesManager {
                 let label = format!("auto-update v{}", update.version);
                 if !await_restart_gate(AUTO_UPDATE_GATE_TIMEOUT, &label)
                     .await
-                    .proceed()
+                    .should_restart()
                 {
                     return Result::Ok(true);
                 }
@@ -1253,7 +1266,11 @@ mod tests {
 
     #[test]
     fn cooldown_absent_when_nothing_failed() {
-        assert!(!failed_version_in_cooldown(None, "2.5.57", UPDATE_FAILURE_COOLDOWN));
+        assert!(!failed_version_in_cooldown(
+            None,
+            "2.5.57",
+            UPDATE_FAILURE_COOLDOWN
+        ));
     }
 
     #[test]
@@ -1324,8 +1341,18 @@ mod tests {
     // gate's return values so the frontend string-match path can't drift.
     use crate::health::{set_boot_error, set_boot_phase};
 
+    /// The boot phase is a process-wide global; the gate tests below each
+    /// set it, await the gate (up to 1s for the pending case), and reset it.
+    /// Without serialization the parallel test runner interleaves them and
+    /// one test's phase write leaks into another's gate wait (same class as
+    /// the sleep_monitor de-flake, #4795).
+    static BOOT_PHASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn await_safe_restart_returns_proceed_when_boot_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_boot_phase("ready", None);
         let result = await_safe_restart(Some(1)).await;
         set_boot_phase("idle", None);
@@ -1336,18 +1363,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn await_safe_restart_returns_errored_on_boot_error() {
+    async fn await_safe_restart_proceeds_on_boot_error() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A failed boot is finished — nothing is mid-init, so restarting is
+        // safe, and a relaunch is the recovery path (#4726: returning
+        // "errored" here wedged users out of updates until a manual quit).
         set_boot_error("simulated boot failure for banner-gate test");
         let result = await_safe_restart(Some(1)).await;
         set_boot_phase("idle", None);
         assert_eq!(
-            result, "errored",
-            "banner gate must surface errored so frontend toasts instead of restarting"
+            result, "proceed",
+            "banner gate must let an errored boot restart — relaunch is the recovery path"
         );
     }
 
     #[tokio::test]
     async fn await_safe_restart_returns_pending_on_timeout() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_boot_phase("starting", None);
         let result = await_safe_restart(Some(1)).await;
         set_boot_phase("idle", None);
@@ -1355,12 +1391,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_gate_proceed_is_the_only_truthy_variant() {
-        // Guards against a new variant accidentally mapping to true and
-        // shipping a process::exit race.
-        assert!(RestartGate::Proceed.proceed());
-        assert!(!RestartGate::Errored.proceed());
-        assert!(!RestartGate::DeferPending.proceed());
+    fn restart_gate_defers_only_while_boot_in_progress() {
+        // DeferPending is the only state where a restart races an in-flight
+        // boot (#3557 ORT teardown segfault). Ready and Errored boots are
+        // both finished, so restarting is safe — and for Errored it's the
+        // recovery path (#4726).
+        assert!(RestartGate::Proceed.should_restart());
+        assert!(RestartGate::Errored.should_restart());
+        assert!(!RestartGate::DeferPending.should_restart());
     }
 
     #[test]

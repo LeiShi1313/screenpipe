@@ -72,6 +72,51 @@ pub struct ServerCore {
     owned_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Bind attempts before giving up on the HTTP port. Together with
+/// [`BIND_RETRY_DELAY`] this rides out a previous core's serve task that is
+/// still releasing the listener during an engine restart (~10s total),
+/// without stalling a genuinely conflicted boot for long.
+const BIND_RETRY_ATTEMPTS: u32 = 20;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// [`bind_listener`] with retry on `AddrInUse`. Only that error kind is
+/// retried — anything else (permission denied, bad address) fails fast on
+/// the first attempt.
+async fn bind_listener_with_retry(
+    addr: SocketAddr,
+    attempts: u32,
+    delay: Duration,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let mut last_err = None;
+    for attempt in 1..=attempts.max(1) {
+        match bind_listener(addr).await {
+            Ok(listener) => {
+                if attempt > 1 {
+                    info!("bound {} after {} attempts", addr, attempt);
+                }
+                return Ok(listener);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < attempts => {
+                if attempt == 1 || attempt % 4 == 0 {
+                    warn!(
+                        "port {} in use (attempt {}/{}), retrying in {:?} — \
+                         previous server may still be releasing it",
+                        addr.port(),
+                        attempt,
+                        attempts,
+                        delay
+                    );
+                }
+                last_err = Some(e);
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrInUse, "bind retry loop")))
+}
+
 impl ServerCore {
     /// Build and start the long-lived server components.
     ///
@@ -675,11 +720,18 @@ impl ServerCore {
             }
         });
 
-        // Bind HTTP listener before returning (catches port conflicts early)
-        let listener = bind_listener(SocketAddr::new(
-            IpAddr::V4(config.listen_address),
-            config.port,
-        ))
+        // Bind HTTP listener before returning (catches port conflicts early).
+        // Retried: an engine restart can reach this bind while the previous
+        // core's serve task is still releasing the port (teardown is async),
+        // and a one-shot bind then fails with AddrInUse, flips boot phase to
+        // 'error', and strands a half-torn-down app (#4726). ~10s of retries
+        // covers any orderly teardown; a genuinely foreign process holding
+        // the port still fails cleanly after the last attempt.
+        let listener = bind_listener_with_retry(
+            SocketAddr::new(IpAddr::V4(config.listen_address), config.port),
+            BIND_RETRY_ATTEMPTS,
+            BIND_RETRY_DELAY,
+        )
         .await
         .map_err(|e| {
             let msg = format!("Failed to bind port {}: {}", config.port, e);
@@ -1086,5 +1138,52 @@ impl ServerCore {
         self.db.close().await;
         screenpipe_secrets::close_all_secret_pools().await;
         info!("Closed all SQLite pools");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn localhost(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[tokio::test]
+    async fn bind_retry_succeeds_once_previous_listener_releases() {
+        // Grab an ephemeral port, keep it held, then release it mid-retry —
+        // models a prior core's serve task letting go during teardown.
+        let holder = tokio::net::TcpListener::bind(localhost(0)).await.unwrap();
+        let addr = holder.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(holder);
+        });
+
+        let listener = bind_listener_with_retry(addr, 20, Duration::from_millis(50))
+            .await
+            .expect("bind must succeed after the previous listener releases the port");
+        assert_eq!(listener.local_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn bind_retry_fails_when_port_stays_held() {
+        let holder = tokio::net::TcpListener::bind(localhost(0)).await.unwrap();
+        let addr = holder.local_addr().unwrap();
+
+        let err = bind_listener_with_retry(addr, 3, Duration::from_millis(10))
+            .await
+            .expect_err("bind must fail when a foreign process keeps the port");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(holder);
+    }
+
+    #[tokio::test]
+    async fn bind_retry_first_attempt_fast_path() {
+        let listener = bind_listener_with_retry(localhost(0), 20, Duration::from_millis(50))
+            .await
+            .expect("binding a free ephemeral port must succeed immediately");
+        drop(listener);
     }
 }

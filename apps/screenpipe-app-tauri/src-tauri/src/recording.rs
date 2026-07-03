@@ -575,6 +575,40 @@ async fn restore_interrupted_meeting_for_capture_restart(
     Ok(())
 }
 
+/// Probe `/health`, retrying once before declaring the server dead. A single
+/// 2s one-shot false-negatives when the server is briefly busy (e.g. SQLite
+/// `BEGIN IMMEDIATE` contention pushes the handler past the deadline) — and a
+/// false negative here triggers a needless *full engine restart*, which is
+/// exactly the teardown/bind race that stranded #4726 in a boot-error state.
+async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
+    // Second attempt gets a longer deadline: transient contention clears in
+    // well under this, while a truly dead server fails both fast.
+    for timeout_secs in [2u64, 4] {
+        let mut req = reqwest::Client::new()
+            .get(health_url)
+            .timeout(std::time::Duration::from_secs(timeout_secs));
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        match req.send().await {
+            Ok(r) if r.status().is_success() => return true,
+            _ => {
+                warn!(
+                    "health probe {} failed (timeout {}s), {}",
+                    health_url,
+                    timeout_secs,
+                    if timeout_secs == 2 {
+                        "retrying once before declaring the server dead"
+                    } else {
+                        "server considered dead"
+                    }
+                );
+            }
+        }
+    }
+    false
+}
+
 /// Start recording. Requires the server to be running.
 #[tauri::command]
 #[specta::specta]
@@ -635,13 +669,11 @@ pub async fn start_capture(
         (core.port, core.local_api_key.clone())
     };
 
-    let mut req = reqwest::Client::new()
-        .get(format!("http://localhost:{}/health", port))
-        .timeout(std::time::Duration::from_secs(2));
-    if let Some(ref key) = api_key {
-        req = req.header("Authorization", format!("Bearer {}", key));
-    }
-    let healthy = matches!(req.send().await, Ok(r) if r.status().is_success());
+    let healthy = probe_server_health(
+        &format!("http://localhost:{}/health", port),
+        api_key.as_deref(),
+    )
+    .await;
     if !healthy {
         warn!(
             "Server unresponsive on port {} — requesting full restart",
@@ -949,34 +981,28 @@ pub async fn spawn_screenpipe(
     {
         let server_guard = state.server.lock().await;
         if server_guard.is_some() {
-            match reqwest::Client::new()
-                .get(&health_url)
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    info!("Server already running and healthy on port {}", port);
-                    // Server is fine — just ensure capture is running
-                    drop(server_guard);
-                    let capture_guard = state.capture.lock().await;
-                    if capture_guard.is_some() {
-                        state.is_starting.store(false, Ordering::SeqCst);
-                        return Ok(());
-                    }
-                    drop(capture_guard);
-                    // Start capture on existing server. If this fails before
-                    // start_capture_internal reaches its success cleanup, clear
-                    // startup flags so the next retry is not wedged.
-                    let result = start_capture_internal(&state, &app).await;
+            let api_key = server_guard
+                .as_ref()
+                .and_then(|core| core.local_api_key.clone());
+            if probe_server_health(&health_url, api_key.as_deref()).await {
+                info!("Server already running and healthy on port {}", port);
+                // Server is fine — just ensure capture is running
+                drop(server_guard);
+                let capture_guard = state.capture.lock().await;
+                if capture_guard.is_some() {
                     state.is_starting.store(false, Ordering::SeqCst);
-                    state.is_starting_capture.store(false, Ordering::SeqCst);
-                    return result;
+                    return Ok(());
                 }
-                _ => {
-                    warn!("Server exists but not responding, will do full restart");
-                }
+                drop(capture_guard);
+                // Start capture on existing server. If this fails before
+                // start_capture_internal reaches its success cleanup, clear
+                // startup flags so the next retry is not wedged.
+                let result = start_capture_internal(&state, &app).await;
+                state.is_starting.store(false, Ordering::SeqCst);
+                state.is_starting_capture.store(false, Ordering::SeqCst);
+                return result;
             }
+            warn!("Server exists but not responding, will do full restart");
         }
     }
 

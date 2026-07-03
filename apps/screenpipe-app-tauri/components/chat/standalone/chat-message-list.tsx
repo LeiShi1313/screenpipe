@@ -20,9 +20,7 @@ import {
   isSteeredAssistantMessage,
 } from "@/lib/chat/message-rendering";
 import { cn } from "@/lib/utils";
-import type { ContentBlock, Message } from "@/lib/chat/types";
-import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
-import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
+import type { Message } from "@/lib/chat/types";
 import type { MarkdownCitationPlan } from "@/lib/chat/markdown-export";
 
 export interface ChatMessageListProps {
@@ -55,11 +53,6 @@ export interface ChatMessageListProps {
   sendMessage: (message: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>;
   openFilePreview: (path: string) => void;
   branchConversation: (messageId: string) => Promise<void> | void;
-  connectionItems?: ConnectionListItem[];
-  onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
-  onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
-  onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
-  onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
   suppressSourceFooters?: boolean;
 }
 
@@ -93,11 +86,6 @@ export function ChatMessageList({
   sendMessage,
   openFilePreview,
   branchConversation,
-  connectionItems = [],
-  onOpenConnectionSetup,
-  onConnectConnectionAction,
-  onContinueConnectionAction,
-  onDismissConnectionAction,
   suppressSourceFooters = false,
 }: ChatMessageListProps) {
   return (
@@ -301,11 +289,6 @@ export function ChatMessageList({
                           onImageClick={onOpenImageViewer}
                           onRetry={(prompt) => sendMessage(prompt)}
                           onOpenViewerPath={openFilePreview}
-                          connectionItems={connectionItems}
-                          onOpenConnectionSetup={onOpenConnectionSetup}
-                          onConnectConnectionAction={onConnectConnectionAction}
-                          onContinueConnectionAction={onContinueConnectionAction}
-                          onDismissConnectionAction={onDismissConnectionAction}
                         />
                       )}
                     </div>

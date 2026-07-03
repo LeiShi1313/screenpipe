@@ -99,23 +99,6 @@ export function resolveLocalPathFromMarkdownUrl(url: string): string | null {
   return null;
 }
 
-function localImageFallbackSrc(path: string): string {
-  return `${getApiBaseUrl()}/experimental/frames/from-file?path=${encodeURIComponent(path)}`;
-}
-
-function localImageSrc(path: string): string {
-  try {
-    return convertFileSrc(path);
-  } catch {
-    return localImageFallbackSrc(path);
-  }
-}
-
-function hideBrokenLocalImage(target: HTMLImageElement) {
-  target.style.display = "none";
-  target.setAttribute("aria-hidden", "true");
-}
-
 function wrapPathForMarkdown(path: string): string {
   return `<${path.replace(/>/g, "%3E")}>`;
 }
@@ -194,8 +177,14 @@ export function createMediaAwareMarkdownComponents(
         return <CustomImage src={src} alt={alt} {...props} />;
       }
 
-      const localPath = resolveLocalPathFromMarkdownUrl(src);
-      const imgSrc = localPath ? localImageSrc(localPath) : src;
+      let imgSrc = src;
+      if (src.startsWith("/")) {
+        try {
+          imgSrc = convertFileSrc(src);
+        } catch {
+          imgSrc = `${getApiBaseUrl()}/experimental/frames/from-file?path=${encodeURIComponent(src)}`;
+        }
+      }
 
       return (
         // eslint-disable-next-line @next/next/no-img-element
@@ -206,13 +195,10 @@ export function createMediaAwareMarkdownComponents(
           loading="lazy"
           onError={(e) => {
             const target = e.currentTarget;
-            if (!localPath) return;
-            if (!target.dataset.retried) {
+            if (src.startsWith("/") && !target.dataset.retried) {
               target.dataset.retried = "1";
-              target.src = localImageFallbackSrc(localPath);
-              return;
+              target.src = convertFileSrc(src);
             }
-            hideBrokenLocalImage(target);
           }}
           {...props}
         />

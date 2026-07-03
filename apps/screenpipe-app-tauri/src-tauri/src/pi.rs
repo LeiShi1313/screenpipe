@@ -945,7 +945,53 @@ fn verify_pi_package_install(install_dir: &Path) -> Result<(), String> {
     }
 }
 
+/// Install Pi dependencies, self-healing on verification failure.
+///
+/// An interrupted cache→node_modules copy (app quit, AV lock, EPERM) leaves a
+/// package dir without `dist/`, and a later `bun install` trusts bun.lock
+/// ("no changes") without re-checking file contents — so the corruption is
+/// permanent until node_modules is cleared. Never ask the user to delete
+/// directories: retry once with node_modules+lockfiles cleared, then once
+/// more with the bun cache wiped too, before reporting failure.
 fn run_pi_package_install(install_dir: &Path, bun: &str) -> Result<(), String> {
+    let first = run_pi_package_install_once(install_dir, bun);
+    let Err(e) = first else { return Ok(()) };
+    if !e.contains("dependency verification failed") {
+        return Err(e);
+    }
+
+    warn!(
+        "Pi install verification failed; self-healing (clearing node_modules + lockfiles): {}",
+        e
+    );
+    clear_pi_install_artifacts(install_dir);
+    seed_pi_package_json(install_dir);
+    let second = run_pi_package_install_once(install_dir, bun);
+    let Err(e) = second else {
+        info!("Pi install self-heal succeeded after clearing node_modules");
+        return Ok(());
+    };
+    if !e.contains("dependency verification failed") {
+        return Err(e);
+    }
+
+    warn!(
+        "Pi install still failing verification; self-healing (wiping bun cache too): {}",
+        e
+    );
+    clear_pi_install_artifacts(install_dir);
+    let _ = std::fs::remove_dir_all(install_dir.join(".bun-cache"));
+    seed_pi_package_json(install_dir);
+    match run_pi_package_install_once(install_dir, bun) {
+        Ok(()) => {
+            info!("Pi install self-heal succeeded after wiping bun cache");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_pi_package_install_once(install_dir: &Path, bun: &str) -> Result<(), String> {
     let cache_dir = install_dir.join(".bun-cache");
     let _ = std::fs::create_dir_all(&cache_dir);
 
@@ -1019,14 +1065,23 @@ fn find_local_pi_entrypoint() -> Option<String> {
 
 fn find_pi_executable() -> Option<String> {
     // 1. Check screenpipe-managed local install first (preferred — we control the deps)
-    if let Some(js) = find_local_pi_entrypoint() {
-        if let Some(install_dir) = pi_local_install_dir() {
-            if let Some(error) = local_pi_install_integrity_error(&install_dir) {
-                warn!("Ignoring unhealthy local pi-agent install: {}", error);
-                return None;
+    if let Some(install_dir) = pi_local_install_dir() {
+        if install_dir.join("package.json").exists() {
+            // A managed install exists (or was attempted). Never fall through
+            // to global installs from here: a stale global bun shim crash-loops
+            // with a misleading module-not-found error, hiding the real install
+            // failure that pi_start would otherwise surface.
+            match local_pi_install_integrity_error(&install_dir) {
+                None => return find_local_pi_entrypoint(),
+                Some(error) => {
+                    warn!(
+                        "Local pi-agent install is unhealthy, not falling back to global pi: {}",
+                        error
+                    );
+                    return None;
+                }
             }
         }
-        return Some(js);
     }
 
     // 2. Fallback to global install locations
@@ -2388,7 +2443,7 @@ pub async fn pi_start_inner(
                         m.child = None;
                         m.stdin = None;
                         let install_hint = take_pi_install_error()
-                            .map(|e| format!(" The Pi install previously failed: {} Try removing ~/.screenpipe/pi-agent and restarting.", e))
+                            .map(|e| format!(" The Pi install previously failed: {} Restart screenpipe to retry the install automatically.", e))
                             .unwrap_or_default();
                         let stderr_hint = first_stderr_line
                             .lock()

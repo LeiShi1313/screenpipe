@@ -105,8 +105,47 @@ jobs:
             --head-ref HEAD `
             --out "$env:AGENTIC_OUT_DIR/plan.json"
 
+      - name: Install Scream on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $screamUrl = "https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip"
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $screamUrl -OutFile Scream4.0.zip
+              break
+            } catch {
+              if ($attempt -eq 5) { throw }
+              Write-Host "Scream download failed on attempt $attempt; retrying..."
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
+          Expand-Archive -Path Scream4.0.zip -DestinationPath Scream
+          openssl req -batch -verbose -x509 -newkey rsa -keyout ScreamCertificate.pvk -out ScreamCertificate.cer -nodes -extensions v3_req
+          openssl pkcs12 -export -nodes -in ScreamCertificate.cer -inkey ScreamCertificate.pvk -out ScreamCertificate.pfx -passout pass:
+
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Sign and install Scream driver
+        shell: pwsh
+        run: |
+          signtool sign /v /fd SHA256 /f ScreamCertificate.pfx Scream\Install\driver\x64\Scream.cat
+          Import-Certificate -FilePath ScreamCertificate.cer -CertStoreLocation Cert:\LocalMachine\root
+          Import-Certificate -FilePath ScreamCertificate.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+          Scream\Install\helpers\devcon-x64.exe install Scream\Install\driver\x64\Scream.inf *Scream
+        timeout-minutes: 5
+
+      - name: Start Windows audio services
+        shell: pwsh
+        run: |
+          foreach ($name in @("AudioEndpointBuilder", "Audiosrv")) {
+            $service = Get-Service -Name $name
+            if ($service.Status -ne "Running") {
+              Start-Service -Name $name
+            }
+            Get-Service -Name $name | Format-Table -AutoSize
+          }
 
       - name: Cache Windows build artifacts
         uses: actions/cache@v4

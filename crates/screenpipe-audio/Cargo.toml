@@ -165,6 +165,8 @@ criterion = { workspace = true }
 strsim = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
+# macOS autorelease-leak repro test reads peak RSS via getrusage.
+libc = { workspace = true }
 
 
 [features]

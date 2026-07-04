@@ -1,0 +1,90 @@
+name: Codex PR loop memory
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print planned writes without changing GitHub"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  checks: read
+
+concurrency:
+  group: pr-loop-memory-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_REPO: ${{ github.repository }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      MAINTAINER_LOGINS: ${{ vars.MAINTAINER_LOGINS }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      PYTHONPATH: .github/scripts
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Collect PR backlog context
+        run: python -m pr_loop.guardian --config .github/pr-loop.json --context-out pr-loop-context.md
+
+      - name: Run Codex backlog review
+        id: codex
+        if: env.OPENAI_API_KEY != ''
+        uses: openai/codex-action@v1
+        continue-on-error: true
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/pr-loop-daily.md
+          output-file: codex-pr-loop-output.md
+          allow-bots: true
+
+      - name: Ensure Codex output exists
+        if: always()
+        run: |
+          if [ ! -s codex-pr-loop-output.md ]; then
+            cat > codex-pr-loop-output.md <<'EOF'
+          # Codex PR loop memory
+
+          ## Maintainer queue
+
+          Codex did not produce a usable daily review in this run. The collector completed, but `OPENAI_API_KEY` was missing, the Codex step failed, or Codex returned an empty output file.
+
+          ## System notes
+
+          Check the workflow logs and the `pr-loop-context` artifact for the raw PR context. No PR comments were posted by this workflow.
+          EOF
+          fi
+
+      - name: Publish daily memory issue
+        if: always()
+        run: |
+          args=""
+          if [ "$DRY_RUN" = "true" ]; then
+            args="--dry-run"
+          fi
+          python -m pr_loop.guardian --config .github/pr-loop.json --publish-codex-output codex-pr-loop-output.md $args
+
+      - name: Upload PR loop artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-loop-context
+          path: |
+            pr-loop-context.md
+            codex-pr-loop-output.md

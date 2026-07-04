@@ -51,6 +51,8 @@ app.py
 *.pyo
 *.pyd
 *.py
+!.github/scripts/pr_loop/*.py
+!.github/scripts/pr_loop_tests/*.py
 !scripts/memory-leak/leak_hunt.py
 *.pyw
 *.pyz

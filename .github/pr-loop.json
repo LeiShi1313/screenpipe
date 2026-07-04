@@ -1,0 +1,78 @@
+{
+  "target_repo": "",
+  "timezone": "America/Los_Angeles",
+  "limit": 60,
+  "interval_seconds": 1800,
+  "daily_issue": {
+    "title_prefix": "Codex PR loop memory",
+    "label": "ai-pr-loop",
+    "label_color": "6f42c1",
+    "label_description": "Daily AI PR triage memory issue"
+  },
+  "pr_comments": {
+    "enabled": true,
+    "minimum_severity": "high",
+    "max_comments_per_run": 5
+  },
+  "mergeable": {
+    "requires_approval": true,
+    "clean_states": ["CLEAN", "HAS_HOOKS", "UNKNOWN"]
+  },
+  "priority": {
+    "high_value_paths": [
+      ".github/workflows/**",
+      "auth/**",
+      "**/auth/**",
+      "billing/**",
+      "**/billing/**",
+      "payments/**",
+      "**/payments/**",
+      "security/**",
+      "**/security/**",
+      "infra/**",
+      "**/infra/**",
+      "migrations/**",
+      "**/migrations/**",
+      "db/**",
+      "**/db/**",
+      "database/**",
+      "**/database/**",
+      "api/**",
+      "**/api/**",
+      "server/**",
+      "**/server/**"
+    ],
+    "low_value_paths": [
+      "docs/**",
+      "*.md",
+      "**/*.md",
+      "*.mdx",
+      "**/*.mdx",
+      "*.png",
+      "**/*.png",
+      "*.jpg",
+      "**/*.jpg",
+      "*.jpeg",
+      "**/*.jpeg",
+      "*.gif",
+      "**/*.gif",
+      "*.svg",
+      "**/*.svg"
+    ],
+    "large_pr_files": 25,
+    "large_pr_lines": 900,
+    "min_body_chars": 80
+  },
+  "codex": {
+    "context_path": "pr-loop-context.md",
+    "recent_feedback_prs": 80,
+    "max_feedback_examples": 30,
+    "feedback_min_chars": 40,
+    "maintainer_logins": [],
+    "include_all_human_feedback_when_no_maintainers": false,
+    "max_diff_chars_per_pr": 20000,
+    "max_discussion_chars_per_pr": 6000,
+    "max_files_per_pr": 80,
+    "max_total_context_chars": 180000
+  }
+}

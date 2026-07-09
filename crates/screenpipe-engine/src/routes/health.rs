@@ -289,12 +289,15 @@ pub struct HealthCheckResponse {
     pub recording_coverage: Option<CoverageSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_stats: Option<PoolHealthInfo>,
-    /// True once the write queue has flagged the disk-I/O wedge as degraded.
+    /// True once the write queue has flagged a failed write path as degraded.
     #[serde(default)]
     pub write_queue_degraded: bool,
     /// Consecutive fatal write batches right now (0 when the write path is healthy).
     #[serde(default)]
     pub write_queue_consecutive_fatal: u64,
+    /// Consecutive batches that exceeded the SQLite lock retry budget.
+    #[serde(default)]
+    pub write_queue_consecutive_contention: u64,
     /// How many times the write pool was reopened in-process to clear poisoned connections.
     #[serde(default)]
     pub write_pool_reopens: u64,
@@ -529,6 +532,7 @@ fn degraded_response() -> HealthCheckResponse {
         pool_stats: None,
         write_queue_degraded: false,
         write_queue_consecutive_fatal: 0,
+        write_queue_consecutive_contention: 0,
         write_pool_reopens: 0,
         persistent_failure_signals: 0,
         vision_db_write_stalled: false,
@@ -1332,6 +1336,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         },
         write_queue_degraded: wqh.is_degraded(),
         write_queue_consecutive_fatal: wqh.consecutive_fatal_batches(),
+        write_queue_consecutive_contention: wqh.consecutive_contention_batches(),
         write_pool_reopens: wqh.write_pool_reopens(),
         persistent_failure_signals: wqh.persistent_failure_signals(),
         vision_db_write_stalled,
@@ -1531,6 +1536,7 @@ mod tests {
             pool_stats: None,
             write_queue_degraded: false,
             write_queue_consecutive_fatal: 0,
+            write_queue_consecutive_contention: 0,
             write_pool_reopens: 0,
             persistent_failure_signals: 0,
             vision_db_write_stalled: false,

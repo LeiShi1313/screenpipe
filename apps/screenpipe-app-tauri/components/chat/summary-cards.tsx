@@ -9,7 +9,13 @@ import { ChevronDown, ChevronUp, Plug, Plus, RefreshCw, Sparkles } from "lucide-
 import posthog from "posthog-js";
 import { PipeAIIconLarge } from "@/components/pipe-ai-icon";
 import { type TemplatePipe } from "@/lib/hooks/use-pipes";
-import { FALLBACK_TEMPLATES, type CustomTemplate } from "@/lib/summary-templates";
+import {
+  AUTOMATE_MY_WORK_TEMPLATE_NAME,
+  buildAutomateMyWorkPrompt,
+  FALLBACK_TEMPLATES,
+  type CustomTemplate,
+} from "@/lib/summary-templates";
+import { type AutomationPipeInventory } from "@/lib/automation-pipe-evals";
 import { type Suggestion } from "@/lib/hooks/use-auto-suggestions";
 import { IntegrationIcon } from "@/components/settings/connections-section";
 import { CustomSummaryBuilder } from "./custom-summary-builder";
@@ -26,6 +32,7 @@ interface SummaryCardsProps {
   onDeleteCustomTemplate: (id: string) => void;
   userName?: string;
   templatePipes?: TemplatePipe[];
+  existingPipes?: AutomationPipeInventory[];
 }
 
 export interface ConnectionSetupSuggestion {
@@ -134,6 +141,7 @@ export function SummaryCards({
   onDeleteCustomTemplate,
   userName,
   templatePipes = [],
+  existingPipes = [],
 }: SummaryCardsProps) {
   const [showAll, setShowAll] = useState(false);
   const [showBuilder, setShowBuilder] = useState(false);
@@ -160,7 +168,11 @@ export function SummaryCards({
       template_name: pipe.name,
       template_title: pipe.title,
     });
-    onSendMessage(pipe.prompt, `${pipe.icon} ${pipe.title}`);
+    const prompt =
+      pipe.name === AUTOMATE_MY_WORK_TEMPLATE_NAME
+        ? buildAutomateMyWorkPrompt(existingPipes)
+        : pipe.prompt;
+    onSendMessage(prompt, `${pipe.icon} ${pipe.title}`);
   };
 
   const handleCustomTemplateClick = (template: CustomTemplate) => {

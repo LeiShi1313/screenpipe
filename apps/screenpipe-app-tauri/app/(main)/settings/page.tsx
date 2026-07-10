@@ -95,12 +95,15 @@ import {
 } from "@/components/ui/alert-dialog";
 import {
   ADVANCED_SETTINGS_RESET_KEYS,
+  getRecommendedRecordingDefaults,
   isRecommendedSettingsRestartRequired,
+  isSimpleRecordingField,
   isSimpleSettingsSection,
   RECOMMENDED_RECORDING_DEFAULT_KEYS,
   setRecommendedSettingsRestartRequired,
 } from "@/components/settings/simple-settings-mode";
 import { ApplyRestartBar } from "@/components/settings/apply-restart-bar";
+import { hasAppEntitlement } from "@/lib/app-entitlement";
 
 type SettingsSection =
   | "account"
@@ -277,11 +280,17 @@ function SettingsContent() {
       const advancedDefaults = Object.fromEntries(
         ADVANCED_SETTINGS_RESET_KEYS.map((key) => [key, defaults[key]]),
       ) as Partial<Settings>;
-      const recommendedRecordingDefaults = Object.fromEntries(
-        RECOMMENDED_RECORDING_DEFAULT_KEYS.map((key) => [key, defaults[key]]),
-      ) as Partial<Settings>;
+      const hardware = await commands.getHardwareCapability().catch(() => null);
+      const recommendedRecordingDefaults = getRecommendedRecordingDefaults({
+        settings,
+        defaults,
+        hardware,
+        hasCloudTranscriptionAccess: hasAppEntitlement(settings.user as any),
+      });
       const recordingDefaultsChanged = RECOMMENDED_RECORDING_DEFAULT_KEYS.some(
-        (key) => JSON.stringify(settings[key]) !== JSON.stringify(defaults[key]),
+        (key) =>
+          JSON.stringify(settings[key]) !==
+          JSON.stringify(recommendedRecordingDefaults[key]),
       );
       const simpleSettings = {
         ...advancedDefaults,
@@ -293,7 +302,10 @@ function SettingsContent() {
         setRecommendedSettingsRestartRequired(true);
         setRecommendedRestartRequired(true);
       }
-      toast({ title: "recommended settings enabled", description: "everything else is using recommended defaults." });
+      toast({
+        title: "recommended settings enabled",
+        description: "capture and transcription are optimized for this device.",
+      });
     } catch (error) {
       console.error("failed to switch to recommended settings", error);
       toast({
@@ -317,7 +329,7 @@ function SettingsContent() {
       setRecommendedRestartRequired(false);
       toast({
         title: "recording restarted",
-        description: "recommended monitor and audio defaults are now active.",
+        description: "the recommended capture profile is now active.",
       });
     } catch (error) {
       console.error("failed to restart recording for recommended settings", error);
@@ -383,7 +395,14 @@ function SettingsContent() {
   const flatItems = navGroups.flatMap((g) =>
     g.items.map((it) => ({ ...it, group: g.label })),
   );
-  const results = searchSettingsNav(searchQuery, flatItems, ALL_SETTINGS_FIELDS);
+  const visibleSettingsFields = isSimpleSettingsMode
+    ? ALL_SETTINGS_FIELDS.filter(
+        (field) =>
+          isSimpleSettingsSection(field.section) &&
+          (field.section !== "recording" || isSimpleRecordingField(field.label)),
+      )
+    : ALL_SETTINGS_FIELDS;
+  const results = searchSettingsNav(searchQuery, flatItems, visibleSettingsFields);
 
   // Reset highlight to top whenever the query changes.
   useEffect(() => { setActiveIndex(0); }, [searchQuery]);
@@ -648,9 +667,12 @@ function SettingsContent() {
             <AlertDialogDescription>
               AI models, keyboard shortcuts, notifications, usage reporting, and
               speaker preferences will return to their recommended defaults.
-              Recording will use all monitors and system-default audio devices,
-              then ask you to apply and restart. Your privacy, storage, and account
-              choices will stay as they are.
+              Recording will use a low-resource profile for this computer: meeting-only
+              audio, the best default transcription engine, automatic power and capture
+              quality, and system-default audio devices. High-spec computers use all
+              monitors; lower-spec computers use the primary monitor. You&apos;ll be asked
+              to apply and restart. Privacy, storage, account, and recording on/off
+              choices stay as they are.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

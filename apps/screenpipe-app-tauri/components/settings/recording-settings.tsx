@@ -1765,8 +1765,63 @@ function HighFpsCard({
   );
 }
 
+function RecommendedRecordingProfile({ settings }: { settings: Settings }) {
+  const rows = [
+    {
+      label: "Power",
+      value: settings.powerMode === "battery_saver" ? "Battery Saver" : "Automatic",
+    },
+    {
+      label: "Audio",
+      value: settings.disableAudio ? "Off" : "Meetings only · default devices",
+    },
+    {
+      label: "Transcription",
+      value: settings.disableAudio
+        ? "Paused with audio"
+        : `${getTranscriptionEngineLabel(settings.audioTranscriptionEngine)} · batch`,
+    },
+    {
+      label: "Screen",
+      value: settings.disableVision
+        ? "Off"
+        : `${settings.useAllMonitors ? "All displays" : "Primary display"} · ${settings.videoQuality || "balanced"}`,
+    },
+  ];
+
+  return (
+    <Card className="border-foreground/20 bg-card" data-testid="recommended-recording-profile">
+      <CardContent className="px-4 py-3.5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4 text-foreground" />
+              <h3 className="text-sm font-medium text-foreground">Recommended recording profile</h3>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Low-resource defaults selected for this computer. Open All settings to customize the engine, power, devices, quality, or capture cadence.
+            </p>
+          </div>
+          <Badge variant="secondary" className="shrink-0 text-[10px] uppercase tracking-wide">
+            automatic
+          </Badge>
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-2 border-t border-border/60 pt-3">
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-baseline justify-between gap-3 text-xs">
+              <span className="text-muted-foreground">{row.label}</span>
+              <span className="truncate text-right font-medium text-foreground">{row.value}</span>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export function RecordingSettings() {
   const { settings, updateSettings, getDataDir, loadUser } = useSettings();
+  const isRecommendedMode = settings.settingsMode !== "advanced";
   const [openLanguages, setOpenLanguages] = React.useState(false);
   // Dev-only: warn if searchIndex drifts from rendered headings. State-gated
   // fields are marked `conditional: true` in the index above, so no false
@@ -2666,6 +2721,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         Screen and audio recording preferences
       </p>
 
+      {isRecommendedMode && <RecommendedRecordingProfile settings={settings} />}
+
       <div className="flex items-center justify-end">
           {hasUnsavedChanges && (
             <Button
@@ -2685,11 +2742,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       </div>
 
       {/* Battery Saver / Power Mode */}
-      <Card className="border-border bg-card">
+      {!isRecommendedMode && <Card className="border-border bg-card">
         <CardContent className="px-3 py-3">
           <BatterySaverSection />
         </CardContent>
-      </Card>
+      </Card>}
 
       {/* Audio */}
       <LockedSetting settingKey="audio_recording">
@@ -2712,6 +2769,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </CardContent>
         </Card>
 
+        {!isRecommendedMode && <>
         {/* Audio capture mode — continuous vs meetings-only */}
         {!settings.disableAudio && (
         <Card className="border-border bg-card">
@@ -2728,7 +2786,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 value={settings.audioCaptureMode ?? "always"}
                 onValueChange={(value) => handleSettingsChange({ audioCaptureMode: value as "always" | "meetings-only" | "disabled" }, true)}
               >
-                <SelectTrigger className="w-[200px] h-7 text-xs">
+                <SelectTrigger className="w-[200px] h-7 text-xs" data-testid="recording-audio-capture-mode">
                   <SelectValue placeholder="Select mode" />
                 </SelectTrigger>
                 <SelectContent>
@@ -2769,7 +2827,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   value={settings.audioTranscriptionEngine}
                   onValueChange={(value) => handleAudioTranscriptionModelChange(value)}
                 >
-                  <SelectTrigger className="w-[200px] h-7 text-xs">
+                  <SelectTrigger className="w-[200px] h-7 text-xs" data-testid="recording-transcription-engine">
                     <SelectValue placeholder="Select engine" />
                   </SelectTrigger>
                   <SelectContent>
@@ -3767,6 +3825,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           onChange={(words) => handleSettingsChange({ vocabularyWords: words }, true)}
         />
         )}
+        </>}
 
       </div>
       </LockedSetting>
@@ -3814,6 +3873,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
+        {!isRecommendedMode && <>
         {/* Use All Monitors - right below screen capture toggles */}
         {screenshotImagesEnabled && (
           <Card className="border-border bg-card">
@@ -3922,7 +3982,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   value={settings.videoQuality || "balanced"}
                   onValueChange={(value) => handleSettingsChange({ videoQuality: value }, true)}
                 >
-                  <SelectTrigger className="w-[180px] h-8 text-xs">
+                  <SelectTrigger className="w-[180px] h-8 text-xs" data-testid="recording-video-quality">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -4004,13 +4064,14 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             onSettingsChange={(patch) => handleSettingsChange(patch, true)}
           />
         )}
+        </>}
 
       </div>
       </LockedSetting>
 
 
       {/* System */}
-      <div className="space-y-2 pt-2">
+      {!isRecommendedMode && <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">System</h2>
 
         <Card className="border-border bg-card">
@@ -4027,7 +4088,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             </div>
           </CardContent>
         </Card>
-      </div>
+      </div>}
 
       {/* Voice Training Dialog */}
       <Dialog open={voiceTraining.dialogOpen} onOpenChange={(open) => {

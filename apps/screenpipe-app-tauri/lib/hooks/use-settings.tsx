@@ -845,6 +845,15 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
+		// Existing installs predate the Recommended / All settings switch and may
+		// rely on customized controls that Recommended intentionally hides. Keep
+		// those users in All settings until they explicitly opt into the profile;
+		// brand-new installs still start in Recommended via DEFAULT_SETTINGS.
+		if (!settings.settingsMode) {
+			settings.settingsMode = "advanced";
+			needsUpdate = true;
+		}
+
 		// Temporary one-time migration: force restart notifications off for all
 		// existing users until the stall detector is more reliable. Users can
 		// still manually opt back in afterward; the marker prevents re-overriding.

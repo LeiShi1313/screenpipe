@@ -302,6 +302,18 @@ describe('Settings sections', () => {
       await useSystemDefaultAudio.click();
     }
 
+    const transcriptionEngine = await $('[data-testid="recording-transcription-engine"]');
+    await transcriptionEngine.click();
+    const deepgramOption = await $('//*[@role="option" and contains(., "Deepgram")]');
+    await deepgramOption.waitForDisplayed({ timeout: 5_000 });
+    await deepgramOption.click();
+
+    const videoQuality = await $('[data-testid="recording-video-quality"]');
+    await videoQuality.click();
+    const maxQualityOption = await $('//*[@role="option" and contains(., "max") and contains(., "native")]');
+    await maxQualityOption.waitForDisplayed({ timeout: 5_000 });
+    await maxQualityOption.click();
+
     const generalNav = await $('[data-testid="settings-nav-general"]');
     await generalNav.click();
     await $('[data-testid="section-settings-general"]').waitForExist({ timeout: 8_000 });
@@ -336,11 +348,28 @@ describe('Settings sections', () => {
 
     const recommendedRecordingNav = await $('[data-testid="settings-nav-recording"]');
     await recommendedRecordingNav.click();
-    const recommendedAllMonitors = await $('#useAllMonitors');
+    const recommendedProfile = await $('[data-testid="recommended-recording-profile"]');
+    await recommendedProfile.waitForDisplayed({ timeout: 8_000 });
+    const profileText = (await recommendedProfile.getText()).toLowerCase();
+    expect(profileText).toContain('meetings only');
+    expect(profileText).toContain('batch');
+    expect(profileText).not.toContain('deepgram');
+    expect(await $('#useAllMonitors').isExisting()).toBe(false);
+    expect(await $('#useSystemDefaultAudio').isExisting()).toBe(false);
+    expect(await $('[data-testid="recording-video-quality"]').isExisting()).toBe(false);
+
+    const profileScreenshot = await saveScreenshot('settings-recommended-recording-profile');
+    expect(existsSync(profileScreenshot)).toBe(true);
+
+    // The simplified UI hides the knobs, but All settings confirms the actual
+    // persisted values changed rather than merely changing what is displayed.
+    const advancedMode = await $('[data-testid="settings-mode-advanced"]');
+    await advancedMode.click();
     const recommendedDefaultAudio = await $('#useSystemDefaultAudio');
-    await recommendedAllMonitors.waitForExist({ timeout: 8_000 });
     await recommendedDefaultAudio.waitForExist({ timeout: 8_000 });
-    expect(await recommendedAllMonitors.getAttribute('data-state')).toBe('checked');
     expect(await recommendedDefaultAudio.getAttribute('data-state')).toBe('checked');
+    const recommendedEngine = await $('[data-testid="recording-transcription-engine"]');
+    expect((await recommendedEngine.getText()).toLowerCase()).not.toContain('deepgram');
+    expect((await $('[data-testid="recording-video-quality"]').getText()).toLowerCase()).not.toContain('max');
   });
 });

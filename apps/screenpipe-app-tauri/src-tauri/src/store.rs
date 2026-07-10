@@ -890,6 +890,15 @@ pub struct SettingsStore {
     #[serde(rename = "isLoading")]
     pub is_loading: bool,
 
+    /// New installs start with the compact Recommended surface. Persisted
+    /// stores created before this field existed deserialize to All settings so
+    /// established users keep access to every control until they opt in.
+    #[serde(
+        rename = "settingsMode",
+        default = "default_existing_settings_mode"
+    )]
+    pub settings_mode: String,
+
     #[serde(rename = "devMode")]
     pub dev_mode: bool,
     #[serde(rename = "ocrEngine")]
@@ -1001,6 +1010,10 @@ fn default_true() -> bool {
 
 fn default_false() -> bool {
     false
+}
+
+fn default_existing_settings_mode() -> String {
+    "advanced".to_string()
 }
 
 fn default_overlay_size() -> String {
@@ -1335,6 +1348,7 @@ Rules:
             },
             ai_presets: vec![default_free_preset],
             is_loading: false,
+            settings_mode: "simple".to_string(),
             dev_mode: false,
             #[cfg(target_os = "macos")]
             ocr_engine: "apple-native".to_string(),
@@ -1970,6 +1984,21 @@ mod tests {
     #[test]
     fn auto_update_defaults_to_disabled() {
         assert!(!SettingsStore::default().auto_update);
+    }
+
+    #[test]
+    fn settings_mode_new_store_defaults_to_recommended() {
+        assert_eq!(SettingsStore::default().settings_mode, "simple");
+    }
+
+    #[test]
+    fn settings_mode_existing_store_without_field_defaults_to_all() {
+        let settings: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": []
+        }))
+        .unwrap();
+
+        assert_eq!(settings.settings_mode, "advanced");
     }
 
     #[test]

@@ -54,7 +54,7 @@ use crate::{RedactError, RedactedSpan, RedactionOutput, Redactor, SpanLabel};
 // Keep the `_onnx` suffix: `Pipeline::name` matches on the "onnx"
 // substring to report `pipeline+onnx` (the previous name,
 // `v45_phase5_pruned`, silently broke that match).
-const ONNX_REDACTOR_NAME: &str = "v46_distilled6l_onnx";
+const ONNX_REDACTOR_NAME: &str = "v47_distilled6l_onnx";
 const ONNX_REDACTOR_VERSION: u32 = 6;
 
 /// Configuration for an ONNX text redactor.
@@ -82,15 +82,15 @@ impl Default for OnnxConfig {
 }
 
 impl OnnxConfig {
-    /// `~/.screenpipe/models/v46_distilled6l/` by convention.
+    /// `~/.screenpipe/models/v47_distilled6l/` by convention.
     pub fn default_model_dir() -> PathBuf {
         dirs::home_dir()
             .map(|h| {
                 h.join(".screenpipe")
                     .join("models")
-                    .join("v46_distilled6l")
+                    .join("v47_distilled6l")
             })
-            .unwrap_or_else(|| PathBuf::from(".screenpipe/models/v46_distilled6l"))
+            .unwrap_or_else(|| PathBuf::from(".screenpipe/models/v47_distilled6l"))
     }
 
     fn resolve_model_file(&self) -> PathBuf {
@@ -113,27 +113,28 @@ impl OnnxConfig {
     /// code change (URL + expected SHA-256 + [`ONNX_REDACTOR_VERSION`]
     /// all bumped together — same discipline as `RfdetrConfig`).
     pub const HF_REPO_BASE: &'static str =
-        "https://huggingface.co/screenpipe/pii-redactor/resolve/main/v46_distilled6l";
+        "https://huggingface.co/screenpipe/pii-redactor/resolve/main/v47_distilled6l";
 
     /// Files to download from the HF repo on first run. Each is
     /// (filename, expected sha256). Recompute via
     ///   shasum -a 256 model_quantized.onnx tokenizer.json config.json remap.json
     /// when bumping the model (and bump [`ONNX_REDACTOR_VERSION`]).
     ///
-    /// v46_distilled6l is a 6-layer student distilled from v45_phase5_pruned's
-    /// ONNX logits (per-row KD masking) on the 42.8k v45 gold corpus + 60k
-    /// multilingual PII-Masking-300k train rows + 8k technical-identifier
-    /// negatives, then vocab-pruned (250k -> ~119k tokens) and INT8-quantized
-    /// (149 MB -> 131 MB, ~4x faster: 6 layers vs 12). Bench vs v45_phase5:
-    /// FR 69.8 vs 27.5, DE 60.6 vs 24.7, ES 86.0, IT 83.3 zero-leak;
-    /// EN in-bench 74.3 vs 77.6; oversmash 11.4 vs 4.5; secret probe 35/1.
-    /// `remap.json` maps full-vocab token ids -> the sliced embedding rows
-    /// and is applied in [`runtime::OnnxRedactor::run_window`].
+    /// v47_distilled6l is a 6-layer student trained with two-teacher KD:
+    /// a strong prior student generation teaches recall on 92.8k gold rows
+    /// (42.8k v45 gold + 30k multilingual + 20k long-form-EN PII-Masking-300k
+    /// train rows) while v45_phase5_pruned's precise logits label 9.4k
+    /// negative/real-capture rows; then vocab-pruned (250k -> ~113k tokens)
+    /// and INT8-quantized (149 MB -> 130 MB, 6 layers vs 12, ~4-5x faster).
+    /// Bench vs v45_phase5: 300k-EN zero-leak 82.0 vs 68.7, FR 72.5 vs 27.5,
+    /// DE 65.3 vs 24.7; EN in-bench 74.6 vs 77.6; oversmash 11.1 vs 4.5;
+    /// secret probe 33/2. `remap.json` maps full-vocab token ids -> the
+    /// sliced embedding rows, applied in [`runtime::OnnxRedactor::run_window`].
     pub const FILES: &'static [(&'static str, &'static str)] = &[
         // INT8-quantized, vocab-pruned 6-layer model. ~131 MB.
         (
             "model_quantized.onnx",
-            "c61763953ff2883fe55329b9160b5bb9046305665ccd24ee659f48b7d114f437",
+            "387d34658c1da95a98b1be058e334d80b1f114cb39a3755febdefc4533473b7c",
         ),
         // SentencePiece tokenizer (HF fast format), unchanged arch/vocab. ~17 MB.
         (
@@ -148,7 +149,7 @@ impl OnnxConfig {
         // full-vocab-id -> pruned-row remap (+ unk_new). ~1.8 MB.
         (
             "remap.json",
-            "28fdedcfa05ddc34d66e18f234acff359a9a5fc773017260ea1db0cb1f74609f",
+            "334df93eb6843ecc7ea0939ab6450df4df203e21d5227bbcb9f7c2af19f98827",
         ),
     ];
 

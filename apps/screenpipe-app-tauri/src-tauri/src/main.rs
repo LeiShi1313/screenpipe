@@ -135,6 +135,7 @@ use tauri::AppHandle;
 mod dock_menu;
 mod health;
 mod log_files;
+mod media_commands;
 mod native_notification;
 mod native_shortcut_reminder;
 mod notifications;
@@ -145,7 +146,6 @@ mod specta_bindings;
 mod vault;
 mod viewer;
 
-use base64::Engine;
 use health::start_health_check;
 use log_files::{get_log_files, get_screenpipe_data_dir};
 use shortcuts::{
@@ -189,171 +189,6 @@ fn should_skip_onboarding() -> bool {
         .ok()
         .map(|s| matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
-}
-
-use tokio::time::{sleep, Duration};
-
-#[tauri::command]
-#[specta::specta]
-async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
-    const MAX_RETRIES: u32 = 3;
-    const INITIAL_DELAY_MS: u64 = 100;
-
-    debug!("Reading media file: {}", file_path);
-
-    // Media paths can arrive home-relative (e.g. `~/Downloads/clip.mp4`) when the
-    // agent prints a friendly path in chat. `Path::new` does not expand `~`, so
-    // resolve it the same way the in-app file viewer does before touching disk.
-    let path = viewer::expand_tilde(file_path);
-
-    // Retry loop to handle files that may be in the process of being written
-    let mut last_error = String::new();
-    for attempt in 0..=MAX_RETRIES {
-        if attempt > 0 {
-            let delay = INITIAL_DELAY_MS * (1 << (attempt - 1)); // exponential backoff
-            debug!(
-                "Retry attempt {} for {}, waiting {}ms",
-                attempt, file_path, delay
-            );
-            sleep(Duration::from_millis(delay)).await;
-        }
-
-        if !path.exists() {
-            last_error = format!("File does not exist: {}", path.display());
-            if attempt < MAX_RETRIES {
-                continue;
-            }
-            return Err(last_error);
-        }
-
-        // Read file contents
-        match tokio::fs::read(&path).await {
-            Ok(contents) => {
-                // Check for empty or suspiciously small files (might still be writing)
-                if contents.is_empty() {
-                    last_error = "File is empty (may still be writing)".to_string();
-                    debug!("{}: {}", last_error, file_path);
-                    if attempt < MAX_RETRIES {
-                        continue;
-                    }
-                    return Err(last_error);
-                }
-
-                debug!(
-                    "Successfully read file of size: {} bytes (attempt {})",
-                    contents.len(),
-                    attempt + 1
-                );
-
-                // Convert to base64
-                let data = base64::prelude::BASE64_STANDARD.encode(&contents);
-
-                // Determine MIME type
-                let mime_type = get_mime_type(file_path);
-
-                return Ok(serde_json::json!({
-                    "data": data,
-                    "mimeType": mime_type
-                }));
-            }
-            Err(e) => {
-                last_error = format!("Failed to read file: {}", e);
-                debug!("{} (attempt {})", last_error, attempt + 1);
-                if attempt < MAX_RETRIES {
-                    continue;
-                }
-                error!("{}", last_error);
-                return Err(last_error);
-            }
-        }
-    }
-
-    Err(last_error)
-}
-
-fn get_mime_type(path: &str) -> String {
-    let ext = path.split('.').last().unwrap_or("").to_lowercase();
-    let is_audio = path.to_lowercase().contains("input") || path.to_lowercase().contains("output");
-
-    match ext.as_str() {
-        "mp4" => "video/mp4".to_string(),
-        "webm" => "video/webm".to_string(),
-        "ogg" => "video/ogg".to_string(),
-        "mp3" => "audio/mpeg".to_string(),
-        "wav" => "audio/wav".to_string(),
-        _ => {
-            if is_audio {
-                "audio/mpeg".to_string()
-            } else {
-                "video/mp4".to_string()
-            }
-        }
-    }
-}
-
-#[tauri::command]
-#[specta::specta]
-async fn upload_file_to_s3(file_path: &str, signed_url: &str) -> Result<bool, String> {
-    debug!("Starting upload for file: {}", file_path);
-
-    // Read file contents - do this outside retry loop to avoid multiple reads
-    let file_contents = match tokio::fs::read(file_path).await {
-        Ok(contents) => {
-            debug!("Successfully read file of size: {} bytes", contents.len());
-            contents
-        }
-        Err(e) => {
-            error!("Failed to read file: {}", e);
-            return Err(e.to_string());
-        }
-    };
-
-    let client = reqwest::Client::new();
-    let max_retries = 3;
-    let mut attempt = 0;
-    let mut last_error = String::new();
-
-    while attempt < max_retries {
-        attempt += 1;
-        debug!("Upload attempt {} of {}", attempt, max_retries);
-
-        match client
-            .put(signed_url)
-            .body(file_contents.clone())
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                if status.is_success() {
-                    debug!("Successfully uploaded file on attempt {}", attempt);
-                    return Ok(true);
-                }
-                // Surface the response body — S3/Supabase wraps the reason for
-                // 400/403 (signed URL expired, content-type mismatch, etc.) in
-                // an XML payload that we'd otherwise discard.
-                let body = response.text().await.unwrap_or_default();
-                let snippet: String = body.chars().take(500).collect();
-                last_error = format!("Upload failed with status: {} body: {}", status, snippet);
-                error!("{} (attempt {}/{})", last_error, attempt, max_retries);
-            }
-            Err(e) => {
-                last_error = format!("Request failed: {}", e);
-                error!("{} (attempt {}/{})", last_error, attempt, max_retries);
-            }
-        }
-
-        if attempt < max_retries {
-            let delay = Duration::from_secs(2u64.pow(attempt as u32 - 1)); // Exponential backoff
-            debug!("Waiting {}s before retry...", delay.as_secs());
-            sleep(delay).await;
-        }
-    }
-
-    Err(format!(
-        "Upload failed after {} attempts. Last error: {}",
-        max_retries, last_error
-    ))
 }
 
 // check if the server is running

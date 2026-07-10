@@ -191,6 +191,57 @@ pub struct CentralHandlerRestartResult {
     pub transcription_error: Option<String>,
 }
 
+struct EngineAcquisition<E> {
+    engine: E,
+    created: bool,
+}
+
+/// Serialize engine construction through the same lock that publishes the
+/// shared instance. A handler restart and a model-capability refresh can race;
+/// only the first caller may construct, while later callers reuse its result.
+async fn get_or_create_engine<E, Matches, Factory, FactoryFuture>(
+    slot: &RwLock<Option<E>>,
+    matches: Matches,
+    factory: Factory,
+) -> Result<EngineAcquisition<E>>
+where
+    E: Clone,
+    Matches: Fn(&E) -> bool,
+    Factory: FnOnce() -> FactoryFuture,
+    FactoryFuture: std::future::Future<Output = Result<E>>,
+{
+    let mut guard = slot.write().await;
+    if let Some(engine) = guard.as_ref().filter(|engine| matches(engine)) {
+        return Ok(EngineAcquisition {
+            engine: engine.clone(),
+            created: false,
+        });
+    }
+
+    let engine = factory().await?;
+    *guard = Some(engine.clone());
+    Ok(EngineAcquisition {
+        engine,
+        created: true,
+    })
+}
+
+fn runtime_transcription_config_matches(
+    requested: &AudioTranscriptionEngine,
+    runtime: &AudioTranscriptionEngine,
+) -> bool {
+    requested == runtime
+        // `Parakeet` deliberately auto-upgrades to the MLX runtime on builds
+        // that include it. That is the same requested engine, not a mismatch.
+        || matches!(
+            (requested, runtime),
+            (
+                AudioTranscriptionEngine::Parakeet,
+                AudioTranscriptionEngine::ParakeetMlx
+            )
+        )
+}
+
 impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
         let effective_windows_input_aec_enabled =
@@ -321,6 +372,9 @@ impl AudioManager {
         super::builder::ensure_system_default_device_types(&mut options, &user_disabled).await;
 
         *self.options.write().await = options;
+        // Handler restarts can reuse a matching engine, but a full options
+        // update must invalidate it: language, vocabulary, and provider
+        // credentials are runtime engine state even when the enum is unchanged.
         *self.engine.write().await = None;
         Ok(())
     }
@@ -905,6 +959,33 @@ impl AudioManager {
         Ok(recording_handle)
     }
 
+    async fn get_or_create_transcription_engine(
+        &self,
+        audio_transcription_engine: Arc<AudioTranscriptionEngine>,
+        deepgram_config: Option<crate::transcription::deepgram::DeepgramTranscriptionConfig>,
+        openai_compatible_config: Option<crate::OpenAICompatibleConfig>,
+        languages: Vec<screenpipe_core::Language>,
+        vocabulary: Vec<crate::transcription::VocabularyEntry>,
+    ) -> Result<EngineAcquisition<TranscriptionEngine>> {
+        let requested_for_match = audio_transcription_engine.clone();
+        get_or_create_engine(
+            self.engine.as_ref(),
+            move |engine| {
+                runtime_transcription_config_matches(requested_for_match.as_ref(), &engine.config())
+            },
+            move || {
+                TranscriptionEngine::new(
+                    audio_transcription_engine,
+                    deepgram_config,
+                    openai_compatible_config,
+                    languages,
+                    vocabulary,
+                )
+            },
+        )
+        .await
+    }
+
     async fn start_audio_receiver_handler(&self) -> Result<JoinHandle<()>> {
         let transcription_sender = self.transcription_sender.clone();
         let segmentation_manager = self.segmentation_manager.clone();
@@ -936,24 +1017,29 @@ impl AudioManager {
         let meeting_detector = self.meeting_detector().await;
         let meeting_audio_tap = self.meeting_audio_tap.clone();
         let db = self.db.clone();
-        let shared_engine = self.engine.clone();
         let on_insert_session = self.on_transcription_insert.clone();
         // Session streams (Meeting Tap, piggyback mic) bypass the meetings-only
         // drop gate below — they exist only during a meeting by construction.
         let session_devices = self.session_devices.clone();
 
-        // Build unified transcription engine — only loads the needed model
-        let engine = TranscriptionEngine::new(
-            audio_transcription_engine.clone(),
-            deepgram_config.clone(),
-            openai_compatible_config.clone(),
-            languages.clone(),
-            vocabulary.clone(),
-        )
-        .await?;
-
-        // Store for reconciliation / retranscribe access
-        *shared_engine.write().await = Some(engine.clone());
+        // Reuse the ready shared engine across handler restarts. Construction is
+        // serialized with capability refreshes so Parakeet/MLX can never be
+        // loaded twice by the two paths.
+        let acquisition = self
+            .get_or_create_transcription_engine(
+                audio_transcription_engine.clone(),
+                deepgram_config.clone(),
+                openai_compatible_config.clone(),
+                languages.clone(),
+                vocabulary.clone(),
+            )
+            .await?;
+        let engine = acquisition.engine;
+        if acquisition.created {
+            info!("transcription engine constructed for audio receiver handler");
+        } else {
+            debug!("reusing shared transcription engine for audio receiver handler");
+        }
 
         // Create a single session and reuse it across all segments.
         // WhisperState is reused (whisper_full_with_state clears KV caches internally).
@@ -1533,23 +1619,27 @@ impl AudioManager {
             ) && get_cached_whisper_model_path(audio_transcription_engine.as_ref()).is_some();
 
         if should_try_transcription_refresh {
-            let mut engine = self.engine.write().await;
-            if engine
-                .as_ref()
-                .is_some_and(|e| e.config() == AudioTranscriptionEngine::Disabled)
-            {
-                match TranscriptionEngine::new(
-                    audio_transcription_engine.clone(),
-                    deepgram_config.clone(),
-                    openai_compatible_config.clone(),
-                    languages.clone(),
-                    vocabulary.clone(),
-                )
+            let engine_is_disabled = self
+                .engine
+                .read()
                 .await
+                .as_ref()
+                .is_some_and(|engine| engine.config() == AudioTranscriptionEngine::Disabled);
+            if engine_is_disabled {
+                match self
+                    .get_or_create_transcription_engine(
+                        audio_transcription_engine.clone(),
+                        deepgram_config.clone(),
+                        openai_compatible_config.clone(),
+                        languages.clone(),
+                        vocabulary.clone(),
+                    )
+                    .await
                 {
-                    Ok(updated_engine) => {
-                        if updated_engine.config() != AudioTranscriptionEngine::Disabled {
-                            *engine = Some(updated_engine);
+                    Ok(acquisition) => {
+                        if acquisition.created
+                            && acquisition.engine.config() != AudioTranscriptionEngine::Disabled
+                        {
                             changed = true;
                         }
                     }
@@ -1573,23 +1663,25 @@ impl AudioManager {
             );
 
             if should_try_audiopipe_refresh {
-                let mut engine = self.engine.write().await;
-                if engine
-                    .as_ref()
-                    .is_some_and(|e| e.config() == AudioTranscriptionEngine::Disabled)
-                {
-                    match TranscriptionEngine::new(
-                        audio_transcription_engine.clone(),
-                        deepgram_config.clone(),
-                        openai_compatible_config.clone(),
-                        languages.clone(),
-                        vocabulary.clone(),
-                    )
-                    .await
+                let engine_is_disabled =
+                    self.engine.read().await.as_ref().is_some_and(|engine| {
+                        engine.config() == AudioTranscriptionEngine::Disabled
+                    });
+                if engine_is_disabled {
+                    match self
+                        .get_or_create_transcription_engine(
+                            audio_transcription_engine.clone(),
+                            deepgram_config.clone(),
+                            openai_compatible_config.clone(),
+                            languages.clone(),
+                            vocabulary.clone(),
+                        )
+                        .await
                     {
-                        Ok(updated_engine) => {
-                            if updated_engine.config() != AudioTranscriptionEngine::Disabled {
-                                *engine = Some(updated_engine);
+                        Ok(acquisition) => {
+                            if acquisition.created
+                                && acquisition.engine.config() != AudioTranscriptionEngine::Disabled
+                            {
                                 changed = true;
                             }
                         }
@@ -1927,6 +2019,273 @@ impl Drop for AudioManager {
 mod tests {
     use super::*;
     use crate::core::device::{AudioDevice, DeviceType};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Barrier;
+
+    #[derive(Clone)]
+    struct FakeEngine {
+        config: &'static str,
+        identity: Arc<()>,
+    }
+
+    fn fake_engine(config: &'static str) -> FakeEngine {
+        FakeEngine {
+            config,
+            identity: Arc::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_lifecycle_disabled_to_ready_loads_once_and_restart_reuses_it() {
+        let slot = RwLock::new(Some(fake_engine("disabled")));
+        let build_calls = Arc::new(AtomicUsize::new(0));
+
+        let refresh_calls = build_calls.clone();
+        let refreshed = get_or_create_engine(
+            &slot,
+            |engine| engine.config == "parakeet",
+            move || async move {
+                refresh_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_engine("parakeet"))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(refreshed.created);
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+
+        let ready_identity = refreshed.engine.identity.clone();
+        let restart_calls = build_calls.clone();
+        let restarted = get_or_create_engine(
+            &slot,
+            |engine| engine.config == "parakeet",
+            move || async move {
+                restart_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_engine("parakeet"))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!restarted.created);
+        assert!(Arc::ptr_eq(&ready_identity, &restarted.engine.identity));
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn model_lifecycle_configuration_mismatch_forces_exactly_one_replacement() {
+        let original = fake_engine("parakeet");
+        let original_identity = original.identity.clone();
+        let slot = RwLock::new(Some(original));
+        let build_calls = Arc::new(AtomicUsize::new(0));
+
+        let replacement_calls = build_calls.clone();
+        let replacement = get_or_create_engine(
+            &slot,
+            |engine| engine.config == "qwen3-asr",
+            move || async move {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_engine("qwen3-asr"))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(replacement.created);
+        assert!(!Arc::ptr_eq(
+            &original_identity,
+            &replacement.engine.identity
+        ));
+
+        let replacement_identity = replacement.engine.identity.clone();
+        let duplicate_calls = build_calls.clone();
+        let reused = get_or_create_engine(
+            &slot,
+            |engine| engine.config == "qwen3-asr",
+            move || async move {
+                duplicate_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_engine("qwen3-asr"))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!reused.created);
+        assert!(Arc::ptr_eq(&replacement_identity, &reused.engine.identity));
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn model_lifecycle_concurrent_refreshes_cannot_double_load() {
+        const CALLERS: usize = 8;
+        let slot = Arc::new(RwLock::new(Some(fake_engine("disabled"))));
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let start_barrier = Arc::new(Barrier::new(CALLERS));
+        let mut tasks = Vec::new();
+
+        for _ in 0..CALLERS {
+            let slot = slot.clone();
+            let build_calls = build_calls.clone();
+            let start_barrier = start_barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                start_barrier.wait().await;
+                let calls_for_factory = build_calls.clone();
+                get_or_create_engine(
+                    slot.as_ref(),
+                    |engine| engine.config == "parakeet",
+                    move || async move {
+                        calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Ok(fake_engine("parakeet"))
+                    },
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut constructed = 0;
+        let mut identity: Option<Arc<()>> = None;
+        for task in tasks {
+            let acquisition = task.await.unwrap();
+            constructed += usize::from(acquisition.created);
+            if let Some(first_identity) = &identity {
+                assert!(Arc::ptr_eq(first_identity, &acquisition.engine.identity));
+            } else {
+                identity = Some(acquisition.engine.identity);
+            }
+        }
+
+        assert_eq!(constructed, 1);
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn model_lifecycle_factory_error_preserves_the_existing_engine() {
+        let existing = fake_engine("parakeet");
+        let existing_identity = existing.identity.clone();
+        let slot = RwLock::new(Some(existing));
+
+        let result = get_or_create_engine(
+            &slot,
+            |engine| engine.config == "qwen3-asr",
+            || async { Err(::anyhow::anyhow!("load failed")) },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let preserved = slot.read().await;
+        let preserved = preserved.as_ref().unwrap();
+        assert_eq!(preserved.config, "parakeet");
+        assert!(Arc::ptr_eq(&existing_identity, &preserved.identity));
+    }
+
+    #[test]
+    fn model_lifecycle_requested_parakeet_accepts_mlx_runtime_but_not_disabled() {
+        assert!(runtime_transcription_config_matches(
+            &AudioTranscriptionEngine::Parakeet,
+            &AudioTranscriptionEngine::ParakeetMlx,
+        ));
+        assert!(!runtime_transcription_config_matches(
+            &AudioTranscriptionEngine::Parakeet,
+            &AudioTranscriptionEngine::Disabled,
+        ));
+        assert!(runtime_transcription_config_matches(
+            &AudioTranscriptionEngine::Disabled,
+            &AudioTranscriptionEngine::Disabled,
+        ));
+    }
+
+    /// Real-model smoke for the release-only Apple Silicon MLX path. This is
+    /// ignored because it requires the multi-gigabyte model to already be in
+    /// the Hugging Face cache and the Xcode Metal toolchain to be installed.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "parakeet-mlx"))]
+    #[tokio::test]
+    #[ignore = "requires cached Parakeet MLX weights and the Xcode Metal toolchain"]
+    async fn cached_parakeet_refresh_reuses_single_mlx_model() {
+        const MODEL_REPO: &str = "mlx-community/parakeet-tdt-0.6b-v3";
+        const MAX_REUSE_DELTA_BYTES: usize = 64 * 1024 * 1024;
+
+        let cache = hf_hub::Cache::from_env().repo(hf_hub::Repo::model(MODEL_REPO.to_string()));
+        let model_cached = cache.get("model.safetensors").is_some()
+            && cache.get("config.json").is_some()
+            && (cache.get("vocab.txt").is_some() || cache.get("tokenizer.model").is_some());
+        if !model_cached {
+            eprintln!(
+                "skipping cached Parakeet MLX smoke: {MODEL_REPO} is not complete in the HF cache"
+            );
+            return;
+        }
+
+        let slot = RwLock::new(Some(TranscriptionEngine::Disabled));
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let requested = Arc::new(AudioTranscriptionEngine::Parakeet);
+
+        let first_calls = build_calls.clone();
+        let first_requested = requested.clone();
+        let first = get_or_create_engine(
+            &slot,
+            |engine| runtime_transcription_config_matches(requested.as_ref(), &engine.config()),
+            move || async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                TranscriptionEngine::new(
+                    first_requested,
+                    None,
+                    None,
+                    vec![screenpipe_core::Language::English],
+                    Vec::new(),
+                )
+                .await
+            },
+        )
+        .await
+        .unwrap();
+        assert!(first.created);
+        let first_model = match &first.engine {
+            TranscriptionEngine::ParakeetMlx { model, .. } => model.clone(),
+            other => panic!("expected Parakeet MLX runtime, got {}", other.config()),
+        };
+        let active_after_first = crate::transcription::engine::mlx_active_memory_bytes_for_test();
+
+        let second_calls = build_calls.clone();
+        let second_requested = requested.clone();
+        let second = get_or_create_engine(
+            &slot,
+            |engine| runtime_transcription_config_matches(requested.as_ref(), &engine.config()),
+            move || async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                TranscriptionEngine::new(
+                    second_requested,
+                    None,
+                    None,
+                    vec![screenpipe_core::Language::English],
+                    Vec::new(),
+                )
+                .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!second.created);
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1);
+        let second_model = match &second.engine {
+            TranscriptionEngine::ParakeetMlx { model, .. } => model.clone(),
+            other => panic!("expected Parakeet MLX runtime, got {}", other.config()),
+        };
+        assert!(Arc::ptr_eq(&first_model, &second_model));
+
+        let _session = second.engine.create_session().unwrap();
+        let active_after_second = crate::transcription::engine::mlx_active_memory_bytes_for_test();
+        let reuse_delta = active_after_second.saturating_sub(active_after_first);
+        assert!(
+            reuse_delta <= MAX_REUSE_DELTA_BYTES,
+            "second acquire grew MLX active memory by {:.1} MiB (limit: 64 MiB)",
+            reuse_delta as f64 / 1024.0 / 1024.0
+        );
+    }
 
     #[test]
     fn test_central_handler_restart_result_defaults() {

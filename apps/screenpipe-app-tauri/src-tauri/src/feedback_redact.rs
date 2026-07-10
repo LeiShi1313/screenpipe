@@ -199,6 +199,21 @@ async fn redact_one(primary: &Pipeline, fallback: &Pipeline, chunk: &str) -> Str
     }
 }
 
+/// Deterministic, on-device redaction for unattended diagnostic uploads.
+///
+/// Unlike the manual feedback flow below, this boundary never sends raw text
+/// to the Tinfoil enclave. The complete bounded bundle is processed in one
+/// local pass so a secret cannot straddle independently-redacted chunks.
+pub(crate) async fn redact_diagnostics_locally(text: String) -> Result<String, String> {
+    let regex = REGEX.get_or_init(|| async { regex_pipeline() }).await;
+    let redacted = redact_one(regex, regex, &text).await;
+    info!(
+        "diagnostic redaction: local regex pass completed ({} input bytes)",
+        text.len()
+    );
+    Ok(redacted)
+}
+
 /// Redact a feedback bundle for upload.
 ///
 /// `text` is the raw logs + chat (PII-dense chat first); `settings_json` is the
@@ -243,7 +258,9 @@ pub async fn redact_pii_for_feedback(
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_by_lines, redact_settings_json, strip_secret_keys};
+    use super::{
+        chunk_by_lines, redact_diagnostics_locally, redact_settings_json, strip_secret_keys,
+    };
     use serde_json::json;
 
     #[test]
@@ -286,5 +303,26 @@ mod tests {
     fn single_oversized_line_is_its_own_chunk() {
         let text = format!("{}\nsmall\n", "x".repeat(5000));
         assert_eq!(chunk_by_lines(&text, 1800).concat(), text);
+    }
+
+    #[tokio::test]
+    async fn unattended_diagnostics_use_fail_closed_local_redaction() {
+        let raw = concat!(
+            "contact alice@example.com about request 42\n",
+            "database postgres://operator:hunter2@db.internal/prod\n",
+            "proxy https://service:password@example.com/private\n",
+            "Authorization: Bearer abcdef1234567890\n",
+            "api_key=deadbeef password=hunter2"
+        )
+        .to_string();
+        let redacted = redact_diagnostics_locally(raw).await.unwrap();
+
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(!redacted.contains("operator:hunter2"));
+        assert!(!redacted.contains("service:password"));
+        assert!(!redacted.contains("abcdef1234567890"));
+        assert!(!redacted.contains("deadbeef"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(redacted.contains("request 42"));
     }
 }

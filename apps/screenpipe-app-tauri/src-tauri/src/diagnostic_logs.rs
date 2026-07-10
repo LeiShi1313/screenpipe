@@ -6,11 +6,12 @@
 //!
 //! This module deliberately knows nothing about remote requests, users, or
 //! upload endpoints. It only builds a small diagnostics bundle from the app's
-//! own `.log` files and passes every byte through the same filtering pipeline
-//! used by the manual "send logs" flow. Contextual filtering uses the Tinfoil
-//! enclave when available and falls back to deterministic local rules. Because
-//! no automated filter can guarantee removal of every name or path, the consent
-//! UI explicitly discloses that residual personal data may remain.
+//! own `.log` files and passes every byte through the shared deterministic
+//! on-device filtering pipeline. The manual "send logs" flow can additionally
+//! use the Tinfoil enclave, but unattended diagnostics never send raw text to a
+//! third-party redaction service. Because no automated filter can guarantee
+//! removal of every name or path, the consent UI explicitly discloses that
+//! residual personal data may remain.
 //!
 //! Unattended collection never includes screenshots, audio/video, chat history,
 //! settings, or the timeline database.
@@ -18,6 +19,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use sysinfo::{System, SystemExt};
+#[cfg(not(feature = "enterprise-build"))]
 use tauri::AppHandle;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -26,36 +29,115 @@ use crate::log_files::LogFile;
 const MAX_FILES: usize = 5;
 const MAX_FILE_BYTES: usize = 100 * 1024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
+const MAX_REDACTED_BUNDLE_BYTES: usize = 512 * 1024;
 const REDACTION_TIMEOUT: Duration = Duration::from_secs(75);
+
+#[derive(Clone, Debug)]
+pub(crate) struct DiagnosticDeviceMetadata {
+    pub os: &'static str,
+    pub os_version: String,
+    pub app_version: &'static str,
+}
+
+pub(crate) fn device_metadata() -> DiagnosticDeviceMetadata {
+    DiagnosticDeviceMetadata {
+        os: std::env::consts::OS,
+        os_version: System::new().os_version().unwrap_or_default(),
+        app_version: env!("CARGO_PKG_VERSION"),
+    }
+}
 
 /// Collect and redact a bounded logs-only bundle for remote support.
 ///
 /// The filtering boundary never returns an entirely unprocessed chunk after
 /// both contextual and deterministic passes fail.
+#[cfg(not(feature = "enterprise-build"))]
 pub async fn collect_redacted(app: &AppHandle) -> Result<String, String> {
     let files = crate::log_files::get_log_files(app.clone())
         .await
         .unwrap_or_default();
-    redact_files(&files).await
+    redact_files(&owned_log_files(files)).await
 }
 
 /// Collect from explicit app-owned log directories.
 ///
 /// Enterprise's mandatory collector uses this entry point so both managed and
 /// opted-in builds share one filesystem, size, timeout, and redaction policy.
+#[cfg(feature = "enterprise-build")]
 pub async fn collect_redacted_from_dirs(dirs: &[std::path::PathBuf]) -> Result<String, String> {
     let files = crate::log_files::collect_log_files(dirs).await;
-    redact_files(&files).await
+    redact_files(&owned_log_files(files)).await
+}
+
+fn owned_log_files(files: Vec<LogFile>) -> Vec<LogFile> {
+    files
+        .into_iter()
+        .filter(|file| is_screenpipe_owned_log_name(&file.name))
+        .collect()
+}
+
+fn is_screenpipe_owned_log_name(name: &str) -> bool {
+    matches!(
+        name,
+        "screenpipe.log"
+            | "screenpipe-app.log"
+            | "last-panic.log"
+            | "recover.import.log"
+            | "recover.stderr.log"
+            | ".db_cleanup.log"
+    ) || is_dated_rolling_log(name, "screenpipe.")
+        || is_dated_rolling_log(name, "screenpipe-app.")
+}
+
+fn is_dated_rolling_log(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() < 14 {
+        return false;
+    }
+    let valid_date = bytes[..10]
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            _ => byte.is_ascii_digit(),
+        });
+    if !valid_date {
+        return false;
+    }
+    let suffix = &rest[10..];
+    suffix == ".log"
+        || suffix
+            .strip_prefix('.')
+            .and_then(|value| value.strip_suffix(".log"))
+            .is_some_and(|rotation| {
+                !rotation.is_empty() && rotation.bytes().all(|byte| byte.is_ascii_digit())
+            })
 }
 
 async fn redact_files(files: &[LogFile]) -> Result<String, String> {
     let raw = build_bundle(files).await;
-    tokio::time::timeout(
+    let redacted = tokio::time::timeout(
         REDACTION_TIMEOUT,
-        crate::feedback_redact::redact_pii_for_feedback(raw, String::new()),
+        crate::feedback_redact::redact_diagnostics_locally(raw),
     )
     .await
-    .map_err(|_| "diagnostic redaction timed out; no logs were uploaded".to_string())?
+    .map_err(|_| "diagnostic redaction timed out; no logs were uploaded".to_string())??;
+    Ok(bound_redacted_bundle(redacted))
+}
+
+fn bound_redacted_bundle(mut text: String) -> String {
+    if text.len() <= MAX_REDACTED_BUNDLE_BYTES {
+        return text;
+    }
+    let mut end = MAX_REDACTED_BUNDLE_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 async fn read_tail(path: &Path, limit: usize) -> Result<Vec<u8>, std::io::Error> {
@@ -68,13 +150,27 @@ async fn read_tail(path: &Path, limit: usize) -> Result<Vec<u8>, std::io::Error>
 
     let mut file = tokio::fs::File::open(path).await?;
     let len = metadata.len();
-    if len > limit as u64 {
+    let truncated = len > limit as u64;
+    if truncated {
         file.seek(std::io::SeekFrom::Start(len - limit as u64))
             .await?;
     }
 
     let mut bytes = Vec::with_capacity(std::cmp::min(len as usize, limit));
     file.take(limit as u64).read_to_end(&mut bytes).await?;
+
+    if truncated {
+        // The tail offset can land inside a token (JWT, API key, credentialed
+        // URL). Uploading that suffix without its identifying prefix can evade
+        // deterministic redaction. Drop the partial first line entirely; if a
+        // giant single-line log has no newline, fail closed with no bytes.
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(line_end) => {
+                bytes.drain(..=line_end);
+            }
+            None => bytes.clear(),
+        };
+    }
     Ok(bytes)
 }
 
@@ -136,7 +232,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large.log");
         let mut contents = vec![b'a'; MAX_FILE_BYTES + 128];
-        contents.extend_from_slice("tail-secret-marker".as_bytes());
+        contents.extend_from_slice("\ntail-secret-marker".as_bytes());
         tokio::fs::write(&path, contents).await.unwrap();
 
         let bundle = build_bundle(&[log_file(&path, 1)]).await;
@@ -194,12 +290,69 @@ mod tests {
     async fn utf8_boundary_is_safe_when_tail_starts_inside_a_character() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("unicode.log");
-        let body = format!("{}éEND", "x".repeat(MAX_FILE_BYTES));
+        let body = format!("{}\néEND", "x".repeat(MAX_FILE_BYTES));
         tokio::fs::write(&path, body).await.unwrap();
 
         let bundle = build_bundle(&[log_file(&path, 0)]).await;
 
         assert!(bundle.contains("END"));
         assert!(bundle.len() <= MAX_BUNDLE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn tail_discards_a_credential_suffix_from_the_partial_first_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boundary.log");
+        let credential = "postgres://operator:hunter2@db.internal/prod";
+        let prefix = format!("0123456789{credential}\nsafe-line\n");
+        let mut contents = prefix.into_bytes();
+        contents.resize(MAX_FILE_BYTES + 20, b'x');
+        tokio::fs::write(&path, &contents).await.unwrap();
+
+        let bytes = read_tail(&path, MAX_FILE_BYTES).await.unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("operator:hunter2"));
+        assert!(text.contains("safe-line"));
+    }
+
+    #[test]
+    fn redacted_bundle_remains_transport_bounded_and_utf8_safe() {
+        let oversized = format!("{}é", "x".repeat(MAX_REDACTED_BUNDLE_BYTES + 8));
+        let bounded = bound_redacted_bundle(oversized);
+
+        assert!(bounded.len() <= MAX_REDACTED_BUNDLE_BYTES);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn unattended_collection_only_accepts_known_screenpipe_log_names() {
+        for name in [
+            "screenpipe.log",
+            "screenpipe.2026-07-10.log",
+            "screenpipe.2026-07-10.2.log",
+            "screenpipe-app.2026-07-10.log",
+            "last-panic.log",
+            "recover.stderr.log",
+            ".db_cleanup.log",
+        ] {
+            assert!(
+                is_screenpipe_owned_log_name(name),
+                "expected {name} to be owned"
+            );
+        }
+
+        for name in [
+            "private.log",
+            "customer.log",
+            "screenpipe-secrets.log",
+            "screenpipe.2026-7-10.log",
+            "screenpipe.2026-07-10.backup.log",
+        ] {
+            assert!(
+                !is_screenpipe_owned_log_name(name),
+                "expected {name} to be excluded"
+            );
+        }
     }
 }

@@ -98,6 +98,15 @@ curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \
 5. **"recent"** = 30 min. **"today"** = since midnight. **"yesterday"** = yesterday's range
 6. If timeout, narrow the time range
 
+### Screen Text Provenance
+
+Frame results carry `content.text_source`: `accessibility` (native UI tree, verbatim) · `ocr` (pixel fallback, verbatim) · `vision_hybrid` (native text plus an AI-written `Visual context:` section) · `vision` (AI visual description only — replace mode) · absent on older rows.
+
+- Visual descriptions are **opt-in and sparse** (subset of frames, only after the user enabled visual indexing). Absence never means nothing was on screen; one range can mix sources (a11y-only before enablement, hybrid after) — provenance change, not a data gap.
+- Quote exact strings only from `accessibility`/`ocr`. `Visual context:`/`vision` text is AI-written (layout, charts, images, video, canvas apps) — may paraphrase or truncate; never present as verbatim.
+- Visual-content questions need no extra parameter — one `/search` spans native text and descriptions. If verbatim results are thin, retry with descriptive keywords ("bar chart", "dialog", "map").
+- No server-side `text_source` filter — filter client-side when provenance matters.
+
 ### Response Format
 
 ```json

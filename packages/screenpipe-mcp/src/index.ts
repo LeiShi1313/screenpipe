@@ -306,7 +306,10 @@ const TOOLS: Tool[] = [
       "USE WHEN: you need the actual text/content of a moment — quotes, OCR snippets, transcript lines — or want to filter by speaker/window. " +
       "DO NOT USE for: broad questions like 'what was I doing?' (use activity-summary, it pre-summarizes apps + windows + transcripts). " +
       "Also DO NOT USE for: targeted UI controls (use search-elements). " +
-      "Start with limit=5, increase only if needed. Per-result text is auto-truncated to 1000 chars; pass max_content_length=0 to opt out, or a custom integer to override.",
+      "Start with limit=5, increase only if needed. Per-result text is auto-truncated to 1000 chars; pass max_content_length=0 to opt out, or a custom integer to override. " +
+      "Screen results are tagged by provenance: [Screen·a11y] and [Screen·ocr] are verbatim captured text; [Screen·a11y+visual] and [Screen·visual] contain an AI-written visual description (layout, charts, images, video — may paraphrase, never quote as verbatim). " +
+      "Visual descriptions are opt-in and sparse: absence says nothing about what was on screen, and one time range can mix provenances (e.g. a11y-only before the user enabled visual indexing, hybrid after) — treat that as provenance change, not a data gap. " +
+      "Queries about visual content search both native text and descriptions in the same call; no extra parameter, and no server-side text_source filter (filter client-side if provenance matters).",
     annotations: { title: "Search Content", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -1230,14 +1233,19 @@ function truncateMiddle(text: string | null | undefined, max: number): string {
 const DEFAULT_SEARCH_CONTENT_TRUNCATE = 1000;
 
 // Format the screen-text tag for a result. The server's `text_source` is
-// "accessibility" (OS-native tree, primary path) or "ocr" (fallback for
-// terminals, canvas, weak a11y). Older rows have no text_source, so we
-// fall back to a bare `[Screen]`. The result type is historically called
-// OCR in the engine but most captures are accessibility-derived — surface
-// the actual source so the model picks filters correctly.
+// "accessibility" (OS-native tree, primary path), "ocr" (fallback for
+// terminals, canvas, weak a11y), "vision_hybrid" (native text plus an
+// AI-written "Visual context:" section — opt-in visual indexing, augment
+// mode), or "vision" (AI visual description only — replace mode). Older
+// rows have no text_source, so we fall back to a bare `[Screen]`. The
+// result type is historically called OCR in the engine but most captures
+// are accessibility-derived — surface the actual source so the model
+// picks filters correctly and never quotes AI-written text as verbatim.
 function screenTag(textSource: unknown): string {
   if (textSource === "accessibility") return "[Screen·a11y]";
   if (textSource === "ocr") return "[Screen·ocr]";
+  if (textSource === "vision_hybrid") return "[Screen·a11y+visual]";
+  if (textSource === "vision") return "[Screen·visual]";
   return "[Screen]";
 }
 

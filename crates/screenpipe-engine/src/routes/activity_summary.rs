@@ -62,7 +62,10 @@ pub struct ActivitySummaryQuery {
     /// drop the window list from the response.
     #[serde(default = "default_true")]
     pub include_windows: bool,
-    /// Include sampled screen text (`key_texts`). Default: true. This is the
+    /// Include sampled screen text (`key_texts`) — accessibility-derived
+    /// rows plus AI visual descriptions (marked `source: "visual"`) when the
+    /// opt-in visual indexing worker has described frames in range.
+    /// Default: true. This is the
     /// heaviest field; disable it (`include_key_texts=false`) for pure
     /// time-tracking sweeps to cut response tokens substantially. Snippets are
     /// unaffected — they still sample screen text internally.
@@ -136,6 +139,11 @@ pub struct KeyText {
     pub app_name: String,
     pub window_name: String,
     pub timestamp: String,
+    /// `"visual"` when the text is an AI-written visual description from the
+    /// opt-in visual indexing worker (not verbatim screen text). Absent for
+    /// accessibility-derived rows so the existing shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Serialize, OaSchema)]
@@ -384,6 +392,22 @@ struct SummaryCore {
     total_active_minutes: f64,
 }
 
+/// Strip a wrapping markdown code fence (``` or ```json) from AI-written
+/// visual descriptions. Small local VLMs emit fenced JSON despite prose
+/// prompts; the fence is noise in summary snippets.
+fn strip_code_fences(text: &str) -> String {
+    let trimmed = text.trim();
+    let without_open = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    let without_close = without_open
+        .trim_end()
+        .strip_suffix("```")
+        .unwrap_or(without_open);
+    without_close.trim().to_string()
+}
+
 async fn collect_summary_core(
     db: &DatabaseManager,
     query: &ActivitySummaryQuery,
@@ -536,6 +560,29 @@ async fn collect_summary_core(
          LIMIT 20"
     );
 
+    // AI visual descriptions from the opt-in visual indexing worker. Without
+    // this, activity for canvas/video/design apps (weak a11y) is invisible to
+    // the summary even though the visual index describes it. Newest per
+    // (day, app, window), small cap — key_texts stays a11y-first.
+    let vision_texts_query = format!(
+        "WITH ranked_visual AS ( \
+           SELECT f.vision_description AS text, f.app_name, \
+             COALESCE(f.window_name, '') as window_name, \
+             f.timestamp, \
+             ROW_NUMBER() OVER ( \
+               PARTITION BY DATE(f.timestamp), f.app_name, f.window_name \
+               ORDER BY f.timestamp DESC \
+             ) as rn \
+           FROM frames f \
+           WHERE f.timestamp BETWEEN '{start}' AND '{end}'{app_filter_f} \
+           AND f.vision_description IS NOT NULL \
+           AND LENGTH(f.vision_description) >= 30 \
+         ) \
+         SELECT text, app_name, window_name, timestamp \
+         FROM ranked_visual WHERE rn = 1 \
+         ORDER BY timestamp DESC LIMIT 8"
+    );
+
     let audio_speakers_query = format!(
         "SELECT COALESCE(s.name, 'Unknown') as speaker_name, COUNT(*) as segment_count \
          FROM audio_transcriptions at \
@@ -591,6 +638,7 @@ async fn collect_summary_core(
         audio_transcripts_result,
         edited_files_result,
         active_ts_result,
+        vision_texts_result,
     ) = tokio::join!(
         db.execute_raw_sql(&apps_query),
         db.execute_raw_sql(&windows_query),
@@ -599,6 +647,7 @@ async fn collect_summary_core(
         db.execute_raw_sql(&audio_transcripts_query),
         db.execute_raw_sql(&edited_files_query),
         db.execute_raw_sql(&active_ts_query),
+        db.execute_raw_sql(&vision_texts_query),
     );
 
     let mut apps = Vec::new();
@@ -657,11 +706,38 @@ async fn collect_summary_core(
                     app_name: str_field(row, "app_name"),
                     window_name: str_field(row, "window_name"),
                     timestamp: str_field(row, "timestamp"),
+                    source: None,
                 });
             }
         }
     } else if let Err(e) = &texts_result {
         error!("activity summary: texts query failed: {}", e);
+    }
+
+    // Visual descriptions ride along after the a11y rows: same dedup set, a
+    // `source: "visual"` marker so consumers never quote them as verbatim
+    // screen text, and markdown/JSON fences stripped (small local VLMs wrap
+    // output in ```json despite prose prompts).
+    if let Ok(rows) = vision_texts_result {
+        if let Some(arr) = rows.as_array() {
+            for row in arr {
+                let text = strip_code_fences(&str_field(row, "text"));
+                let text: String = text.chars().take(300).collect();
+                let normalized = text.to_lowercase().trim().to_string();
+                if normalized.len() < 15 || !seen_texts.insert(normalized) {
+                    continue;
+                }
+                key_texts.push(KeyText {
+                    text,
+                    app_name: str_field(row, "app_name"),
+                    window_name: str_field(row, "window_name"),
+                    timestamp: str_field(row, "timestamp"),
+                    source: Some("visual".to_string()),
+                });
+            }
+        }
+    } else if let Err(e) = &vision_texts_result {
+        error!("activity summary: vision texts query failed: {}", e);
     }
 
     let mut speakers = Vec::new();
@@ -1927,6 +2003,40 @@ mod db_tests {
     }
 
     #[tokio::test]
+    async fn key_texts_include_visual_descriptions_with_source_marker() {
+        let (db, _d) = fresh_db().await;
+        add_frame(
+            &db,
+            &format!("{DAY} 11:00:00"),
+            Some("Figma"),
+            Some("Design board"),
+        )
+        .await;
+        // Fenced output mimics small local VLMs; the summary must strip it.
+        db.execute_raw_sql(&format!(
+            "UPDATE frames SET vision_description = \
+             '```json\nDesign canvas showing a signup flow diagram with four screens\n```' \
+             WHERE timestamp = '{DAY} 11:00:00'"
+        ))
+        .await
+        .unwrap();
+        let (s, e) = full_range();
+        let core = collect_summary_core(&db, &query(None), &s, &e).await;
+        let visual = core
+            .key_texts
+            .iter()
+            .find(|k| k.source.as_deref() == Some("visual"))
+            .expect("visual description missing from key_texts");
+        assert!(
+            visual.text.starts_with("Design canvas"),
+            "fence not stripped: {:?}",
+            visual.text
+        );
+        assert!(!visual.text.contains("```"));
+        assert_eq!(visual.app_name, "Figma");
+    }
+
+    #[tokio::test]
     async fn key_texts_are_balanced_across_weekly_ranges() {
         let (db, _d) = fresh_db().await;
         for day in 1..=7 {
@@ -1988,6 +2098,7 @@ mod db_tests {
                 app_name: "Arc".to_string(),
                 window_name: "Weekly Summary".to_string(),
                 timestamp: format!("2026-06-0{day}T10:00:00Z"),
+                source: None,
             })
             .collect::<Vec<_>>();
 
@@ -2321,6 +2432,7 @@ mod include_flag_tests {
             app_name: "Arc".to_string(),
             window_name: "GitHub".to_string(),
             timestamp: "2026-06-02T10:00:30Z".to_string(),
+            source: None,
         }];
         ActivitySummaryResponse {
             apps: include_apps.then_some(apps),

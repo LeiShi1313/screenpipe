@@ -43,7 +43,7 @@ interface CaptureStatusHealth {
   pending_transcription_segments?: number | null;
 }
 
-interface HealthCheckResponse {
+export interface HealthCheckResponse {
   status: string;
   status_code: number;
   last_frame_timestamp: string | null;
@@ -97,6 +97,7 @@ interface HealthSnapshot {
 
 const SERVER_DOWN_GRACE_PERIOD_MS = 5000;
 const HEALTH_RETRY_INTERVAL_MS = 10000;
+const E2E_HEALTH_OVERRIDE_KEY = "screenpipe_e2e_health_override";
 
 let snapshot: HealthSnapshot = {
   health: null,
@@ -201,7 +202,55 @@ function errorHealth(message: string): HealthCheckResponse {
   };
 }
 
+/**
+ * Deterministic E2E seam for capture-health UI tests. This is unavailable in
+ * production builds and is intentionally driven by localStorage so a test can
+ * switch from a stalled pipeline back to the live health WebSocket without
+ * touching macOS permissions or the user's capture session.
+ */
+function getE2EHealthOverride(): HealthCheckResponse | null {
+  if (
+    process.env.NEXT_PUBLIC_SCREENPIPE_E2E !== "true" ||
+    typeof window === "undefined"
+  ) {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(E2E_HEALTH_OVERRIDE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<HealthCheckResponse>;
+    if (
+      typeof parsed.status !== "string" ||
+      typeof parsed.frame_status !== "string" ||
+      typeof parsed.audio_status !== "string"
+    ) {
+      return null;
+    }
+    return {
+      status_code: parsed.status_code ?? 503,
+      last_frame_timestamp: parsed.last_frame_timestamp ?? null,
+      last_audio_timestamp: parsed.last_audio_timestamp ?? null,
+      last_ui_timestamp: parsed.last_ui_timestamp ?? null,
+      ui_status: parsed.ui_status ?? "ok",
+      message: parsed.message ?? "capture health overridden by E2E",
+      ...parsed,
+    } as HealthCheckResponse;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchHealth(): Promise<void> {
+  const e2eOverride = getE2EHealthOverride();
+  if (e2eOverride) {
+    closeHealthSocket(1000, "E2E health override");
+    clearRetryInterval();
+    clearServerDownTimer();
+    emitSnapshot({ health: e2eOverride, isServerDown: false, isLoading: false });
+    return;
+  }
+
   closeHealthSocket(1000, "refreshing");
 
   try {

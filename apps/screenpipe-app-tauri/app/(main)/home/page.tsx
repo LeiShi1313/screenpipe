@@ -48,6 +48,7 @@ import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
 import { RecordingStatus, type RecordingDevice } from "@/components/recording-status";
+import { CaptureHealthBanner } from "@/components/status/capture-health-banner";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
@@ -910,6 +911,7 @@ function HomeContent() {
       {needsLicenseKey && <EnterpriseLicensePrompt onSubmit={submitLicenseKey} />}
       {/* Drag region — always absolute so it works with full-bleed translucent layout */}
       <div className="absolute top-0 left-0 right-0 h-8 z-10" data-tauri-drag-region />
+      <CaptureHealthBanner />
 
           {/* Sidebar */}
           <TooltipProvider delayDuration={0}>

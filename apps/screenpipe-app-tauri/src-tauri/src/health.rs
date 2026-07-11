@@ -397,6 +397,16 @@ struct HealthCheckResponse {
     schedule_paused: bool,
 }
 
+fn has_capture_failure(health: &HealthCheckResponse) -> bool {
+    matches!(
+        health.frame_status.as_deref(),
+        Some("stale" | "not_started" | "error" | "permission_denied")
+    ) || matches!(
+        health.audio_status.as_deref(),
+        Some("stale" | "not_started" | "error" | "active_no_data")
+    )
+}
+
 /// Decide recording status based on health check result and time since startup.
 ///
 /// During the grace period, connection errors are treated as "starting up"
@@ -406,11 +416,6 @@ struct HealthCheckResponse {
 /// When transitioning away from Recording, we require `consecutive_failures`
 /// to meet or exceed `failure_threshold` to prevent flickering caused by
 /// transient timeouts or momentary server busyness.
-///
-/// "stale" responses (server responding but frame/audio timestamps are old)
-/// are treated as Recording — the server IS running, it's just behind on
-/// DB writes (e.g. pool saturation). Showing the error icon for this causes
-/// false alarms and user panic when data is actually still being captured.
 fn decide_status(
     health_result: &Result<HealthCheckResponse>,
     elapsed_since_start: Duration,
@@ -423,13 +428,16 @@ fn decide_status(
     current_status: RecordingStatus,
 ) -> RecordingStatus {
     match health_result {
-        Ok(health) if health.status == "unhealthy" || health.status == "error" => {
+        Ok(health)
+            if health.status == "unhealthy"
+                || health.status == "error"
+                || has_capture_failure(health) =>
+        {
             // Server is responding but explicitly reporting a problem.
             // Debounce heavily: 2 min sustained before flipping to Error.
-            // /health is a soft signal — DB pool pressure, OCR queue backpressure,
-            // and slow audio chunks all flap "unhealthy" while recording continues.
-            // Genuine failures (permission revoked, capture crashed) surface via
-            // the permission_monitor + capture-module event paths, not here.
+            // /health is a soft signal for generic DB/OCR pressure, but explicit
+            // capture failures (stale/not-started/error/permission denied) must
+            // eventually reach the tray so the user is not told "Recording".
             if consecutive_unhealthy >= unhealthy_threshold {
                 RecordingStatus::Error
             } else if current_status == RecordingStatus::Recording {
@@ -439,12 +447,8 @@ fn decide_status(
             }
         }
         Ok(_) => {
-            // Server is responding (healthy, stale, or degraded — with or without
-            // DRM-pause). "stale" means timestamps are old but the server process
-            // is alive; this happens during DB pool saturation and resolves on its
-            // own. "degraded" is a soft signal that does NOT mean recording stopped
-            // — real permission/capture failures are detected by permission_monitor
-            // (see line 498-504 below). Don't surface Error in the tray for this.
+            // Server is responding and no explicit capture failure was reported.
+            // Generic degraded/stale DB signals remain soft to avoid false alarms.
             RecordingStatus::Recording
         }
         Err(_) => {
@@ -823,9 +827,14 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // Connection errors = server unreachable (crash, restart, port conflict).
             // Unhealthy = server responding but reporting a problem (DB issues, stalls).
             match &health_result {
-                Ok(health) if health.status == "unhealthy" || health.status == "error" => {
-                    // Only hard "unhealthy"/"error" counts toward the Error transition.
-                    // "degraded" is treated as healthy in decide_status (see comments there).
+                Ok(health)
+                    if health.status == "unhealthy"
+                        || health.status == "error"
+                        || has_capture_failure(health) =>
+                {
+                    // Only explicit unhealthy/error or capture-failure states count
+                    // toward the debounced Error transition. Generic degraded DB/OCR
+                    // pressure remains a soft signal.
                     ever_connected = true;
                     consecutive_failures = 0;
                     consecutive_unhealthy = consecutive_unhealthy.saturating_add(1);
@@ -1509,6 +1518,30 @@ mod tests {
             status,
             RecordingStatus::Error,
             "sustained unhealthy should transition to Error"
+        );
+    }
+
+    #[test]
+    fn test_stale_capture_at_threshold_transitions_to_error() {
+        let mut health = make_healthy_response().expect("healthy fixture");
+        health.status = "degraded".to_string();
+        health.frame_status = Some("stale".to_string());
+        let result = Ok(health);
+        let status = decide_status(
+            &result,
+            Duration::from_secs(60),
+            STARTUP_GRACE_PERIOD,
+            true,
+            0,
+            CONSECUTIVE_FAILURES_THRESHOLD,
+            CONSECUTIVE_UNHEALTHY_THRESHOLD,
+            CONSECUTIVE_UNHEALTHY_THRESHOLD,
+            RecordingStatus::Recording,
+        );
+        assert_eq!(
+            status,
+            RecordingStatus::Error,
+            "sustained stale capture should transition to Error"
         );
     }
 

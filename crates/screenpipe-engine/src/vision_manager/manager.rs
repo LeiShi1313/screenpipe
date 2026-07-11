@@ -7,7 +7,9 @@
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use screenpipe_db::DatabaseManager;
-use screenpipe_screen::monitor::{get_monitor_by_id, list_monitors};
+use screenpipe_screen::monitor::{
+    get_monitor_by_id, list_monitors_detailed, MonitorListError,
+};
 use screenpipe_screen::PipelineMetrics;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -262,11 +264,26 @@ impl VisionManager {
         *status = VisionManagerStatus::Running;
         drop(status);
 
-        // Get all monitors and start recording on each (filtered by user selection)
-        let monitors = list_monitors().await;
+        // Preserve the actual monitor-enumeration error. The compatibility
+        // wrapper turns Screen Recording TCC denial into an empty list, which
+        // makes recovery report the unrelated "stale monitor_ids" error.
+        let monitors = match list_monitors_detailed().await {
+            Ok(monitors) => monitors,
+            Err(MonitorListError::PermissionDenied) => {
+                *self.status.write().await = VisionManagerStatus::Stopped;
+                return Err(anyhow::anyhow!(
+                    "screen recording permission denied; grant access in System Settings > Privacy & Security > Screen Recording"
+                ));
+            }
+            Err(MonitorListError::NoMonitorsFound) => Vec::new(),
+            Err(MonitorListError::Other(error)) => {
+                *self.status.write().await = VisionManagerStatus::Stopped;
+                return Err(anyhow::anyhow!("failed to enumerate monitors: {}", error));
+            }
+        };
         let total_monitors = monitors.len();
-        for monitor in monitors {
-            if !self.is_monitor_allowed(&monitor) {
+        for monitor in &monitors {
+            if !self.is_monitor_allowed(monitor) {
                 info!(
                     "Skipping monitor {} ({}) — not in allowed list",
                     monitor.id(),
@@ -292,7 +309,7 @@ impl VisionManager {
             );
             self.stale_allowlist_fallback
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            for monitor in list_monitors().await {
+            for monitor in &monitors {
                 let monitor_id = monitor.id();
                 if let Err(e) = self.start_monitor(monitor_id).await {
                     warn!(
@@ -730,6 +747,7 @@ mod tests {
     use super::*;
     use screenpipe_core::Language;
     use screenpipe_db::DatabaseManager;
+    use screenpipe_screen::monitor::list_monitors;
     use screenpipe_screen::PipelineMetrics;
 
     async fn make_vm_with_monitor_ids(monitor_ids: Vec<String>) -> VisionManager {

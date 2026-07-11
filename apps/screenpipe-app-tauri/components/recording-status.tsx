@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { localFetch } from "@/lib/api";
+import { useHealthCheck } from "@/lib/hooks/use-health-check";
 
 export interface RecordingDevice {
   name: string;
@@ -80,13 +81,29 @@ export function RecordingStatus({
 }: RecordingStatusProps) {
   const [open, setOpen] = React.useState(false);
   const [pauseLoading, setPauseLoading] = React.useState(false);
+  const { health, isServerDown } = useHealthCheck();
 
   const pausedCount = devices.filter((d) => !d.active).length;
-  const allActive = devices.length > 0 && pausedCount === 0;
+  const captureProblem =
+    isServerDown ||
+    Boolean(
+      health &&
+        ["stale", "not_started", "error", "permission_denied"].includes(
+          health.frame_status,
+        ),
+    ) ||
+    Boolean(
+      health &&
+        ["stale", "not_started", "error", "active_no_data"].includes(
+          health.audio_status,
+        ),
+    );
+  const allActive = devices.length > 0 && pausedCount === 0 && !captureProblem;
   const canPauseRecording = devices.some((d) => d.active);
 
-  const summary =
-    devices.length === 0
+  const summary = captureProblem
+    ? "capture problem"
+    : devices.length === 0
       ? "not recording"
       : pausedCount === 0
         ? "recording"
@@ -204,10 +221,14 @@ export function RecordingStatus({
                   isTranslucent
                     ? allActive
                       ? "vibrant-sidebar-fg bg-current"
-                      : "vibrant-sidebar-fg border border-current bg-transparent"
+                      : captureProblem
+                        ? "vibrant-sidebar-fg border border-red-300 bg-red-300"
+                        : "vibrant-sidebar-fg border border-current bg-transparent"
                     : allActive
                       ? "bg-foreground"
-                      : "border border-foreground bg-transparent",
+                      : captureProblem
+                        ? "border border-destructive bg-destructive"
+                        : "border border-foreground bg-transparent",
                   devices.length === 0 && "opacity-40",
                   meetingActive && "animate-pulse"
                 )}

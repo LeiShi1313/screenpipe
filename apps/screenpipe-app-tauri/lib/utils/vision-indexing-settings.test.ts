@@ -6,9 +6,13 @@ import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_LOCAL_VISION_ENDPOINT,
 	DEFAULT_LOCAL_VISION_MODEL,
+	SCREENPIPE_CLOUD_VISION_ENDPOINT,
+	SCREENPIPE_CLOUD_VISION_MODEL,
 	getVisionIndexingDisabledUpdates,
 	getVisionIndexingEndpointUpdates,
 	getVisionIndexingModeUpdates,
+	getVisionIndexingProvider,
+	getVisionIndexingProviderUpdates,
 	validateVisionIndexingSettings,
 } from "./vision-indexing-settings";
 
@@ -96,6 +100,96 @@ describe("visual indexing settings", () => {
 			visionIndexingApiKey: "",
 			visionIndexingCloudConsent: false,
 		});
+	});
+
+	it("derives the provider from mode + endpoint without a persisted field", () => {
+		expect(getVisionIndexingProvider({})).toBe("off");
+		expect(getVisionIndexingProvider({ visionIndexingMode: "local" })).toBe("local");
+		expect(
+			getVisionIndexingProvider({
+				visionIndexingMode: "cloud",
+				visionIndexingEndpoint: `${SCREENPIPE_CLOUD_VISION_ENDPOINT}/`,
+			}),
+		).toBe("screenpipe-cloud");
+		expect(
+			getVisionIndexingProvider({
+				visionIndexingMode: "cloud",
+				visionIndexingEndpoint: "https://vision.example/v1",
+			}),
+		).toBe("custom");
+	});
+
+	it("pins endpoint/model, installs the account token, and treats selection as consent for screenpipe cloud", () => {
+		expect(
+			getVisionIndexingProviderUpdates(
+				{ visionIndexingMode: "off", visionIndexingApiKey: "old" },
+				"screenpipe-cloud",
+				{ screenpipeCloudToken: " tok-123 " },
+			),
+		).toEqual({
+			visionIndexingMode: "cloud",
+			usePiiRemoval: true,
+			asyncImagePiiRedaction: true,
+			visionIndexingEndpoint: SCREENPIPE_CLOUD_VISION_ENDPOINT,
+			visionIndexingModel: SCREENPIPE_CLOUD_VISION_MODEL,
+			visionIndexingApiKey: "tok-123",
+			visionIndexingCloudConsent: true,
+		});
+	});
+
+	it("never carries screenpipe cloud credentials into a custom provider", () => {
+		const updates = getVisionIndexingProviderUpdates(
+			{
+				visionIndexingMode: "cloud",
+				visionIndexingEndpoint: SCREENPIPE_CLOUD_VISION_ENDPOINT,
+				visionIndexingApiKey: "account-token",
+				visionIndexingCloudConsent: true,
+			},
+			"custom",
+		);
+		expect(updates).toMatchObject({
+			visionIndexingMode: "cloud",
+			visionIndexingEndpoint: "",
+			visionIndexingModel: "",
+			visionIndexingApiKey: "",
+			visionIndexingCloudConsent: false,
+		});
+	});
+
+	it("re-selecting the current provider keeps its configuration", () => {
+		expect(
+			getVisionIndexingProviderUpdates(
+				{
+					visionIndexingMode: "cloud",
+					visionIndexingEndpoint: SCREENPIPE_CLOUD_VISION_ENDPOINT,
+					visionIndexingApiKey: "account-token",
+					visionIndexingCloudConsent: true,
+				},
+				"screenpipe-cloud",
+				{ screenpipeCloudToken: "newer-token" },
+			),
+		).toEqual({
+			visionIndexingMode: "cloud",
+			usePiiRemoval: true,
+			asyncImagePiiRedaction: true,
+		});
+	});
+
+	it("provider off delegates to the disabled updates", () => {
+		expect(
+			getVisionIndexingProviderUpdates(
+				{
+					visionIndexingMode: "local",
+					visionIndexingEndpoint: DEFAULT_LOCAL_VISION_ENDPOINT,
+				},
+				"off",
+			),
+		).toEqual(
+			getVisionIndexingDisabledUpdates({
+				visionIndexingMode: "local",
+				visionIndexingEndpoint: DEFAULT_LOCAL_VISION_ENDPOINT,
+			}),
+		);
 	});
 
 	it("turns visual indexing off when image PII removal is disabled", () => {

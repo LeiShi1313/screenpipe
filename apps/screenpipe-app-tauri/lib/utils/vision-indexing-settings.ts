@@ -4,8 +4,26 @@
 
 export type VisionIndexingMode = "off" | "local" | "cloud";
 
-export const DEFAULT_LOCAL_VISION_ENDPOINT = "http://127.0.0.1:8000/v1";
-export const DEFAULT_LOCAL_VISION_MODEL = "google/gemma-4-E4B";
+/**
+ * UI-level provider choice layered over the engine's off/local/cloud modes.
+ * "screenpipe-cloud" is engine mode "cloud" pinned to the screenpipe API
+ * (Gemma inside a Tinfoil enclave, billed as screenpipe credits); "custom" is
+ * engine mode "cloud" with a user-supplied endpoint. Derived from the stored
+ * endpoint rather than persisted, so the engine contract stays three modes.
+ */
+export type VisionIndexingProvider = "off" | "screenpipe-cloud" | "local" | "custom";
+
+// Ollama's default port — the most common local runtime on macOS, and the one
+// the settings UI enumerates models from. vLLM users point this at :8000.
+export const DEFAULT_LOCAL_VISION_ENDPOINT = "http://127.0.0.1:11434/v1";
+// Deliberately empty: the UI auto-selects the first model detected on the
+// local server. A hardcoded default that the server doesn't actually host
+// would make every indexing job fail silently.
+export const DEFAULT_LOCAL_VISION_MODEL = "";
+export const SCREENPIPE_CLOUD_VISION_ENDPOINT = "https://api.screenpipe.com/v1";
+// "auto" mirrors the screenpipe-cloud AI presets: the server routes to its
+// current vision model (Gemma in the Tinfoil enclave) without a client pin.
+export const SCREENPIPE_CLOUD_VISION_MODEL = "auto";
 
 export type VisionIndexingSettingsLike = {
 	visionIndexingMode?: VisionIndexingMode;
@@ -114,6 +132,60 @@ export const getVisionIndexingModeUpdates = (
 	if (nextMode === "local") {
 		updates.visionIndexingEndpoint = DEFAULT_LOCAL_VISION_ENDPOINT;
 		updates.visionIndexingModel = DEFAULT_LOCAL_VISION_MODEL;
+	} else {
+		updates.visionIndexingEndpoint = "";
+		updates.visionIndexingModel = "";
+	}
+
+	return updates;
+};
+
+export const getVisionIndexingProvider = (
+	settings: VisionIndexingSettingsLike,
+): VisionIndexingProvider => {
+	const mode = settings.visionIndexingMode ?? "off";
+	if (mode === "off") return "off";
+	if (mode === "local") return "local";
+	return normalizedEndpoint(settings.visionIndexingEndpoint) ===
+		SCREENPIPE_CLOUD_VISION_ENDPOINT
+		? "screenpipe-cloud"
+		: "custom";
+};
+
+/**
+ * Provider-level counterpart of getVisionIndexingModeUpdates. Keeps the same
+ * invariant: switching who receives screenshots never carries an endpoint,
+ * credential, model choice, or consent across. screenpipe-cloud additionally
+ * pins the endpoint/model and installs the account token as the bearer key.
+ */
+export const getVisionIndexingProviderUpdates = (
+	current: VisionIndexingSettingsLike,
+	nextProvider: VisionIndexingProvider,
+	opts?: { screenpipeCloudToken?: string | null },
+): VisionIndexingSettingsUpdate => {
+	if (nextProvider === "off") return getVisionIndexingDisabledUpdates(current);
+
+	const updates: VisionIndexingSettingsUpdate = {
+		visionIndexingMode: nextProvider === "local" ? "local" : "cloud",
+		usePiiRemoval: true,
+		asyncImagePiiRedaction: true,
+	};
+
+	if (nextProvider === getVisionIndexingProvider(current)) return updates;
+
+	updates.visionIndexingApiKey = "";
+	updates.visionIndexingCloudConsent = false;
+	if (nextProvider === "local") {
+		updates.visionIndexingEndpoint = DEFAULT_LOCAL_VISION_ENDPOINT;
+		updates.visionIndexingModel = DEFAULT_LOCAL_VISION_MODEL;
+	} else if (nextProvider === "screenpipe-cloud") {
+		updates.visionIndexingEndpoint = SCREENPIPE_CLOUD_VISION_ENDPOINT;
+		updates.visionIndexingModel = SCREENPIPE_CLOUD_VISION_MODEL;
+		updates.visionIndexingApiKey = opts?.screenpipeCloudToken?.trim() ?? "";
+		// Picking the managed provider from the dropdown IS the consent act —
+		// screenpipe operates the enclave, so no second acknowledgement box.
+		// Custom endpoints keep the explicit checkbox: unknown operator.
+		updates.visionIndexingCloudConsent = true;
 	} else {
 		updates.visionIndexingEndpoint = "";
 		updates.visionIndexingModel = "";

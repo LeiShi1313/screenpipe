@@ -31,7 +31,7 @@ export const searchIndex: SettingsField[] = [
   { label: "Smart recording", keywords: ["smart recording", "beta", "meeting", "piggyback", "per-process", "meeting audio"], conditional: true },
   { label: "Screen context capture", keywords: ["screen", "video", "accessibility"] },
   { label: "Screenshot images", keywords: ["screenshot", "pixels", "ocr", "jpeg"] },
-  { label: "Visual indexing", keywords: ["vision", "vlm", "local model", "cloud model", "semantic search", "dayflow"], conditional: true },
+  { label: "Visual indexing", keywords: ["vision", "vlm", "local model", "cloud model", "semantic search", "dayflow", "screenpipe cloud", "tinfoil", "gemma", "ollama", "describe screen"], conditional: true },
   { label: "Use all monitors", keywords: ["monitor", "display"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
   { label: "Monitors", conditional: true },
@@ -75,7 +75,6 @@ import {
   RefreshCw,
   Loader2,
   Globe,
-  Shield,
   Zap,
   Music,
   FileAudio,
@@ -164,10 +163,12 @@ import {
 import {
   getVisionIndexingDisabledUpdates,
   getVisionIndexingEndpointUpdates,
-  getVisionIndexingModeUpdates,
+  getVisionIndexingProvider,
+  getVisionIndexingProviderUpdates,
   validateVisionIndexingSettings,
-  type VisionIndexingMode,
+  type VisionIndexingProvider,
 } from "@/lib/utils/vision-indexing-settings";
+import { useVisionModels } from "./hooks/use-vision-models";
 import { AudioEqualizer } from "@/app/shortcut-reminder/audio-equalizer";
 
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
@@ -1912,6 +1913,8 @@ export function RecordingSettings() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [showOpenAIApiKey, setShowOpenAIApiKey] = useState(false);
   const [showVisionApiKey, setShowVisionApiKey] = useState(false);
+  const [showVisionAdvanced, setShowVisionAdvanced] = useState(false);
+  const [visionModelManualEntry, setVisionModelManualEntry] = useState(false);
   const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
   const { checkLogin } = useLoginDialog();
   const overlayData = useOverlayData();
@@ -2065,7 +2068,24 @@ export function RecordingSettings() {
   const screenshotImagesEnabled = screenContextEnabled && !(settings.disableScreenshots ?? false);
   const visionIndexingMode = settings.visionIndexingMode ?? "off";
   const visionIndexingEnabled = visionIndexingMode !== "off";
+  const visionIndexingProvider = getVisionIndexingProvider(settings);
   const visionImageRedactionBackend = settings.piiBackend === "tinfoil" ? "tinfoil" : "local";
+  const screenpipeCloudToken = settings.user?.token ?? "";
+  const { models: visionModels, isLoading: visionModelsLoading } = useVisionModels(
+    settings.visionIndexingEndpoint ?? "",
+    settings.visionIndexingApiKey ?? "",
+    visionIndexingProvider === "local",
+  );
+  // Local mode ships with an empty model on purpose (a hardcoded name the
+  // server doesn't host would fail every job silently) — adopt the first
+  // detected model so the common ollama path configures itself.
+  useEffect(() => {
+    if (visionIndexingProvider !== "local") return;
+    if ((settings.visionIndexingModel ?? "").trim()) return;
+    if (visionModels.length === 0) return;
+    handleSettingsChange({ visionIndexingModel: visionModels[0] }, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionIndexingProvider, visionModels, settings.visionIndexingModel]);
 
   const handleAecModeChange = useCallback((mode: AecMode) => {
     handleSettingsChange(getAecModeSettings(mode), true);
@@ -3836,174 +3856,184 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div className="min-w-0">
                     <h3 className="text-sm font-medium text-foreground">Visual indexing</h3>
                     <p className="text-xs text-muted-foreground">
-                      Turn selected screenshots into short visual descriptions for canvas apps,
-                      remote desktops, and other screens that text capture misses. A background
-                      worker indexes only redaction-ready images; capture never calls the model.
+                      Let AI describe your screen so search also finds charts, images, and video.
                     </p>
                   </div>
                 </div>
                 <Select
-                  value={visionIndexingMode}
-                  onValueChange={(value) =>
+                  value={visionIndexingProvider}
+                  onValueChange={(value) => {
+                    setVisionModelManualEntry(false);
                     handleSettingsChange(
-                      getVisionIndexingModeUpdates(
+                      getVisionIndexingProviderUpdates(
                         settings,
-                        value as VisionIndexingMode,
+                        value as VisionIndexingProvider,
+                        { screenpipeCloudToken },
                       ),
                       true,
-                    )
-                  }
+                    );
+                  }}
                 >
-                  <SelectTrigger className="h-8 w-[180px] shrink-0 text-xs">
+                  <SelectTrigger className="h-8 w-[210px] shrink-0 text-xs">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="off">Off</SelectItem>
-                    <SelectItem value="local">Local VLM</SelectItem>
-                    <SelectItem value="cloud">Cloud VLM</SelectItem>
+                    <SelectItem value="screenpipe-cloud">Screenpipe cloud (recommended)</SelectItem>
+                    <SelectItem value="local">On this Mac</SelectItem>
+                    <SelectItem value="custom">Custom provider</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
               {visionIndexingEnabled && (
                 <div className="space-y-2.5 border-t border-border pt-3">
-                  <div className="flex items-start gap-2 rounded border border-border bg-muted/40 px-2.5 py-2 text-[11px] text-muted-foreground">
-                    <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>
-                      {visionImageRedactionBackend === "tinfoil"
-                        ? "Required privacy step: your configured cloud enclave processes original pixels before the visual indexer receives the processed screenshot. Generated descriptions are not redacted again; your selected Image PII labels define this boundary."
-                        : "Required privacy step: the local Image PII removal worker processes each screenshot first and may download about 100 MB on first use. Generated descriptions are not redacted again; your selected Image PII labels define this boundary."}
-                    </span>
-                  </div>
                   {validationErrors.asyncImagePiiRedaction && (
                     <p className="text-[11px] text-destructive">
                       {validationErrors.asyncImagePiiRedaction}
                     </p>
                   )}
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    <label className="space-y-1">
-                      <span className="text-xs font-medium text-foreground">Search scope</span>
-                      <Select
-                        value={settings.visionIndexingContextMode ?? "augment"}
-                        onValueChange={(value) =>
-                          handleSettingsChange(
-                            {
-                              visionIndexingContextMode: value as "augment" | "replace",
-                            },
-                            true,
-                          )
-                        }
-                      >
-                        <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="augment">Native + visual</SelectItem>
-                          <SelectItem value="replace">Visual descriptions only</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <span className="block text-[11px] text-muted-foreground">
-                        {settings.visionIndexingContextMode === "replace"
-                          ? "For frames with a visual description, search uses that description while native accessibility/OCR text remains stored unchanged."
-                          : "Recommended: search native screen text and the separate visual index together."}
-                      </span>
-                    </label>
 
-                    <label className="space-y-1">
-                      <span className="text-xs font-medium text-foreground">Maximum cadence</span>
-                      <Select
-                        value={String(settings.visionIndexingIntervalMs ?? 10000)}
-                        onValueChange={(value) =>
-                          handleSettingsChange({ visionIndexingIntervalMs: Number(value) }, true)
-                        }
-                      >
-                        <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="10000">Every 10 seconds (recommended)</SelectItem>
-                          <SelectItem value="30000">Every 30 seconds</SelectItem>
-                          <SelectItem value="60000">Every minute</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <span className="block text-[11px] text-muted-foreground">
-                        The background worker coalesces each monitor to its newest eligible redacted frame.
-                      </span>
-                    </label>
-                  </div>
+                  {visionIndexingProvider === "screenpipe-cloud" && (
+                    <div className="space-y-2.5">
+                      {!screenpipeCloudToken && (
+                        <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[11px]">
+                          Sign in to your screenpipe account to use screenpipe cloud.
+                        </p>
+                      )}
+                      <p className="text-[11px] text-muted-foreground">
+                        Screenshots are scrubbed of personal info on this device, then described
+                        privately in a sealed enclave. Uses your screenpipe credits.
+                      </p>
+                    </div>
+                  )}
 
-                  <label className="block space-y-1">
-                    <span className="text-xs font-medium text-foreground">OpenAI-compatible endpoint</span>
-                    <Input
-                      className="h-8 text-xs font-mono"
-                      placeholder={visionIndexingMode === "local" ? "http://127.0.0.1:8000/v1" : "https://your-provider.example/v1"}
-                      value={settings.visionIndexingEndpoint ?? ""}
-                      onChange={(event) =>
-                        handleSettingsChange(
-                          getVisionIndexingEndpointUpdates(
-                            settings.visionIndexingEndpoint,
-                            event.target.value,
-                          ),
-                          true,
-                        )
-                      }
-                    />
-                    <span className="block text-[11px] text-muted-foreground">
-                      {visionIndexingMode === "local"
-                        ? "Only screenshots processed by Image PII removal are sent to localhost / loopback. vLLM and Ollama both expose this API shape."
-                        : "Must be HTTPS. You choose the provider, model, credentials, and retention terms."}
-                    </span>
-                    {validationErrors.visionIndexingEndpoint && (
-                      <span className="block text-[11px] text-destructive">
-                        {validationErrors.visionIndexingEndpoint}
-                      </span>
-                    )}
-                  </label>
-
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    <label className="space-y-1">
+                  {visionIndexingProvider === "local" && (
+                    <label className="block space-y-1">
                       <span className="text-xs font-medium text-foreground">Model</span>
-                      <Input
-                        className="h-8 text-xs font-mono"
-                        placeholder={visionIndexingMode === "local" ? "google/gemma-4-E4B" : "gemini-3.1-flash-lite"}
-                        value={settings.visionIndexingModel ?? ""}
-                        onChange={(event) =>
-                          handleSettingsChange({ visionIndexingModel: event.target.value }, true)
-                        }
-                      />
-                      <span className="block text-[11px] text-muted-foreground">
-                        Local starting point: Gemma 4 E4B; test GUI-Owl 1.5 4B for UI grounding and Qwen3.6-27B only for escalations.
-                      </span>
+                      {visionModels.length > 0 && !visionModelManualEntry ? (
+                        <Select
+                          value={
+                            visionModels.includes(settings.visionIndexingModel ?? "")
+                              ? (settings.visionIndexingModel ?? "")
+                              : ""
+                          }
+                          onValueChange={(value) => {
+                            if (value === "__manual__") {
+                              setVisionModelManualEntry(true);
+                              return;
+                            }
+                            handleSettingsChange({ visionIndexingModel: value }, true);
+                          }}
+                        >
+                          <SelectTrigger className="h-8 text-xs font-mono">
+                            <SelectValue placeholder={settings.visionIndexingModel || "Pick a model"} />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {visionModels.map((model) => (
+                              <SelectItem key={model} value={model} className="font-mono text-xs">
+                                {model}
+                              </SelectItem>
+                            ))}
+                            <SelectItem value="__manual__">Type a model name…</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <Input
+                          className="h-8 text-xs font-mono"
+                          placeholder="e.g. qwen2.5vl:3b"
+                          value={settings.visionIndexingModel ?? ""}
+                          onChange={(event) =>
+                            handleSettingsChange({ visionIndexingModel: event.target.value }, true)
+                          }
+                        />
+                      )}
+                      {visionModels.length === 0 && (
+                        <span className="block text-[11px] text-muted-foreground">
+                          {visionModelsLoading
+                            ? "Looking for models on your local AI server…"
+                            : "No local AI server found — start Ollama, or type a model name."}
+                        </span>
+                      )}
                       {validationErrors.visionIndexingModel && (
                         <span className="block text-[11px] text-destructive">
                           {validationErrors.visionIndexingModel}
                         </span>
                       )}
                     </label>
+                  )}
 
-                    <label className="space-y-1">
-                      <span className="text-xs font-medium text-foreground">API key {visionIndexingMode === "local" ? "(optional)" : ""}</span>
-                      <div className="relative">
+                  {visionIndexingProvider === "custom" && (
+                    <div className="space-y-2.5">
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-foreground">OpenAI-compatible endpoint</span>
                         <Input
-                          className="h-8 pr-8 text-xs font-mono"
-                          type={showVisionApiKey ? "text" : "password"}
-                          value={settings.visionIndexingApiKey ?? ""}
+                          className="h-8 text-xs font-mono"
+                          placeholder="https://your-provider.example/v1"
+                          value={settings.visionIndexingEndpoint ?? ""}
                           onChange={(event) =>
-                            handleSettingsChange({ visionIndexingApiKey: event.target.value }, true)
+                            handleSettingsChange(
+                              getVisionIndexingEndpointUpdates(
+                                settings.visionIndexingEndpoint,
+                                event.target.value,
+                              ),
+                              true,
+                            )
                           }
                         />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="absolute right-0 top-0 h-8 w-8"
-                          onClick={() => setShowVisionApiKey((visible) => !visible)}
-                          aria-label={showVisionApiKey ? "hide vision API key" : "show vision API key"}
-                        >
-                          {showVisionApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                        </Button>
-                      </div>
-                    </label>
-                  </div>
+                        <span className="block text-[11px] text-muted-foreground">
+                          Must be HTTPS. You choose the provider, model, credentials, and retention terms.
+                        </span>
+                        {validationErrors.visionIndexingEndpoint && (
+                          <span className="block text-[11px] text-destructive">
+                            {validationErrors.visionIndexingEndpoint}
+                          </span>
+                        )}
+                      </label>
 
-                  {visionIndexingMode === "cloud" && (
-                    <div className="space-y-2.5">
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <label className="space-y-1">
+                          <span className="text-xs font-medium text-foreground">Model</span>
+                          <Input
+                            className="h-8 text-xs font-mono"
+                            placeholder="gemini-3.1-flash-lite"
+                            value={settings.visionIndexingModel ?? ""}
+                            onChange={(event) =>
+                              handleSettingsChange({ visionIndexingModel: event.target.value }, true)
+                            }
+                          />
+                          {validationErrors.visionIndexingModel && (
+                            <span className="block text-[11px] text-destructive">
+                              {validationErrors.visionIndexingModel}
+                            </span>
+                          )}
+                        </label>
+
+                        <label className="space-y-1">
+                          <span className="text-xs font-medium text-foreground">API key</span>
+                          <div className="relative">
+                            <Input
+                              className="h-8 pr-8 text-xs font-mono"
+                              type={showVisionApiKey ? "text" : "password"}
+                              value={settings.visionIndexingApiKey ?? ""}
+                              onChange={(event) =>
+                                handleSettingsChange({ visionIndexingApiKey: event.target.value }, true)
+                              }
+                            />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="absolute right-0 top-0 h-8 w-8"
+                              onClick={() => setShowVisionApiKey((visible) => !visible)}
+                              aria-label={showVisionApiKey ? "hide vision API key" : "show vision API key"}
+                            >
+                              {showVisionApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                            </Button>
+                          </div>
+                        </label>
+                      </div>
+
                       <label className="flex cursor-pointer items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs">
                         <input
                           type="checkbox"
@@ -4024,29 +4054,139 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                           {validationErrors.visionIndexingCloudConsent}
                         </p>
                       )}
-                      <label className="block space-y-1">
-                        <span className="text-xs font-medium text-foreground">Cloud daily budget</span>
-                        <Select
-                          value={String(settings.visionIndexingMaxCloudJobsPerDay ?? 100)}
-                          onValueChange={(value) =>
-                            handleSettingsChange(
-                              { visionIndexingMaxCloudJobsPerDay: Number(value) },
-                              true,
-                            )
-                          }
-                        >
-                          <SelectTrigger className="h-8 w-[220px] text-xs"><SelectValue /></SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="25">25 cloud requests / day</SelectItem>
-                            <SelectItem value="100">100 cloud requests / day (recommended)</SelectItem>
-                            <SelectItem value="250">250 cloud requests / day</SelectItem>
-                            <SelectItem value="500">500 cloud requests / day</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <span className="block text-[11px] text-muted-foreground">
-                          A persisted cap across restarts. Provider image-token accounting varies, so benchmark your selected model before increasing it.
-                        </span>
-                      </label>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    className="flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+                    onClick={() => setShowVisionAdvanced((visible) => !visible)}
+                    aria-expanded={showVisionAdvanced}
+                  >
+                    <ChevronDown
+                      className={cn(
+                        "h-3.5 w-3.5 transition-transform",
+                        !showVisionAdvanced && "-rotate-90",
+                      )}
+                    />
+                    Advanced
+                  </button>
+
+                  {showVisionAdvanced && (
+                    <div className="space-y-2.5">
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <label className="space-y-1">
+                          <span className="text-xs font-medium text-foreground">Search scope</span>
+                          <Select
+                            value={settings.visionIndexingContextMode ?? "augment"}
+                            onValueChange={(value) =>
+                              handleSettingsChange(
+                                {
+                                  visionIndexingContextMode: value as "augment" | "replace",
+                                },
+                                true,
+                              )
+                            }
+                          >
+                            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="augment">Screen text + descriptions</SelectItem>
+                              <SelectItem value="replace">Descriptions only</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </label>
+
+                        <label className="space-y-1">
+                          <span className="text-xs font-medium text-foreground">How often</span>
+                          <Select
+                            value={String(settings.visionIndexingIntervalMs ?? 10000)}
+                            onValueChange={(value) =>
+                              handleSettingsChange({ visionIndexingIntervalMs: Number(value) }, true)
+                            }
+                          >
+                            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="10000">Every 10 seconds (recommended)</SelectItem>
+                              <SelectItem value="30000">Every 30 seconds</SelectItem>
+                              <SelectItem value="60000">Every minute</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </label>
+                      </div>
+
+                      {visionIndexingProvider === "local" && (
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          <label className="space-y-1">
+                            <span className="text-xs font-medium text-foreground">Local server address</span>
+                            <Input
+                              className="h-8 text-xs font-mono"
+                              placeholder="http://127.0.0.1:11434/v1"
+                              value={settings.visionIndexingEndpoint ?? ""}
+                              onChange={(event) =>
+                                handleSettingsChange(
+                                  getVisionIndexingEndpointUpdates(
+                                    settings.visionIndexingEndpoint,
+                                    event.target.value,
+                                  ),
+                                  true,
+                                )
+                              }
+                            />
+                            {validationErrors.visionIndexingEndpoint && (
+                              <span className="block text-[11px] text-destructive">
+                                {validationErrors.visionIndexingEndpoint}
+                              </span>
+                            )}
+                          </label>
+
+                          <label className="space-y-1">
+                            <span className="text-xs font-medium text-foreground">API key (optional)</span>
+                            <div className="relative">
+                              <Input
+                                className="h-8 pr-8 text-xs font-mono"
+                                type={showVisionApiKey ? "text" : "password"}
+                                value={settings.visionIndexingApiKey ?? ""}
+                                onChange={(event) =>
+                                  handleSettingsChange({ visionIndexingApiKey: event.target.value }, true)
+                                }
+                              />
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="absolute right-0 top-0 h-8 w-8"
+                                onClick={() => setShowVisionApiKey((visible) => !visible)}
+                                aria-label={showVisionApiKey ? "hide vision API key" : "show vision API key"}
+                              >
+                                {showVisionApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                              </Button>
+                            </div>
+                          </label>
+                        </div>
+                      )}
+
+                      {visionIndexingMode === "cloud" && (
+                        <label className="block space-y-1">
+                          <span className="text-xs font-medium text-foreground">Daily limit</span>
+                          <Select
+                            value={String(settings.visionIndexingMaxCloudJobsPerDay ?? 100)}
+                            onValueChange={(value) =>
+                              handleSettingsChange(
+                                { visionIndexingMaxCloudJobsPerDay: Number(value) },
+                                true,
+                              )
+                            }
+                          >
+                            <SelectTrigger className="h-8 w-[220px] text-xs"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="25">25 screenshots / day</SelectItem>
+                              <SelectItem value="100">100 screenshots / day (recommended)</SelectItem>
+                              <SelectItem value="250">250 screenshots / day</SelectItem>
+                              <SelectItem value="500">500 screenshots / day</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </label>
+                      )}
                     </div>
                   )}
                 </div>

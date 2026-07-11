@@ -2807,25 +2807,48 @@ disableVision: boolean;
 disableScreenshots?: boolean;
 /**
  * Optional visual-language-model indexing for captured screenshots.
- * Values: `"off"` (default), `"local"`, or `"cloud"`.
+ *
+ * Values: `"off"` (default), `"local"`, or `"cloud"`. The engine
+ * validates the endpoint for the selected mode before the background
+ * reconciler starts. Local mode only accepts loopback endpoints.
  */
 visionIndexingMode?: string;
 /**
- * `"augment"` searches accessibility/OCR plus the separate visual index;
- * `"replace"` searches visual descriptions while retaining native text.
+ * How VLM observations join the screen-text index.
+ *
+ * `"augment"` searches accessibility/OCR and the separate visual index.
+ * `"replace"` searches the visual description for indexed frames. Native
+ * text is retained unchanged in both modes.
  */
 visionIndexingContextMode?: string;
-/** OpenAI-compatible chat-completions base URL for the selected VLM. */
+/**
+ * OpenAI-compatible chat-completions base URL for the VLM.
+ * Local examples: Ollama or vLLM on `http://127.0.0.1:<port>/v1`.
+ */
 visionIndexingEndpoint?: string | null;
-/** API key for the selected VLM endpoint. */
+/**
+ * API key for a cloud or authenticated local OpenAI-compatible VLM.
+ * `store.bin` is kept mode 0600 and can be encrypted by the desktop app.
+ */
 visionIndexingApiKey?: string | null;
-/** VLM model identifier. */
+/**
+ * VLM model identifier sent to the configured endpoint.
+ */
 visionIndexingModel?: string | null;
-/** Minimum milliseconds between background VLM jobs for one monitor. */
+/**
+ * Minimum interval between VLM jobs for one monitor. The background
+ * reconciler coalesces newer ready frames to this bounded-cost cadence.
+ */
 visionIndexingIntervalMs?: number;
-/** Explicit acknowledgement before cloud mode uploads redaction-processed screenshots. */
+/**
+ * Explicit acknowledgement required before cloud mode sends an image
+ * processed by the configured redaction policy to a remote endpoint.
+ */
 visionIndexingCloudConsent?: boolean;
-/** Maximum outbound cloud VLM requests per UTC day; local mode ignores it. */
+/**
+ * Durable per-day cost guard for remote VLM indexing. Local mode ignores
+ * this; cloud mode stops after this many outbound VLM requests.
+ */
 visionIndexingMaxCloudJobsPerDay?: number;
 /**
  * Disable the timeline / rewind feature. When true, the engine skips

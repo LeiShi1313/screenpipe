@@ -9,7 +9,7 @@
 //!
 //! ## Design
 //!
-//! Detection comes from two sources that funnel through a single emission
+//! Detection comes from three sources that funnel through a single emission
 //! path (so events are deduped and dedup'd state is shared):
 //!
 //! 1. **Polling** (this task). Every 5s checks `check_permissions()` and
@@ -20,14 +20,16 @@
 //!    calls [`report_state`] when `SCStream` errors with `PermissionDenied`.
 //!    Fires within ~100ms of a revoke in System Settings.
 //!
-//!    Audio has no equivalent: CoreAudio/cpal don't surface permission
-//!    revocation as a specific error — the stream just goes silent.
-//!    `AVCaptureDevice.authorizationStatusForMediaType` (used by the
-//!    polling path) IS up to date (unlike `CGPreflightScreenCaptureAccess`),
-//!    so the 5s poll is the right detection path for mic.
+//! 3. **Desktop hints**. Tauri calls [`reconcile_now`] when the app regains
+//!    focus after System Settings, and the native AV permission callback feeds
+//!    its result to [`report_state`]. These are latency hints only; they do not
+//!    own transition state or recovery policy.
 //!
-//! Both paths call [`report_state`] which holds a single [`STATE`] mutex
+//! All paths call [`report_state`] which holds a single [`STATE`] mutex
 //! and emits only if the new value differs from the last-known value.
+//! CoreAudio/cpal does not surface microphone revocation as a specific error —
+//! the stream can remain registered but silent — so `screenpipe-audio` consumes
+//! the typed restoration event and cycles only eligible input streams.
 //!
 //! ## Wake grace period
 //!
@@ -40,8 +42,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
-use screenpipe_core::permissions::{check_permissions, PermissionStatus};
-use screenpipe_events::{send_event, PermissionEvent, PermissionKind};
+use screenpipe_core::permissions::{
+    check_accessibility, check_microphone, check_permissions, check_screen_recording_tauri,
+    PermissionStatus, PermissionsCheck,
+};
+use screenpipe_events::{send_event, PermissionEvent, PermissionKind, PermissionState};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
@@ -56,24 +61,43 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// period used by the old health-based detector.
 const WAKE_GRACE: Duration = Duration::from_secs(10);
 
-/// Minimum time between consecutive emissions for the *same* permission.
-/// Prevents modal flashing if the user rapidly toggles a permission in
-/// System Settings. Restorations bypass this cooldown so the user isn't
-/// stuck in the recovery modal when they re-grant quickly.
-const EMIT_COOLDOWN: Duration = Duration::from_secs(5);
+/// Permission probes differ by host. In particular, the CLI's fallback screen
+/// capture probe is a false positive inside release Tauri on macOS 15+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeContext {
+    Engine,
+    Tauri,
+}
 
 struct LastKnown {
     granted: bool,
-    last_lost_at: Option<Instant>,
 }
 
 impl LastKnown {
     const fn new(granted: bool) -> Self {
-        Self {
-            granted,
-            last_lost_at: None,
-        }
+        Self { granted }
     }
+
+    fn observe(&mut self, now_granted: bool) -> Observation {
+        if self.granted == now_granted {
+            return Observation::Unchanged;
+        }
+
+        self.granted = now_granted;
+
+        Observation::Transition(if now_granted {
+            PermissionState::Restored
+        } else {
+            PermissionState::Lost
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    Unchanged,
+    WakeGrace,
+    Transition(PermissionState),
 }
 
 struct State {
@@ -86,37 +110,70 @@ struct State {
     keychain: LastKnown,
     wake_grace_until: Option<Instant>,
     started: bool,
+    probe_context: ProbeContext,
 }
 
-static STATE: Lazy<Mutex<State>> = Lazy::new(|| {
-    Mutex::new(State {
-        // Initialize all as "granted" — first poll will emit `lost` for any
-        // that aren't actually granted. That's desirable on startup only
-        // AFTER onboarding (app subscriber gates this); otherwise benign
-        // because the event bus is in-process and subscribers can filter.
-        screen: LastKnown::new(true),
-        mic: LastKnown::new(true),
-        accessibility: LastKnown::new(true),
-        keychain: LastKnown::new(true),
-        wake_grace_until: None,
-        started: false,
-    })
-});
+impl State {
+    const fn all_granted() -> Self {
+        Self {
+            screen: LastKnown::new(true),
+            mic: LastKnown::new(true),
+            accessibility: LastKnown::new(true),
+            keychain: LastKnown::new(true),
+            wake_grace_until: None,
+            started: false,
+            probe_context: ProbeContext::Engine,
+        }
+    }
+
+    fn observe(&mut self, kind: PermissionKind, now_granted: bool, now: Instant) -> Observation {
+        if self.wake_grace_until.is_some_and(|until| now < until) {
+            return Observation::WakeGrace;
+        }
+
+        let entry = match kind {
+            PermissionKind::ScreenRecording => &mut self.screen,
+            PermissionKind::Microphone => &mut self.mic,
+            PermissionKind::Accessibility => &mut self.accessibility,
+            PermissionKind::Keychain => &mut self.keychain,
+        };
+        entry.observe(now_granted)
+    }
+}
+
+static STATE: Lazy<Mutex<State>> = Lazy::new(|| Mutex::new(State::all_granted()));
+/// Serializes OS snapshots with eager capture/native reports. Without this, a
+/// poll can read `denied`, an AV callback can report `granted`, and the stale
+/// poll can then overwrite it with a second loss/restoration cycle.
+static TRANSITION_GATE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Start the monitor. Idempotent — calling twice returns early; the first
 /// call wins. Returns the join handle of the polling task (first call) or
 /// `None` on subsequent calls.
 pub fn start() -> Option<JoinHandle<()>> {
+    start_with_context(ProbeContext::Engine)
+}
+
+/// Start the monitor for the embedded desktop app. Uses Tauri's safe screen
+/// recording probe instead of the CLI capture fallback, which can report a
+/// false grant inside release Tauri on macOS 15+.
+pub fn start_tauri() -> Option<JoinHandle<()>> {
+    start_with_context(ProbeContext::Tauri)
+}
+
+fn start_with_context(probe_context: ProbeContext) -> Option<JoinHandle<()>> {
+    let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if state.started {
             return None;
         }
         state.started = true;
+        state.probe_context = probe_context;
         // Seed last-known with current state so the first poll tick doesn't
         // emit spurious events for permissions that were already denied at
         // process start.
-        let perms = check_permissions();
+        let perms = check_permissions_for(probe_context);
         state.screen = LastKnown::new(perms.screen_recording.is_granted());
         state.mic = LastKnown::new(perms.microphone.is_granted());
         state.accessibility = LastKnown::new(perms.accessibility.is_granted());
@@ -129,6 +186,7 @@ pub fn start() -> Option<JoinHandle<()>> {
             mic = state.mic.granted,
             accessibility = state.accessibility.granted,
             keychain = state.keychain.granted,
+            ?probe_context,
             "permission monitor started"
         );
     }
@@ -143,46 +201,23 @@ pub fn start() -> Option<JoinHandle<()>> {
 /// Skipped silently during the wake grace period to avoid spurious
 /// lost→restored flashes after sleep/wake.
 pub fn report_state(kind: PermissionKind, now_granted: bool, reason: Option<&str>) {
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    report_state_inner(kind, now_granted, reason);
+}
 
-    // Suppress emissions during wake grace period. A real transition will
-    // be picked up by the next poll once the grace expires.
-    if let Some(until) = state.wake_grace_until {
-        if Instant::now() < until {
+fn report_state_inner(kind: PermissionKind, now_granted: bool, reason: Option<&str>) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let observation = state.observe(kind, now_granted, Instant::now());
+    match observation {
+        Observation::Unchanged => return,
+        Observation::WakeGrace => {
             debug!(
                 ?kind,
                 now_granted, "permission change suppressed (wake grace)"
             );
             return;
         }
-    }
-
-    let entry = match kind {
-        PermissionKind::ScreenRecording => &mut state.screen,
-        PermissionKind::Microphone => &mut state.mic,
-        PermissionKind::Accessibility => &mut state.accessibility,
-        PermissionKind::Keychain => &mut state.keychain,
-    };
-
-    // Dedup: no transition, no emission.
-    if entry.granted == now_granted {
-        return;
-    }
-
-    // Cooldown applies only to back-to-back "lost" events (prevents flapping).
-    // Restorations always emit so the user exits the recovery modal promptly.
-    if !now_granted {
-        if let Some(t) = entry.last_lost_at {
-            if t.elapsed() < EMIT_COOLDOWN {
-                debug!(?kind, "permission loss suppressed (cooldown)");
-                return;
-            }
-        }
-    }
-
-    entry.granted = now_granted;
-    if !now_granted {
-        entry.last_lost_at = Some(Instant::now());
+        Observation::Transition(_) => {}
     }
 
     // Drop the lock before emitting so event subscribers that take other
@@ -200,13 +235,78 @@ pub fn report_state(kind: PermissionKind, now_granted: bool, reason: Option<&str
         );
         PermissionEvent::lost(kind, reason.map(str::to_owned))
     };
+
+    request_audio_recovery(evt.kind, evt.state);
     let _ = send_event(evt.event_name(), evt);
+}
+
+fn request_audio_recovery(kind: PermissionKind, state: PermissionState) {
+    if kind == PermissionKind::Microphone && state == PermissionState::Restored {
+        // Recovery policy remains in screenpipe-audio. This zero-allocation
+        // latch avoids adding a receiver to the high-volume global event bus
+        // just to observe this rare transition.
+        screenpipe_audio::input_permission_recovery::request();
+    }
+}
+
+/// Re-check all permissions immediately and feed the result through the same
+/// deduplicating transition state as the poller. The desktop shell calls this
+/// when it regains focus after System Settings, avoiding a second Tauri-owned
+/// permission state machine while keeping the normal five-second poll as the
+/// fallback.
+///
+/// Calls before [`start`] are ignored: `start` must first seed the baseline so
+/// an already-granted launch cannot be mistaken for a new grant.
+pub fn reconcile_now(reason: &str) {
+    let _transition_guard = match TRANSITION_GATE.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            debug!(
+                reason,
+                "permission reconcile coalesced with in-flight observation"
+            );
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+
+    let probe_context = {
+        let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.started {
+            debug!(reason, "permission reconcile skipped before monitor start");
+            return;
+        }
+        state.probe_context
+    };
+
+    let perms = check_permissions_for(probe_context);
+    report_state_inner(
+        PermissionKind::ScreenRecording,
+        granted(perms.screen_recording),
+        Some(reason),
+    );
+    report_state_inner(
+        PermissionKind::Microphone,
+        granted(perms.microphone),
+        Some(reason),
+    );
+    report_state_inner(
+        PermissionKind::Accessibility,
+        granted(perms.accessibility),
+        Some(reason),
+    );
+    report_state_inner(
+        PermissionKind::Keychain,
+        keychain_accessible(),
+        Some(reason),
+    );
 }
 
 /// Notify the monitor that the system just woke from sleep. Suppresses
 /// emissions for [`WAKE_GRACE`] to avoid spurious events while TCC
 /// re-registers.
 pub fn notify_wake() {
+    let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     state.wake_grace_until = Some(Instant::now() + WAKE_GRACE);
     debug!(
@@ -232,32 +332,23 @@ async fn run() {
 
     loop {
         ticker.tick().await;
-        let perms = check_permissions();
-        report_state(
-            PermissionKind::ScreenRecording,
-            granted(perms.screen_recording),
-            Some("poll"),
-        );
-        report_state(
-            PermissionKind::Microphone,
-            granted(perms.microphone),
-            Some("poll"),
-        );
-        report_state(
-            PermissionKind::Accessibility,
-            granted(perms.accessibility),
-            Some("poll"),
-        );
-        report_state(
-            PermissionKind::Keychain,
-            keychain_accessible(),
-            Some("poll"),
-        );
+        reconcile_now("poll");
     }
 }
 
 fn granted(status: PermissionStatus) -> bool {
     status.is_granted()
+}
+
+fn check_permissions_for(context: ProbeContext) -> PermissionsCheck {
+    match context {
+        ProbeContext::Engine => check_permissions(),
+        ProbeContext::Tauri => PermissionsCheck {
+            screen_recording: check_screen_recording_tauri(),
+            microphone: check_microphone(),
+            accessibility: check_accessibility(),
+        },
+    }
 }
 
 /// Read-only probe of the OS keychain. Returns `true` if the encryption key
@@ -287,5 +378,115 @@ fn keychain_accessible() -> bool {
         KeyResult::Unavailable => true,
         // AccessDenied = had access, now don't. This is the only real loss.
         KeyResult::AccessDenied => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mic_state(granted: bool) -> State {
+        let mut state = State::all_granted();
+        state.mic = LastKnown::new(granted);
+        state
+    }
+
+    #[test]
+    fn denied_to_granted_emits_one_restoration() {
+        let now = Instant::now();
+        let mut state = mic_state(false);
+
+        assert_eq!(
+            state.observe(PermissionKind::Microphone, true, now),
+            Observation::Transition(PermissionState::Restored)
+        );
+        assert_eq!(
+            state.observe(PermissionKind::Microphone, true, now),
+            Observation::Unchanged,
+            "repeated focus observations must not create duplicate restores"
+        );
+    }
+
+    #[test]
+    fn already_granted_baseline_is_not_a_restoration() {
+        let mut state = mic_state(true);
+
+        assert_eq!(
+            state.observe(PermissionKind::Microphone, true, Instant::now()),
+            Observation::Unchanged
+        );
+    }
+
+    #[test]
+    fn rapid_real_transitions_are_preserved_in_order() {
+        let now = Instant::now();
+        let mut state = mic_state(true);
+        assert_eq!(
+            state.observe(PermissionKind::Microphone, false, now),
+            Observation::Transition(PermissionState::Lost)
+        );
+
+        assert_eq!(
+            state.observe(
+                PermissionKind::Microphone,
+                true,
+                now + Duration::from_millis(1),
+            ),
+            Observation::Transition(PermissionState::Restored)
+        );
+        assert_eq!(
+            state.observe(
+                PermissionKind::Microphone,
+                false,
+                now + Duration::from_millis(2),
+            ),
+            Observation::Transition(PermissionState::Lost)
+        );
+        assert_eq!(
+            state.observe(
+                PermissionKind::Microphone,
+                true,
+                now + Duration::from_millis(3),
+            ),
+            Observation::Transition(PermissionState::Restored),
+            "each real loss must re-arm the next restoration"
+        );
+    }
+
+    #[test]
+    fn wake_grace_suppresses_without_consuming_transition() {
+        let now = Instant::now();
+        let mut state = mic_state(false);
+        state.wake_grace_until = Some(now + WAKE_GRACE);
+
+        assert_eq!(
+            state.observe(PermissionKind::Microphone, true, now),
+            Observation::WakeGrace
+        );
+        assert!(
+            !state.mic.granted,
+            "suppressed observations must not mutate the baseline"
+        );
+        assert_eq!(
+            state.observe(
+                PermissionKind::Microphone,
+                true,
+                now + WAKE_GRACE + Duration::from_millis(1),
+            ),
+            Observation::Transition(PermissionState::Restored)
+        );
+    }
+
+    #[test]
+    fn only_microphone_restoration_requests_audio_recovery() {
+        let _ = screenpipe_audio::input_permission_recovery::take();
+
+        request_audio_recovery(PermissionKind::ScreenRecording, PermissionState::Restored);
+        request_audio_recovery(PermissionKind::Microphone, PermissionState::Lost);
+        assert!(!screenpipe_audio::input_permission_recovery::take());
+
+        request_audio_recovery(PermissionKind::Microphone, PermissionState::Restored);
+        assert!(screenpipe_audio::input_permission_recovery::take());
+        assert!(!screenpipe_audio::input_permission_recovery::take());
     }
 }

@@ -5,9 +5,7 @@
 use crate::tray::QUIT_REQUESTED;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-#[allow(unused_imports)] // used on macOS
-use std::sync::atomic::Ordering;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -63,8 +61,7 @@ pub fn open_permission_settings(permission: OSPermission) {
 
 #[tauri::command]
 #[specta::specta]
-#[allow(unused_variables)] // permission used on macOS
-pub async fn request_permission(app: tauri::AppHandle, permission: OSPermission) {
+pub async fn request_permission(_app: tauri::AppHandle, permission: OSPermission) {
     #[cfg(target_os = "macos")]
     {
         use nokhwa_bindings_macos::AVMediaType;
@@ -92,7 +89,7 @@ pub async fn request_permission(app: tauri::AppHandle, permission: OSPermission)
                     }
                     AVAuthorizationStatus::NotDetermined => {
                         // First time — show the system prompt
-                        request_av_permission(app.clone(), AVMediaType::Audio);
+                        request_av_permission(AVMediaType::Audio);
                     }
                     _ => {
                         open_permission_settings(OSPermission::Microphone);
@@ -126,24 +123,22 @@ pub async fn request_permission(app: tauri::AppHandle, permission: OSPermission)
 }
 
 #[cfg(target_os = "macos")]
-fn request_av_permission(app: tauri::AppHandle, media_type: nokhwa_bindings_macos::AVMediaType) {
+fn request_av_permission(media_type: nokhwa_bindings_macos::AVMediaType) {
     use nokhwa_bindings_macos::AVMediaType;
 
     let is_audio = media_type == AVMediaType::Audio;
-    let app_for_callback = app.clone();
+    let runtime = tokio::runtime::Handle::current();
     crate::window::with_autorelease_pool(|| {
         use objc::{runtime::*, *};
         use tauri_nspanel::block::ConcreteBlock;
 
         let callback = move |granted: BOOL| {
-            if is_audio && granted != NO {
-                info!(
-                    "Microphone permission granted via AV callback — restarting capture for audio reinit"
-                );
-                let app = app_for_callback.clone();
-                tauri::async_runtime::spawn(async move {
-                    restart_capture_on_mic_grant(app).await;
-                });
+            if is_audio {
+                // Keep Apple's native callback queue free of event-bus and
+                // Tokio work. Feed the engine tracker on the runtime captured
+                // by the Tauri command that initiated this request.
+                let granted = granted != NO;
+                crate::permission_lifecycle::report_microphone_authorization(&runtime, granted);
             }
         };
         let cls = class!(AVCaptureDevice);
@@ -153,133 +148,6 @@ fn request_av_permission(app: tauri::AppHandle, media_type: nokhwa_bindings_maco
             let _: () = msg_send![cls, requestAccessForMediaType:media_type.into_ns_str() completionHandler:objc_fn_pass];
         };
     });
-}
-
-/// Guards concurrent/duplicate `restart_capture_on_mic_grant` invocations —
-/// both the window-focus handler in main.rs and the direct AVCaptureDevice
-/// grant callback in `request_av_permission` above can trigger it. Always
-/// reset on drop (success, early-return, or a give-up) so a *later* trigger
-/// (e.g. the user refocusing the window) can retry. A latch that is set once
-/// and never reset would permanently disable mic-grant recovery for the rest
-/// of the process the first time an attempt didn't land (found during the
-/// Intel-Mac CI smoke-test investigation, screenpipe#4978).
-#[cfg(target_os = "macos")]
-static MIC_GRANT_RESTART_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(target_os = "macos")]
-struct ResetGuard<'a>(&'a std::sync::atomic::AtomicBool);
-#[cfg(target_os = "macos")]
-impl Drop for ResetGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
-/// How long to wait for the backend to finish booting before giving up on
-/// this mic-grant attempt. Matches `updates.rs::AUTO_UPDATE_GATE_TIMEOUT` —
-/// production boot is well under a minute even on cold installs; 5 minutes
-/// covers slow first-time model downloads and large DB migrations.
-#[cfg(target_os = "macos")]
-const BOOT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Stop and restart capture so `capture_session::start` re-queries TCC and
-/// repopulates audio devices. Matches the settings-toggle path.
-///
-/// When the user grants the mic permission immediately on first launch, the
-/// AVCaptureDevice completion callback (or the window-focus handler) can fire
-/// before the backend `ServerCore` has been constructed. Rather than guess a
-/// fixed retry budget against the "Server not running" error string — which
-/// raced a slow-but-succeeding boot (DB migration, first-launch model
-/// download) and gave up before `ServerCore` was even constructed — wait on
-/// the boot-phase state machine that `spawn_screenpipe`'s race-prevention
-/// path and the auto-update restart gate already use for this exact class of
-/// race (found during the Intel-Mac CI smoke-test investigation, screenpipe#4978).
-#[cfg(target_os = "macos")]
-pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
-    use tauri::Manager;
-
-    if MIC_GRANT_RESTART_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        debug!("start_capture after mic grant: already in flight, skipping duplicate trigger");
-        return;
-    }
-    let _guard = ResetGuard(&MIC_GRANT_RESTART_IN_FLIGHT);
-
-    let need_stop = {
-        let state = app.state::<crate::recording::RecordingState>();
-        let is_running = state.capture.lock().await.is_some();
-        is_running
-    };
-    if need_stop {
-        let state = app.state::<crate::recording::RecordingState>();
-        if let Err(e) = crate::recording::stop_capture(state, app.clone()).await {
-            warn!("stop_capture before mic-grant audio reinit: {}", e);
-        }
-    }
-
-    match crate::health::wait_for_boot_ready(BOOT_WAIT_TIMEOUT).await {
-        crate::health::BootReadiness::Errored => {
-            error!(
-                "start_capture after mic grant: boot phase errored ({}) — capture cannot start \
-                 until the app is restarted",
-                crate::health::get_boot_phase_snapshot()
-                    .error
-                    .unwrap_or_default()
-            );
-            return;
-        }
-        crate::health::BootReadiness::Pending => {
-            error!(
-                "start_capture after mic grant: boot still not ready after {}s (phase={}) — \
-                 giving up this attempt; a later focus event will retry",
-                BOOT_WAIT_TIMEOUT.as_secs(),
-                crate::health::get_boot_phase_snapshot().phase
-            );
-            return;
-        }
-        crate::health::BootReadiness::Ready => {}
-    }
-
-    // Boot is confirmed ready — RecordingState.server is assigned a handful
-    // of sync instructions after `set_boot_phase("ready", ...)` in
-    // server_core.rs, with no intervening `.await`. A short retry buffer
-    // rides out that razor-thin window rather than guessing at boot duration.
-    const MAX_ATTEMPTS: u32 = 5;
-    const BACKOFF_MS: u64 = 200;
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let state = app.state::<crate::recording::RecordingState>();
-        match crate::recording::start_capture(state, app.clone()).await {
-            Ok(()) => {
-                if attempt > 1 {
-                    info!(
-                        "start_capture after mic grant: succeeded on attempt {}/{}",
-                        attempt, MAX_ATTEMPTS
-                    );
-                }
-                return;
-            }
-            Err(e) => {
-                let transient = e.contains("Server not running")
-                    || e.contains("Server not responding");
-                if !transient {
-                    warn!("start_capture after mic grant: {}", e);
-                    return;
-                }
-                last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS)).await;
-            }
-        }
-    }
-    error!(
-        "start_capture after mic grant: gave up after {} attempts post-boot-ready ({}ms): {}",
-        MAX_ATTEMPTS,
-        MAX_ATTEMPTS as u64 * BACKOFF_MS,
-        last_err.unwrap_or_else(|| "unknown error".to_string())
-    );
 }
 
 // Accessibility permission APIs using ApplicationServices framework
@@ -1235,57 +1103,7 @@ pub fn request_arc_automation_permission(_app: tauri::AppHandle) -> bool {
 // NOTE: Runtime permission monitoring is now handled by
 // `screenpipe-engine::permission_monitor` which emits `permission_lost` /
 // `permission_restored` events on the shared event bus. The Tauri app
-// subscribes via `crate::engine_events::permission` over /ws/events. This module
-// keeps the synchronous TCC/AV check helpers used by the onboarding UI
-// and the preflight startup check.
-
-#[cfg(all(test, target_os = "macos"))]
-mod mic_grant_restart_tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    // Regression for the mic-grant-restart guard: previously it was a
-    // fire-once-per-process AtomicBool (`MIC_FOCUS_CAPTURE_RESTART` in
-    // main.rs) that was set true and never reset, so if the first attempt
-    // didn't land (e.g. the boot-wait timed out), no later window-focus
-    // event could ever retry for the rest of the process's life (found during
-    // the Intel-Mac CI smoke-test investigation, screenpipe#4978).
-    #[test]
-    fn guard_resets_after_scope_so_a_later_call_can_retry() {
-        let flag = AtomicBool::new(false);
-
-        assert!(
-            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok(),
-            "first entry should acquire the guard"
-        );
-        {
-            let _guard = ResetGuard(&flag);
-            assert!(flag.load(Ordering::SeqCst));
-        } // guard drops here — must release the flag
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "guard must reset the flag on drop so a later trigger (e.g. the \
-             user refocusing the window) can retry"
-        );
-
-        // A later trigger can now acquire the guard again.
-        assert!(flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok());
-    }
-
-    #[test]
-    fn concurrent_entry_is_rejected_while_first_is_in_flight() {
-        let flag = AtomicBool::new(false);
-        flag.store(true, Ordering::SeqCst);
-        let _guard = ResetGuard(&flag);
-
-        // A second caller (e.g. the direct AVCaptureDevice grant callback
-        // firing at the same time as a window-focus event) must be rejected
-        // while the first is still in flight.
-        assert!(flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err());
-    }
-}
+// subscribes via `crate::engine_events::permission` over /ws/events, while
+// `screenpipe-audio` consumes microphone restorations for input-only recovery.
+// This module keeps only the synchronous OS request/check helpers used by the
+// onboarding UI and preflight checks.

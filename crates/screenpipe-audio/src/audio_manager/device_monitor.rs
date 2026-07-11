@@ -218,6 +218,35 @@ fn is_permanent_device_start_error(err: &anyhow::Error) -> bool {
         || msg.contains("no display audio device found")
 }
 
+/// Input streams eligible for a permission-restoration cycle. This is
+/// intentionally narrower than sleep/wake invalidation: microphone grants
+/// must not rebuild output capture, transcription handlers, vision, or any
+/// device the user explicitly paused (or a meeting piggyback suspended).
+fn input_permission_recovery_targets(
+    enabled: &HashSet<String>,
+    user_disabled: &HashSet<String>,
+    suspended: &HashSet<String>,
+) -> Vec<AudioDevice> {
+    let mut targets: Vec<_> = enabled
+        .iter()
+        .filter(|name| !user_disabled.contains(*name) && !suspended.contains(*name))
+        .filter_map(|name| parse_audio_device(name).ok())
+        .filter(|device| device.device_type == DeviceType::Input)
+        .collect();
+    targets.sort_by_key(ToString::to_string);
+    targets
+}
+
+fn session_input_permission_recovery_targets(session: &HashSet<String>) -> Vec<AudioDevice> {
+    let mut targets: Vec<_> = session
+        .iter()
+        .filter_map(|name| parse_audio_device(name).ok())
+        .filter(|device| device.device_type == DeviceType::Input)
+        .collect();
+    targets.sort_by_key(ToString::to_string);
+    targets
+}
+
 fn should_log_recovery_attempt(attempts: u32) -> bool {
     attempts <= 3 || attempts.is_multiple_of(30)
 }
@@ -546,6 +575,9 @@ pub async fn start_device_monitor(
     *DEVICE_MONITOR.lock().await = Some(tokio::spawn(async move {
         let mut disconnected_devices: HashSet<String> = HashSet::new();
         let mut default_tracker = SystemDefaultTracker::new();
+        // A request that predates this monitor is stale: start-up enumerates
+        // current devices and the initial sync below owns any needed recovery.
+        let _ = crate::input_permission_recovery::take();
 
         // Track devices that repeatedly fail to start so we don't spam errors
         // every 2 seconds. After a failure, back off for increasing durations.
@@ -605,6 +637,39 @@ pub async fn start_device_monitor(
 
         loop {
             if audio_manager.status().await == AudioManagerStatus::Running {
+                if crate::input_permission_recovery::take() {
+                    input_recovery_backoff.reset();
+
+                    let enabled = audio_manager.enabled_devices().await;
+                    let user_disabled = audio_manager.user_disabled_devices().await;
+                    let suspended = audio_manager.suspended_devices();
+                    let targets =
+                        input_permission_recovery_targets(&enabled, &user_disabled, &suspended);
+                    let session_targets =
+                        session_input_permission_recovery_targets(&audio_manager.session_devices());
+
+                    info!(
+                        configured_targets = targets.len(),
+                        session_targets = session_targets.len(),
+                        "[DEVICE_RECOVERY] microphone permission restored; reconciling input streams"
+                    );
+                    for device in targets {
+                        // CoreAudio can leave the pre-grant stream registered
+                        // but silent. Cycle only the input stream and keep the
+                        // configured device in `enabled_devices`; the existing
+                        // reconnect path below owns start retries/backoff.
+                        let _ = audio_manager.stop_device_recording(&device).await;
+                        disconnected_devices.insert(device.to_string());
+                    }
+                    for device in session_targets {
+                        // Meeting piggyback streams are not configured devices;
+                        // remove them through their own lifecycle API. MicFollow
+                        // observes the missing session stream and reopens it at
+                        // its single, backoff-controlled recovery point.
+                        let _ = audio_manager.stop_session_device(&device).await;
+                    }
+                }
+
                 // Check if sleep/wake or display reconfiguration requested
                 // audio stream invalidation. Force-cycle all running devices
                 // to recover from silent CoreAudio stream failures.
@@ -2034,6 +2099,54 @@ mod tests {
         /// Default for builders that don't exercise the fail-over-to-any-available
         /// path (most fallback tests only care about the system-default target).
         static ref EMPTY_AVAILABLE_INPUTS: HashSet<String> = HashSet::new();
+    }
+
+    #[test]
+    fn permission_recovery_cycles_only_unpaused_input_streams() {
+        let enabled = set(&[
+            "Built-in Microphone (input)",
+            "USB Microphone (input)",
+            "Meeting Microphone (input)",
+            "System Audio (output)",
+        ]);
+        let user_disabled = set(&["USB Microphone (input)"]);
+        let suspended = set(&["Meeting Microphone (input)"]);
+
+        let targets = input_permission_recovery_targets(&enabled, &user_disabled, &suspended)
+            .into_iter()
+            .map(|device| device.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["Built-in Microphone (input)"]);
+    }
+
+    #[test]
+    fn permission_recovery_cycles_session_mics_but_not_session_output() {
+        let session = set(&["Meeting Microphone (input)", "Meeting Tap (output)"]);
+
+        let targets = session_input_permission_recovery_targets(&session)
+            .into_iter()
+            .map(|device| device.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["Meeting Microphone (input)"]);
+    }
+
+    #[test]
+    fn default_input_appearing_after_permission_grant_is_a_change_once() {
+        let mut tracker = SystemDefaultTracker::new();
+        assert_eq!(tracker.check_input_changed_from_current(None), None);
+
+        let microphone = "Built-in Microphone (input)".to_string();
+        assert_eq!(
+            tracker.check_input_changed_from_current(Some(microphone.clone())),
+            Some(microphone.clone())
+        );
+        assert_eq!(
+            tracker.check_input_changed_from_current(Some(microphone)),
+            None,
+            "the same restored default must not retrigger every monitor pass"
+        );
     }
 
     #[test]

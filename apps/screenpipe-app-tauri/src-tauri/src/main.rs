@@ -13,7 +13,7 @@ use analytics::AnalyticsManager;
 use serde_json::json;
 use std::env;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
@@ -74,6 +74,7 @@ mod owned_browser_transport;
 mod engine_events;
 mod monitor_events;
 mod owned_browser_cookies;
+mod permission_lifecycle;
 mod permissions;
 mod pi;
 mod pi_command_queue;
@@ -145,33 +146,6 @@ mod skills;
 mod specta_bindings;
 mod vault;
 mod viewer;
-
-#[cfg(target_os = "macos")]
-/// Tracks the observed permission transition so repeated focus events cannot
-/// restart capture while the audio status cache is still empty.
-struct MicFocusRecoveryTracker {
-    permission_was_granted: AtomicBool,
-}
-
-#[cfg(target_os = "macos")]
-impl MicFocusRecoveryTracker {
-    const fn new() -> Self {
-        Self {
-            permission_was_granted: AtomicBool::new(false),
-        }
-    }
-
-    fn should_restart_capture(&self, permission_granted: bool, audio_devices_empty: bool) -> bool {
-        let permission_was_granted = self
-            .permission_was_granted
-            .swap(permission_granted, Ordering::SeqCst);
-
-        permission_granted && !permission_was_granted && audio_devices_empty
-    }
-}
-
-#[cfg(target_os = "macos")]
-static MIC_FOCUS_RECOVERY: MicFocusRecoveryTracker = MicFocusRecoveryTracker::new();
 
 use health::start_health_check;
 use log_files::{get_log_files, get_screenpipe_data_dir};
@@ -688,21 +662,7 @@ async fn main() {
         .on_window_event(|window, event| match event {
             #[cfg(target_os = "macos")]
             tauri::WindowEvent::Focused(true) => {
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let permission_granted =
-                        permissions::check_microphone_permission().permitted();
-                    let audio_devices_empty = health::get_audio_device_status().is_empty();
-                    if !MIC_FOCUS_RECOVERY
-                        .should_restart_capture(permission_granted, audio_devices_empty)
-                    {
-                        return;
-                    }
-                    info!(
-                        "Microphone permission became available with no audio devices (focus return) — restarting capture once for audio reinit"
-                    );
-                    permissions::restart_capture_on_mic_grant(app).await;
-                });
+                crate::permission_lifecycle::reconcile_on_focus();
             }
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.set_always_on_top(false);
@@ -840,6 +800,12 @@ async fn main() {
                 app.deep_link().register_all()?;
             }
             let app_handle = app.handle();
+
+            // Schedule the engine-owned permission state before creating
+            // windows or starting ServerCore. A first-launch grant can happen
+            // while DB/audio boot is still slow; it must remain a real
+            // denied→granted transition independent of HTTP readiness.
+            crate::permission_lifecycle::start_monitor();
 
             // Create macOS app menu with Settings
             #[cfg(target_os = "macos")]
@@ -1743,10 +1709,10 @@ async fn main() {
                 }
             });
 
-            // Subscribe to permission events emitted by the engine over /ws/events.
-            // Replaces the old TCC-preflight polling loop and the health-based
-            // degraded heuristic — detection now happens in `screenpipe-engine`
-            // (the actual capture module), not by polling from the app.
+            // Forward engine events (including permission UI notifications)
+            // over /ws/events once the embedded server is ready. The producer's
+            // transition state already runs independently of this bridge, and
+            // audio recovery uses its lightweight in-process latch.
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 // Wait for the server core to be ready so we have port + API key.
@@ -2045,45 +2011,6 @@ async fn main() {
             error!("panic in run event handler: {:?}", e);
         }
     });
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod mic_focus_recovery_tests {
-    use super::MicFocusRecoveryTracker;
-
-    #[test]
-    fn repeated_focus_with_empty_audio_status_restarts_only_once() {
-        let tracker = MicFocusRecoveryTracker::new();
-
-        assert!(tracker.should_restart_capture(true, true));
-        assert!(!tracker.should_restart_capture(true, true));
-        assert!(!tracker.should_restart_capture(true, true));
-    }
-
-    #[test]
-    fn temporary_empty_audio_status_does_not_look_like_a_new_permission_grant() {
-        let tracker = MicFocusRecoveryTracker::new();
-
-        assert!(!tracker.should_restart_capture(true, false));
-        assert!(!tracker.should_restart_capture(true, true));
-    }
-
-    #[test]
-    fn permission_revoke_rearms_focus_recovery() {
-        let tracker = MicFocusRecoveryTracker::new();
-
-        assert!(tracker.should_restart_capture(true, true));
-        assert!(!tracker.should_restart_capture(false, true));
-        assert!(tracker.should_restart_capture(true, true));
-    }
-
-    #[test]
-    fn missing_permission_never_restarts_capture() {
-        let tracker = MicFocusRecoveryTracker::new();
-
-        assert!(!tracker.should_restart_capture(false, true));
-        assert!(!tracker.should_restart_capture(false, false));
-    }
 }
 
 #[cfg(test)]

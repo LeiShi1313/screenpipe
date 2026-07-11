@@ -233,30 +233,40 @@ function SettingsContent() {
 
   const navGroups = [
     {
-      label: "Core",
+      label: "Capture & AI",
       items: [
         { id: "recording" as const, label: "Recording", icon: <Video className="h-4 w-4" /> },
-        { id: "privacy" as const, label: "Privacy", icon: <Shield className="h-4 w-4" /> },
         { id: "ai" as const, label: "AI", icon: <Brain className="h-4 w-4" /> },
-        { id: "storage" as const, label: "Storage", icon: <HardDrive className="h-4 w-4" /> },
       ].filter((s) => !isSectionHidden(s.id)),
     },
     {
-      label: "Personalize",
+      label: "Privacy & security",
       items: [
+        { id: "privacy" as const, label: "Privacy", icon: <Shield className="h-4 w-4" /> },
+      ].filter((s) => !isSectionHidden(s.id)),
+    },
+    {
+      label: "Data",
+      items: [
+        { id: "storage" as const, label: "Storage", icon: <HardDrive className="h-4 w-4" /> },
+        { id: "usage" as const, label: "Usage", icon: <BarChart3 className="h-4 w-4" /> },
+      ].filter((s) => !isSectionHidden(s.id)),
+    },
+    {
+      label: "App",
+      items: [
+        // Keep the legacy `general` section id so existing deep links and
+        // automated tests continue to work. The user-facing label is the
+        // familiar Apple-style category name.
+        { id: "general" as const, label: "General", icon: <SettingsIcon className="h-4 w-4" /> },
         { id: "display" as const, label: "Appearance", icon: <Layout className="h-4 w-4" /> },
         { id: "notifications" as const, label: "Notifications", icon: <Bell className="h-4 w-4" /> },
         { id: "shortcuts" as const, label: "Shortcuts", icon: <Keyboard className="h-4 w-4" /> },
       ].filter((s) => !isSectionHidden(s.id)),
     },
     {
-      label: "Advanced",
+      label: "Audio",
       items: [
-        // Keep the legacy `general` section id so existing deep links and
-        // automated tests continue to work. The user-facing label makes its
-        // role clear: this is the escape hatch for technical preferences.
-        { id: "general" as const, label: "Advanced", icon: <SettingsIcon className="h-4 w-4" /> },
-        { id: "usage" as const, label: "Usage", icon: <BarChart3 className="h-4 w-4" /> },
         { id: "speakers" as const, label: "Speakers", icon: <Mic className="h-4 w-4" /> },
       ].filter((s) => !isSectionHidden(s.id)),
     },
@@ -302,7 +312,7 @@ function SettingsContent() {
   useEffect(() => {
     posthog.capture("settings_section_viewed", { section });
     if (section === "general") {
-      posthog.capture("settings_advanced_opened");
+      posthog.capture("settings_general_opened");
     }
   }, [section]);
 

@@ -916,6 +916,38 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Terminally mark redaction-succeeded rows that the candidate query can
+    /// never select because of an *immutable* structural mismatch: a missing,
+    /// empty, or non-jpg snapshot path, or a `name` that diverges from
+    /// `snapshot_path` (the legacy mp4-chunk capture path). Without this they
+    /// sit in `idx_frames_vision_index_pending` forever, so every 10s poll
+    /// re-scans a growing dead tail. Deliberately does NOT retire policy-id
+    /// mismatches — those can recover when the user reverts a backend/label
+    /// change, so retiring them would lose recoverable frames.
+    ///
+    /// Returns the number of rows retired.
+    pub async fn retire_structurally_ineligible_vision_frames(&self) -> Result<u64, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let affected = sqlx::query(
+            r#"UPDATE frames
+                  SET vision_index_considered_at = strftime('%s', 'now')
+                WHERE image_redaction_succeeded_at IS NOT NULL
+                  AND vision_index_considered_at IS NULL
+                  AND (
+                        snapshot_path IS NULL
+                     OR snapshot_path = ''
+                     OR (LOWER(snapshot_path) NOT LIKE '%.jpg'
+                         AND LOWER(snapshot_path) NOT LIKE '%.jpeg')
+                     OR COALESCE(name, '') != snapshot_path
+                  )"#,
+        )
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(affected)
+    }
+
     /// Return recent screenshot rows that are ready for visual indexing.
     ///
     /// Readiness is fail-closed: the image worker must have successfully
@@ -1978,6 +2010,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(orphaned_fts_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn retire_sweep_stamps_only_structurally_dead_rows() {
+        let db = mem_db().await;
+        sqlx::query("INSERT INTO video_chunks (id, file_path) VALUES (1, '/tmp/x.mp4')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // id 1: eligible jpg (name == snapshot_path) — must NOT be retired.
+        // id 2: legacy mp4-chunk path (name != snapshot_path) — retire.
+        // id 3: non-jpg snapshot — retire.
+        // id 4: null snapshot_path — retire.
+        // id 5: succeeded but a jpg that just isn't considered yet — keep.
+        let rows = [
+            (1, "'/f1.jpg'", "'/f1.jpg'"),
+            (2, "'/chunk.mp4'", "'/f2.jpg'"),
+            (3, "'/f3.png'", "'/f3.png'"),
+            (4, "NULL", "NULL"),
+            (5, "'/f5.jpg'", "'/f5.jpg'"),
+        ];
+        for (id, name, snap) in rows {
+            sqlx::query(&format!(
+                "INSERT INTO frames (id, video_chunk_id, offset_index, timestamp, name, \
+                    snapshot_path, device_name, image_redacted_at, image_redaction_succeeded_at) \
+                 VALUES ({id}, 1, 0, '2026-07-10T00:00:0{id}Z', {name}, {snap}, 'd', 1, 1)"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let retired = db
+            .retire_structurally_ineligible_vision_frames()
+            .await
+            .unwrap();
+        assert_eq!(retired, 3, "ids 2,3,4 are structurally dead");
+
+        let considered: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM frames WHERE vision_index_considered_at IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(considered, vec![2, 3, 4]);
+
+        // Idempotent: the good rows stay eligible on a second sweep.
+        assert_eq!(
+            db.retire_structurally_ineligible_vision_frames()
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -197,9 +197,15 @@ impl VisionIndexingConfig {
 
     pub fn chat_completions_url(&self) -> Result<Url> {
         let mut url = Url::parse(self.endpoint.trim())?;
-        if !url.path().ends_with("/chat/completions") {
-            let path = format!("{}/chat/completions", url.path().trim_end_matches('/'));
-            url.set_path(&path);
+        // Trim a trailing slash before the suffix check. Without this a pasted
+        // ".../chat/completions/" fails the ends_with test and gets a second
+        // "/chat/completions" appended, 404ing every request — and in cloud
+        // mode each 404 still consumes a reserved daily-budget unit.
+        let trimmed = url.path().trim_end_matches('/').to_string();
+        if trimmed.ends_with("/chat/completions") {
+            url.set_path(&trimmed);
+        } else {
+            url.set_path(&format!("{trimmed}/chat/completions"));
         }
         Ok(url)
     }
@@ -210,7 +216,14 @@ impl VisionIndexingConfig {
 /// indexer are both constructed from this value, so a row sanitized under an
 /// older policy cannot cross the current VLM boundary.
 pub fn image_redaction_policy_id(backend: &str, labels: &[String]) -> String {
-    let backend = backend.trim().to_ascii_lowercase();
+    // Canonicalize backend aliases before embedding them in the id. The Tauri
+    // worker spawn treats "cloud"/"enclave" as tinfoil aliases; without this
+    // an alias would produce a different policy id than the worker stamps, so
+    // the indexer's exact-match candidate filter would match zero rows forever.
+    let backend = match backend.trim().to_ascii_lowercase().as_str() {
+        "tinfoil" | "cloud" | "enclave" => "tinfoil".to_string(),
+        other => other.to_string(),
+    };
     if backend == "tinfoil" {
         image_redaction_policy_id_for_model(
             &backend,
@@ -302,6 +315,17 @@ async fn reconcile_ready_images(
         .await
     {
         warn!("could not apply visual-index context mode: {error}");
+    }
+    // Retire rows that can never be indexed (missing/non-jpg snapshot, legacy
+    // mp4-chunk path) so they stop clogging the pending index and the 10s
+    // rescan. One-shot at startup — new dead rows are rare and self-retire via
+    // the normal per-frame considered stamp.
+    match db.retire_structurally_ineligible_vision_frames().await {
+        Ok(retired) if retired > 0 => {
+            debug!(retired, "retired structurally-ineligible vision frames");
+        }
+        Err(error) => warn!("could not retire ineligible vision frames: {error}"),
+        _ => {}
     }
     let mut last_attempted = seed_last_indexed_by_monitor(&db).await;
 
@@ -533,7 +557,13 @@ pub async fn analyze_jpeg(
     let request = json!({
         "model": config.model,
         "temperature": 0,
-        "max_tokens": 160,
+        // 512, not 160: a reasoning model spends the completion budget on its
+        // hidden chain-of-thought and returns empty content at finish_reason
+        // "length", so a 160-token cap makes every frame fail — and in cloud
+        // mode each failure has already burned a daily-budget unit. The prompt
+        // caps output at ~120 words and normalize_description trims to 2000
+        // chars, so the extra ceiling costs little on non-reasoning models.
+        "max_tokens": 512,
         "messages": [
             {
                 "role": "system",
@@ -566,15 +596,50 @@ pub async fn analyze_jpeg(
 
     let parsed: ChatCompletion =
         serde_json::from_slice(&body).context("parsing OpenAI-compatible vision response")?;
-    parsed
+    let choice = parsed
         .choices
         .first()
-        .and_then(|choice| extract_message_content(&choice.message.content))
-        .ok_or_else(|| anyhow!("vision endpoint returned no assistant content"))
+        .ok_or_else(|| anyhow!("vision endpoint returned no assistant content"))?;
+    match extract_message_content(&choice.message.content) {
+        Some(text) => Ok(text),
+        // Give the reasoning-model failure a diagnosable error instead of the
+        // generic empty one: this is the difference between "raise max_tokens /
+        // pick a non-reasoning model" and the prompt-sanctioned sensitive-image
+        // skip, which otherwise log identically.
+        None if choice.finish_reason.as_deref() == Some("length") => Err(anyhow!(
+            "vision model hit the token limit before emitting a caption \
+             (reasoning model?); raise max_tokens or choose a non-reasoning model"
+        )),
+        None => Err(anyhow!("vision endpoint returned no assistant content")),
+    }
 }
 
+/// Strip a leading `<think>...</think>` block (R1-style models inline their
+/// chain-of-thought in `content`) and wrapping code fences before trimming, so
+/// the stored caption is the description and not the model's reasoning.
 fn normalize_description(value: &str) -> String {
-    value.trim().chars().take(MAX_DESCRIPTION_CHARS).collect()
+    let mut text = value.trim();
+    if let Some(rest) = text.strip_prefix("<think>") {
+        if let Some(end) = rest.find("</think>") {
+            text = rest[end + "</think>".len()..].trim();
+        }
+    }
+    let text = strip_wrapping_code_fence(text);
+    text.trim().chars().take(MAX_DESCRIPTION_CHARS).collect()
+}
+
+/// Drop a wrapping markdown code fence (```json, ```JSON, ``` …) that small
+/// local VLMs emit despite the prose prompt.
+fn strip_wrapping_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let body = match after_open.split_once('\n') {
+        Some((tag, rest)) if tag.trim().chars().all(|c| c.is_ascii_alphanumeric()) => rest,
+        _ => after_open,
+    };
+    body.trim().strip_suffix("```").unwrap_or(body).trim()
 }
 
 #[derive(Debug, Deserialize)]
@@ -585,10 +650,16 @@ struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
+    // Some reasoning providers omit `content` entirely (only `reasoning_content`),
+    // which would otherwise fail the whole-body parse; default to null so the
+    // empty-content path produces the clean diagnosable error instead.
+    #[serde(default)]
     content: Value,
 }
 
@@ -827,6 +898,55 @@ mod tests {
             extract_message_content(&json!([{"type":"text","text":"  "}])),
             None
         );
+    }
+
+    #[test]
+    fn chat_completions_url_appends_once_even_with_trailing_slash() {
+        let path = |endpoint: &str| {
+            config("local", endpoint, false)
+                .chat_completions_url()
+                .unwrap()
+                .path()
+                .to_string()
+        };
+        // Bare base gets the suffix.
+        assert_eq!(path("http://127.0.0.1:8000/v1"), "/v1/chat/completions");
+        // Already-complete URL, with and without a trailing slash, is unchanged
+        // (the trailing-slash case previously double-appended and 404'd).
+        assert_eq!(
+            path("http://127.0.0.1:8000/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(
+            path("http://127.0.0.1:8000/v1/chat/completions/"),
+            "/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_description_strips_think_block_and_fences() {
+        assert_eq!(
+            normalize_description("<think>plan the caption</think>\nA code editor is open"),
+            "A code editor is open"
+        );
+        assert_eq!(
+            normalize_description("```json\n{\"app\":\"Figma\"}\n```"),
+            "{\"app\":\"Figma\"}"
+        );
+        assert_eq!(
+            normalize_description("```JSON\nplain caption\n```"),
+            "plain caption"
+        );
+        assert_eq!(normalize_description("  a canvas app  "), "a canvas app");
+    }
+
+    #[test]
+    fn policy_id_canonicalizes_tinfoil_aliases() {
+        let labels = vec!["email".to_string()];
+        let tinfoil = image_redaction_policy_id("tinfoil", &labels);
+        assert_eq!(image_redaction_policy_id("cloud", &labels), tinfoil);
+        assert_eq!(image_redaction_policy_id("enclave", &labels), tinfoil);
+        assert_ne!(image_redaction_policy_id("local", &labels), tinfoil);
     }
 
     #[test]

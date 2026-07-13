@@ -1133,6 +1133,9 @@ pub trait PipeStore: Send + Sync {
         &self,
         limit_per_pipe: i32,
     ) -> Result<HashMap<String, Vec<PipeExecution>>>;
+
+    /// Get the exact persisted execution count for every pipe.
+    async fn get_all_execution_counts(&self) -> Result<HashMap<String, i64>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2640,6 +2643,15 @@ impl PipeManager {
             store.get_executions(name, limit, before_id).await
         } else {
             Ok(vec![])
+        }
+    }
+
+    /// Get exact persisted execution counts for all pipes in one grouped query.
+    pub async fn get_all_execution_counts(&self) -> HashMap<String, i64> {
+        if let Some(ref store) = self.store {
+            store.get_all_execution_counts().await.unwrap_or_default()
+        } else {
+            HashMap::new()
         }
     }
 

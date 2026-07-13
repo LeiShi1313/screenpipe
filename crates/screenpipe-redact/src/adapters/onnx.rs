@@ -87,11 +87,7 @@ impl OnnxConfig {
     /// `~/.screenpipe/models/v49_distilled6l/` by convention.
     pub fn default_model_dir() -> PathBuf {
         dirs::home_dir()
-            .map(|h| {
-                h.join(".screenpipe")
-                    .join("models")
-                    .join("v49_distilled6l")
-            })
+            .map(|h| h.join(".screenpipe").join("models").join("v49_distilled6l"))
             .unwrap_or_else(|| PathBuf::from(".screenpipe/models/v49_distilled6l"))
     }
 

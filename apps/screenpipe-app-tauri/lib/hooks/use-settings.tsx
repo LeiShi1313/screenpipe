@@ -303,6 +303,12 @@ export type Settings = SettingsStore & {
 	 *  duration. Requires the meeting detector. Falls back to standard capture automatically if
 	 *  unavailable. */
 	experimentalMeetingPiggyback?: boolean;
+	/** Opening a Bluetooth mic always degrades the paired device's output audio (A2DP -> SCO,
+	 *  a macOS/OS limitation — issue #3750). Off by default: Bluetooth mics are only recorded
+	 *  during a detected meeting. Turn on to always record Bluetooth mics regardless of
+	 *  meeting state. No effect on wired/built-in mics, Bluetooth output devices, or a dedicated
+	 *  Bluetooth mic with no output side of its own — nothing to protect there. */
+	alwaysRecordBluetoothMic?: boolean;
 	/** Experimental: request Windows WASAPI microphone AEC when supported. */
 	windowsInputAecEnabled?: boolean;
 	/** Experimental: request Apple VoiceProcessingIO AEC on the default macOS microphone. */
@@ -682,6 +688,7 @@ let DEFAULT_SETTINGS: Settings = {
 			keepComputerAwake: false,
 			experimentalCoreaudioSystemAudio: false,
 			experimentalMeetingPiggyback: false,
+			alwaysRecordBluetoothMic: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,
 			screenpipeAecEnabled: false,

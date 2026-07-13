@@ -4,17 +4,13 @@
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import PickPipe from "./pick-pipe";
+import PickPipe, { extractFirstValuePreview } from "./pick-pipe";
 
 const mocks = vi.hoisted(() => ({
   completeOnboarding: vi.fn().mockResolvedValue(undefined),
-  scheduleFirstRunNotification: vi.fn(),
+  scheduleFirstRunNotification: vi.fn().mockResolvedValue(undefined),
   localFetch: vi.fn(),
   capture: vi.fn(),
-  oauthStatus: vi.fn().mockResolvedValue({
-    status: "ok",
-    data: { connected: false },
-  }),
 }));
 
 vi.mock("@/lib/hooks/use-onboarding", () => ({
@@ -31,149 +27,283 @@ vi.mock("@/lib/api", () => ({
   localFetch: mocks.localFetch,
 }));
 
-vi.mock("@/lib/utils/tauri", () => ({
-  commands: {
-    oauthStatus: mocks.oauthStatus,
-  },
-}));
-
 vi.mock("posthog-js", () => ({
   default: {
     capture: mocks.capture,
   },
 }));
 
-function mockSuccessfulPipeEnable(...slugs: string[]) {
-  const enabled = new Set(slugs);
+function response(body: unknown, ok = true, status = 200) {
+  return Promise.resolve({
+    ok,
+    status,
+    json: async () => body,
+  });
+}
+
+function assistantOutput(text: string): string {
+  return JSON.stringify({
+    type: "agent_end",
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text }],
+      },
+    ],
+  });
+}
+
+function mockFirstValueFlow({
+  preview = "You spent most of this session planning the launch.",
+  executionStatus = "completed",
+  runBody = { success: true },
+}: {
+  preview?: string;
+  executionStatus?: string;
+  runBody?: Record<string, unknown>;
+} = {}) {
+  let runStarted = false;
 
   mocks.localFetch.mockImplementation((url: string) => {
-    if (url === "/health") {
-      return Promise.resolve({ ok: true });
-    }
+    if (url === "/health") return response({ status: "ok" });
 
-    const enableMatch = url.match(/^\/pipes\/([^/]+)\/enable$/);
-    if (enableMatch && enabled.has(enableMatch[1])) {
-      return Promise.resolve({
-        ok: true,
-        json: async () => ({}),
+    if (/^\/pipes\/[^/]+\/enable$/.test(url)) return response({});
+
+    if (url === "/pipes/digital-clone/executions?limit=20") {
+      return response({
+        data: runStarted
+          ? [
+              {
+                id: 42,
+                pipe_name: "digital-clone",
+                status: executionStatus,
+                trigger_type: "manual",
+                stdout: assistantOutput(preview),
+                error_type: null,
+                error_message: null,
+                duration_ms: executionStatus === "completed" ? 1250 : null,
+              },
+            ]
+          : [],
       });
     }
 
-    const runMatch = url.match(/^\/pipes\/([^/]+)\/run$/);
-    if (runMatch && enabled.has(runMatch[1])) {
-      return Promise.resolve({ ok: true });
+    if (url === "/pipes/digital-clone/run") {
+      runStarted = true;
+      return response(runBody);
     }
 
     return Promise.reject(new Error(`unexpected url: ${url}`));
   });
 }
 
+describe("extractFirstValuePreview", () => {
+  it("uses the final assistant message instead of tool or user output", () => {
+    const output = [
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "user", content: "private user prompt" },
+      }),
+      assistantOutput("A concise, useful first result."),
+    ].join("\n");
+
+    expect(extractFirstValuePreview(output)).toBe(
+      "A concise, useful first result."
+    );
+  });
+});
+
 describe("PickPipe", () => {
   beforeEach(() => {
-    vi.useFakeTimers();
+    vi.useRealTimers();
     vi.clearAllMocks();
-    mocks.oauthStatus.mockResolvedValue({
-      status: "ok",
-      data: { connected: false },
-    });
     mocks.completeOnboarding.mockResolvedValue(undefined);
+    mocks.scheduleFirstRunNotification.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it("does not install or enable a pipe when the user skips onboarding", async () => {
+  it("skips without calling any pipe API", async () => {
+    vi.useFakeTimers();
+    render(<PickPipe />);
+
     await act(async () => {
-      render(<PickPipe />);
+      vi.advanceTimersByTime(5000);
+    });
+    fireEvent.click(screen.getByRole("button", { name: /skip/i }));
+
+    await act(async () => {
+      await Promise.resolve();
     });
 
-    fireEvent.click(
-      screen.getByRole("checkbox", {
-        name: /your ai twin: writes and acts like you/i,
-      }),
+    expect(mocks.localFetch).not.toHaveBeenCalled();
+    expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
+    expect(mocks.scheduleFirstRunNotification).toHaveBeenCalledTimes(1);
+    expect(mocks.capture).toHaveBeenCalledWith(
+      "onboarding_completed",
+      expect.objectContaining({ completion_reason: "skipped" })
     );
-    fireEvent.click(
-      screen.getByRole("checkbox", {
-        name: /people memory: remember everyone you meet/i,
-      }),
-    );
+  });
+
+  it("enables selected pipes sequentially, runs only one, and waits for a useful result", async () => {
+    const privatePreview =
+      "You spent most of this session planning the YC launch and reviewing customer feedback.";
+    mockFirstValueFlow({ preview: privatePreview });
+    render(<PickPipe />);
+
+    fireEvent.click(screen.getByRole("button", { name: /turn them on/i }));
 
     expect(
-      screen.getByRole("button", { name: /turn them on/i }),
-    ).toBeDisabled();
+      await screen.findByRole("heading", { name: /your first result is ready/i })
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("first-value-preview")).toHaveTextContent(
+      privatePreview
+    );
+    expect(mocks.completeOnboarding).not.toHaveBeenCalled();
 
-    await act(async () => {
-      vi.advanceTimersByTime(5000);
-    });
+    const enableUrls = mocks.localFetch.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.endsWith("/enable"));
+    expect(enableUrls).toEqual([
+      "/pipes/digital-clone/enable",
+      "/pipes/personal-crm/enable",
+    ]);
+    expect(
+      mocks.localFetch.mock.calls.filter(
+        ([url]) => url === "/pipes/digital-clone/run"
+      )
+    ).toHaveLength(1);
+    expect(
+      mocks.localFetch.mock.calls.some(
+        ([url]) => url === "/pipes/personal-crm/run"
+      )
+    ).toBe(false);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /skip/i }));
-    });
-
-    expect(mocks.localFetch).not.toHaveBeenCalled();
-    expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
-    expect(mocks.scheduleFirstRunNotification).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not install a pipe on skip even when defaults are still selected", async () => {
-    await act(async () => {
-      render(<PickPipe />);
-    });
-
-    await act(async () => {
-      vi.advanceTimersByTime(5000);
-    });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /skip/i }));
-    });
-
-    expect(mocks.localFetch).not.toHaveBeenCalled();
-    expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
-    expect(mocks.scheduleFirstRunNotification).toHaveBeenCalledTimes(1);
-  });
-
-  it("enables only the pipes the user keeps selected", async () => {
-    vi.useRealTimers();
-    mockSuccessfulPipeEnable("personal-crm");
-
-    await act(async () => {
-      render(<PickPipe />);
-    });
-
-    fireEvent.click(
-      screen.getByRole("checkbox", {
-        name: /your ai twin: writes and acts like you/i,
-      }),
+    // The preview itself must never be copied into analytics properties.
+    expect(JSON.stringify(mocks.capture.mock.calls)).not.toContain(
+      privatePreview
     );
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /turn it on/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /continue to screenpipe/i })
+    );
+    await waitFor(() => {
+      expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
     });
+    expect(mocks.capture).toHaveBeenCalledWith(
+      "onboarding_completed",
+      expect.objectContaining({ completion_reason: "first_value" })
+    );
+  });
+
+  it("treats an HTTP 200 error body as a failed run", async () => {
+    mockFirstValueFlow({ runBody: { error: "provider unavailable" } });
+    render(<PickPipe />);
+
+    fireEvent.click(screen.getByRole("button", { name: /turn them on/i }));
+
+    expect(
+      await screen.findByText(/couldn't create a first result yet/i)
+    ).toBeInTheDocument();
+    expect(mocks.completeOnboarding).not.toHaveBeenCalled();
+    expect(mocks.capture).toHaveBeenCalledWith(
+      "onboarding_first_value_failed",
+      expect.objectContaining({ failure_stage: "running" })
+    );
+    expect(JSON.stringify(mocks.capture.mock.calls)).not.toContain(
+      "provider unavailable"
+    );
+  });
+
+  it("does not offer background continuation before the run is accepted", async () => {
+    let resolveBaseline!: (value: Awaited<ReturnType<typeof response>>) => void;
+    const baselineResponse = new Promise<
+      Awaited<ReturnType<typeof response>>
+    >((resolve) => {
+      resolveBaseline = resolve;
+    });
+    let executionReads = 0;
+
+    mocks.localFetch.mockImplementation((url: string) => {
+      if (url === "/health") return response({ status: "ok" });
+      if (/^\/pipes\/[^/]+\/enable$/.test(url)) return response({});
+      if (url === "/pipes/digital-clone/executions?limit=20") {
+        executionReads += 1;
+        if (executionReads === 1) return baselineResponse;
+        return response({
+          data: [
+            {
+              id: 42,
+              pipe_name: "digital-clone",
+              status: "completed",
+              trigger_type: "manual",
+              stdout: assistantOutput("A useful first result."),
+              error_type: null,
+              error_message: null,
+              duration_ms: 1250,
+            },
+          ],
+        });
+      }
+      if (url === "/pipes/digital-clone/run") {
+        return response({ success: true });
+      }
+      return Promise.reject(new Error(`unexpected url: ${url}`));
+    });
+
+    render(<PickPipe />);
+    fireEvent.click(screen.getByRole("button", { name: /turn them on/i }));
+
+    await waitFor(() => expect(executionReads).toBe(1));
+    expect(screen.queryByTestId("continue-while-running")).not.toBeInTheDocument();
+    expect(mocks.completeOnboarding).not.toHaveBeenCalled();
+    expect(mocks.capture).not.toHaveBeenCalledWith(
+      "onboarding_completed",
+      expect.anything()
+    );
+
+    resolveBaseline(await response({ data: [] }));
+    expect(
+      await screen.findByRole("heading", { name: /your first result is ready/i })
+    ).toBeInTheDocument();
+  });
+
+  it("lets the user continue while a slow first run stays in the background", async () => {
+    mockFirstValueFlow({ executionStatus: "running" });
+    render(<PickPipe />);
+
+    fireEvent.click(screen.getByRole("button", { name: /turn them on/i }));
+
+    const continueButton = await screen.findByTestId("continue-while-running");
+    fireEvent.click(continueButton);
 
     await waitFor(() => {
-      expect(mocks.localFetch).toHaveBeenCalledWith("/health");
-      expect(mocks.localFetch).toHaveBeenCalledWith(
-        "/pipes/personal-crm/enable",
-        expect.objectContaining({
-          method: "POST",
-        }),
-      );
-      expect(mocks.localFetch).toHaveBeenCalledWith(
-        "/pipes/personal-crm/run",
-        expect.objectContaining({
-          method: "POST",
-        }),
-      );
+      expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
+    });
+    expect(mocks.capture).toHaveBeenCalledWith(
+      "onboarding_completed",
+      expect.objectContaining({ completion_reason: "background_pending" })
+    );
+  });
+
+  it("treats unmount as cancellation rather than a failed first result", async () => {
+    mockFirstValueFlow({ executionStatus: "running" });
+    const { unmount } = render(<PickPipe />);
+
+    fireEvent.click(screen.getByRole("button", { name: /turn them on/i }));
+    await screen.findByTestId("continue-while-running");
+
+    unmount();
+    await act(async () => {
+      await Promise.resolve();
     });
 
-    expect(
-      mocks.localFetch.mock.calls.some(([url]) =>
-        String(url).includes("/pipes/digital-clone/"),
-      ),
-    ).toBe(false);
-    expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
-    expect(mocks.scheduleFirstRunNotification).toHaveBeenCalledTimes(1);
+    expect(mocks.capture).not.toHaveBeenCalledWith(
+      "onboarding_first_value_failed",
+      expect.anything()
+    );
+    expect(mocks.completeOnboarding).not.toHaveBeenCalled();
   });
 });

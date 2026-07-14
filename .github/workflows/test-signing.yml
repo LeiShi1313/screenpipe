@@ -26,18 +26,25 @@ jobs:
           $unsignedSource = "$env:RUNNER_TEMP\unsigned-source.exe"
           Copy-Item "C:\Windows\System32\notepad.exe" $unsignedSource
 
-          $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction Stop |
-            Where-Object { $_.DirectoryName -match "\\x64$" } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $signtool) {
-            throw 'signtool.exe was not found'
+          # Clear the PE certificate-table directory so the test starts with a
+          # genuinely unsigned executable instead of trusting Notepad's existing
+          # Microsoft signature. The certificate bytes can remain as ignored
+          # overlay data; a zero directory entry makes the PE unsigned.
+          $bytes = [System.IO.File]::ReadAllBytes($unsignedSource)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $optionalHeaderOffset = $peOffset + 24
+          $optionalHeaderMagic = [BitConverter]::ToUInt16($bytes, $optionalHeaderOffset)
+          $dataDirectoryOffset = if ($optionalHeaderMagic -eq 0x10b) {
+            $optionalHeaderOffset + 96
+          } elseif ($optionalHeaderMagic -eq 0x20b) {
+            $optionalHeaderOffset + 112
+          } else {
+            throw "Unexpected PE optional-header magic: $optionalHeaderMagic"
           }
+          $certificateDirectoryOffset = $dataDirectoryOffset + (4 * 8)
+          0..7 | ForEach-Object { $bytes[$certificateDirectoryOffset + $_] = 0 }
+          [System.IO.File]::WriteAllBytes($unsignedSource, $bytes)
 
-          & $signtool.FullName remove /s $unsignedSource
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not remove the source Authenticode signature (exit $LASTEXITCODE)"
-          }
           if ((Get-AuthenticodeSignature $unsignedSource).Status -ne 'NotSigned') {
             throw 'Test source is still signed'
           }

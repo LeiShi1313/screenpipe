@@ -4,7 +4,13 @@
 
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useMemo,
+} from "react";
 import { useEventListener } from "@/lib/hooks/use-event-listener";
 // PipeMonitorView merged into PipesSection as device dropdown
 import { apiCache } from "@/lib/cache";
@@ -67,7 +73,10 @@ import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
 import { NotificationBell } from "@/components/notification-bell";
-import { ChatPrefillData } from "@/lib/chat-utils";
+import {
+  type ChatPrefillData,
+  pendingChatPrefillForCurrentAuth,
+} from "@/lib/chat-utils";
 import { useFeedbackStore } from "@/lib/stores/feedback-store";
 // --- Types ---
 
@@ -141,17 +150,52 @@ const SORT_OPTIONS = [
   { value: "newest", label: "Newest" },
 ];
 
-const PERMISSION_LABELS: { key: string; label: string; icon: React.ReactNode }[] = [
-  { key: "ocr", label: "Screen text (OCR)", icon: <Eye className="h-3.5 w-3.5" /> },
-  { key: "audio", label: "Audio transcripts", icon: <Mic className="h-3.5 w-3.5" /> },
-  { key: "input", label: "Keyboard input", icon: <Keyboard className="h-3.5 w-3.5" /> },
-  { key: "raw_sql", label: "Raw SQL", icon: <Database className="h-3.5 w-3.5" /> },
-  { key: "frames", label: "Screenshots", icon: <Image className="h-3.5 w-3.5" /> },
-  { key: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
-  { key: "accessibility", label: "Accessibility", icon: <Accessibility className="h-3.5 w-3.5" /> },
+const PERMISSION_LABELS: {
+  key: string;
+  label: string;
+  icon: React.ReactNode;
+}[] = [
+  {
+    key: "ocr",
+    label: "Screen text (OCR)",
+    icon: <Eye className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "audio",
+    label: "Audio transcripts",
+    icon: <Mic className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "input",
+    label: "Keyboard input",
+    icon: <Keyboard className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "raw_sql",
+    label: "Raw SQL",
+    icon: <Database className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "frames",
+    label: "Screenshots",
+    icon: <Image className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "connections",
+    label: "Connections",
+    icon: <Plug className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "accessibility",
+    label: "Accessibility",
+    icon: <Accessibility className="h-3.5 w-3.5" />,
+  },
 ];
 
-function getPermissionStatus(perms: PipePermissions | undefined, key: string): "allowed" | "denied" | "unset" {
+function getPermissionStatus(
+  perms: PipePermissions | undefined,
+  key: string,
+): "allowed" | "denied" | "unset" {
   if (!perms) return "unset";
   const allowKey = `allow_${key}` as keyof PipePermissions;
   const denyKey = `deny_${key}` as keyof PipePermissions;
@@ -172,7 +216,10 @@ function isUnrestricted(perms?: PipePermissions): boolean {
   );
 }
 
-export function getPipeInstallRisk(pipe: { permissions?: PipePermissions; author_verified?: boolean | null }): "safe" | "warning" | "high" {
+export function getPipeInstallRisk(pipe: {
+  permissions?: PipePermissions;
+  author_verified?: boolean | null;
+}): "safe" | "warning" | "high" {
   const unrestricted = isUnrestricted(pipe.permissions);
   const verified = !!pipe.author_verified;
   if (unrestricted && !verified) return "high";
@@ -180,7 +227,10 @@ export function getPipeInstallRisk(pipe: { permissions?: PipePermissions; author
   return "safe";
 }
 
-function getPipeInstallDescription(pipe: { permissions?: PipePermissions; author_verified?: boolean | null }): string {
+function getPipeInstallDescription(pipe: {
+  permissions?: PipePermissions;
+  author_verified?: boolean | null;
+}): string {
   const risk = getPipeInstallRisk(pipe);
   const unrestricted = isUnrestricted(pipe.permissions);
   if (risk === "high") {
@@ -220,7 +270,9 @@ function getAllowedAccessLabels(perms?: PipePermissions): string[] {
 
   return PERMISSION_LABELS.flatMap((perm) => {
     const status = getPermissionStatus(perms, perm.key);
-    return status === "allowed" ? [labelsByKey[perm.key] || perm.label.toLowerCase()] : [];
+    return status === "allowed"
+      ? [labelsByKey[perm.key] || perm.label.toLowerCase()]
+      : [];
   });
 }
 
@@ -247,8 +299,9 @@ function getReadmeFromPipeMd(raw: string): string {
   return trimmed.slice(end + 3).trim();
 }
 
-function navigateHomeAndPrefill(data: ChatPrefillData): void {
-  sessionStorage.setItem("pendingChatPrefill", JSON.stringify(data));
+async function navigateHomeAndPrefill(data: ChatPrefillData): Promise<void> {
+  const ownedData = await pendingChatPrefillForCurrentAuth(data);
+  sessionStorage.setItem("pendingChatPrefill", JSON.stringify(ownedData));
   const url = new URL(window.location.href);
   url.searchParams.set("section", "home");
   window.location.href = url.toString();
@@ -263,8 +316,6 @@ function buildPublishPipeDisplayLabel(pipeName: string): string {
   const name = pipeName.trim();
   return name ? `Publish pipe: ${name}` : "Publish pipe";
 }
-
-
 
 function formatCount(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
@@ -322,11 +373,15 @@ export function PipeStoreView() {
       .catch(() => setInstalledCount(0));
   }, []);
 
-  const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">("my-pipes");
+  const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">(
+    "my-pipes",
+  );
 
   // listen for tab switch events from empty state button
   useEventListener("switch-pipes-tab", (e) => {
-    setActiveTab((e as CustomEvent<{ tab: "discover" | "my-pipes" }>).detail.tab);
+    setActiveTab(
+      (e as CustomEvent<{ tab: "discover" | "my-pipes" }>).detail.tab,
+    );
   });
 
   // Read ?tab= from URL after mount, then strip it so it doesn't persist
@@ -337,7 +392,11 @@ export function PipeStoreView() {
     else if (tab === "my-pipes") setActiveTab("my-pipes");
     if (tab) {
       params.delete("tab");
-      window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
+      window.history.replaceState(
+        {},
+        "",
+        `${window.location.pathname}?${params}`,
+      );
     }
   }, []);
 
@@ -367,7 +426,7 @@ export function PipeStoreView() {
               "pb-3 text-sm font-medium transition-colors duration-150 border-b-2 -mb-px",
               activeTab === key
                 ? "border-foreground text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
             )}
           >
             {label}
@@ -413,7 +472,11 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       setSearchQuery(q);
       setDebouncedQuery(q);
       params.delete("q");
-      window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
+      window.history.replaceState(
+        {},
+        "",
+        `${window.location.pathname}?${params}`,
+      );
     }
   }, []);
   const [category, setCategory] = useState("All");
@@ -428,7 +491,12 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       counts.set(label, (counts.get(label) || 0) + 1);
     }
     // Sort by count descending
-    return ["All", ...Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([name]) => name)];
+    return [
+      "All",
+      ...Array.from(counts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([name]) => name),
+    ];
   }, [pipes]);
 
   // Detail view
@@ -438,7 +506,9 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
 
   // Install state
   const [installing, setInstalling] = useState<string | null>(null);
-  const [pendingInstall, setPendingInstall] = useState<StorePipe | PipeDetail | null>(null);
+  const [pendingInstall, setPendingInstall] = useState<
+    StorePipe | PipeDetail | null
+  >(null);
   const [installRiskAcknowledged, setInstallRiskAcknowledged] = useState(false);
 
   // Review state
@@ -460,7 +530,16 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
 
   // Available updates from store
-  const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
+  const [availableUpdates, setAvailableUpdates] = useState<
+    Record<
+      string,
+      {
+        latest_version: number;
+        installed_version: number;
+        locally_modified: boolean;
+      }
+    >
+  >({});
 
   // Confirm dialog before overwriting a locally-modified pipe on update.
   const [updateConfirm, setUpdateConfirm] = useState<{
@@ -496,7 +575,9 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       .then((r) => r.json())
       .then((data) => {
         const list = Array.isArray(data) ? data : data.data || data.pipes || [];
-        const names = new Set<string>(list.map((p: any) => p.config?.name || p.name));
+        const names = new Set<string>(
+          list.map((p: any) => p.config?.name || p.name),
+        );
         apiCache.set(cacheKey, names, 30_000);
         setInstalledNames(names);
       })
@@ -506,12 +587,23 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   // Check for pipe updates
   useEffect(() => {
     localFetch("/pipes/store/check-updates")
-      .then((r) => r.ok ? r.json() : null)
+      .then((r) => (r.ok ? r.json() : null))
       .then((json) => {
         if (!json) return;
-        const updates: Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }> = {};
+        const updates: Record<
+          string,
+          {
+            latest_version: number;
+            installed_version: number;
+            locally_modified: boolean;
+          }
+        > = {};
         for (const u of json.data || []) {
-          updates[u.pipe_name] = { latest_version: u.latest_version, installed_version: u.installed_version, locally_modified: u.locally_modified };
+          updates[u.pipe_name] = {
+            latest_version: u.latest_version,
+            installed_version: u.installed_version,
+            locally_modified: u.locally_modified,
+          };
         }
         setAvailableUpdates(updates);
       })
@@ -550,7 +642,9 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10_000);
-      const res = await localFetch(`/pipes/store?${params}`, { signal: controller.signal });
+      const res = await localFetch(`/pipes/store?${params}`, {
+        signal: controller.signal,
+      });
       clearTimeout(timeoutId);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -639,7 +733,8 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
         body: JSON.stringify({ slug }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      if (!res.ok || data.error)
+        throw new Error(data.error || `HTTP ${res.status}`);
       posthog.capture("pipe_updated_from_store", { slug });
       // Clear just this card's update state → re-renders one card, no reload.
       setAvailableUpdates((prev) => {
@@ -690,7 +785,9 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const handleInstall = async (slug: string) => {
     setInstalling(slug);
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
       if (token) headers["Authorization"] = `Bearer ${token}`;
       const res = await localFetch("/pipes/store/install", {
         method: "POST",
@@ -698,7 +795,8 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
         body: JSON.stringify({ slug }),
       });
       const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      if (!res.ok || data.error)
+        throw new Error(data.error || `HTTP ${res.status}`);
       posthog.capture("pipe_installed_from_store", { slug });
 
       // Override the pipe's preset so it works out of the box (published
@@ -741,7 +839,9 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
             <button
               type="button"
               className="underline underline-offset-2 text-inherit opacity-80 hover:opacity-100"
-              onClick={() => openFeedback(`Pipe install failed (${slug}): ${err.message}`)}
+              onClick={() =>
+                openFeedback(`Pipe install failed (${slug}): ${err.message}`)
+              }
             >
               report issue
             </button>
@@ -759,16 +859,15 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
     if (!selectedPipe || reviewRating === 0) return;
     setSubmittingReview(true);
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      const res = await localFetch(
-        `/pipes/store/${selectedPipe.slug}/review`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ rating: reviewRating, comment: reviewComment }),
-        }
-      );
+      const res = await localFetch(`/pipes/store/${selectedPipe.slug}/review`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ rating: reviewRating, comment: reviewComment }),
+      });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `HTTP ${res.status}`);
@@ -791,14 +890,17 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const handleUnpublish = async (slug: string) => {
     setUnpublishing(true);
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
       if (token) headers["Authorization"] = `Bearer ${token}`;
       const res = await localFetch(`/pipes/store/${slug}`, {
         method: "DELETE",
         headers,
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      if (!res.ok || data.error)
+        throw new Error(data.error || `HTTP ${res.status}`);
       posthog.capture("pipe_unpublished_from_store", { slug });
       toast({ title: `"${slug}" unpublished from store` });
       setShowDetail(false);
@@ -820,13 +922,18 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const filteredPipes = useMemo(() => {
     if (category === "All") return pipes;
     return pipes.filter((p) => {
-      const cat = (p.category || "other").charAt(0).toUpperCase() + (p.category || "other").slice(1);
+      const cat =
+        (p.category || "other").charAt(0).toUpperCase() +
+        (p.category || "other").slice(1);
       return cat === category;
     });
   }, [pipes, category]);
 
   const installGateDialog = (
-    <Dialog open={!!pendingInstall} onOpenChange={(open) => !open && closeInstallGate()}>
+    <Dialog
+      open={!!pendingInstall}
+      onOpenChange={(open) => !open && closeInstallGate()}
+    >
       <DialogContent className="max-w-lg pt-8">
         <DialogTitle className="sr-only">review pipe access</DialogTitle>
 
@@ -852,20 +959,21 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
             disabled={
               !pendingInstall ||
               installing === pendingInstall.slug ||
-              (getPipeInstallRisk(pendingInstall) === "high" && !installRiskAcknowledged)
+              (getPipeInstallRisk(pendingInstall) === "high" &&
+                !installRiskAcknowledged)
             }
             onClick={confirmPendingInstall}
-            >
-              {pendingInstall && installing === pendingInstall.slug ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                  installing...
-                </>
-              ) : (
-                "install pipe"
-              )}
-            </Button>
-          </DialogFooter>
+          >
+            {pendingInstall && installing === pendingInstall.slug ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                installing...
+              </>
+            ) : (
+              "install pipe"
+            )}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
@@ -926,7 +1034,10 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
             pipes are AI automations that run on your screen data
           </p>
           <p className="text-sm text-muted-foreground mt-1">
-            they can summarize your day, track your time, build a digital memory, sync notes to obsidian, auto-update your CRM, and more. install one below to get started — click GET, then enable it in My Pipes.
+            they can summarize your day, track your time, build a digital
+            memory, sync notes to obsidian, auto-update your CRM, and more.
+            install one below to get started — click GET, then enable it in My
+            Pipes.
           </p>
         </div>
       )}
@@ -938,7 +1049,11 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
             browse, install, and review community pipes
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={() => setPublishOpen(true)}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setPublishOpen(true)}
+        >
           <Upload className="h-4 w-4 mr-1.5" />
           PUBLISH
         </Button>
@@ -980,7 +1095,7 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
                 "px-3 py-1.5 rounded-none text-xs font-medium transition-colors duration-150 whitespace-nowrap",
                 category === c
                   ? "bg-foreground text-background"
-                  : "bg-muted text-muted-foreground hover:text-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground",
               )}
             >
               {c}
@@ -1019,17 +1134,19 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {[...filteredPipes].sort((a, b) => (b.featured ? 1 : 0) - (a.featured ? 1 : 0)).map((pipe) => (
-            <PipeCard
-              key={pipe.slug}
-              pipe={pipe}
-              isInstalled={installedNames.has(pipe.slug)}
-              hasUpdate={!!availableUpdates[pipe.slug]}
-              onInstall={() => requestInstall(pipe)}
-              installing={installing === pipe.slug}
-              onClick={() => openDetail(pipe.slug)}
-            />
-          ))}
+          {[...filteredPipes]
+            .sort((a, b) => (b.featured ? 1 : 0) - (a.featured ? 1 : 0))
+            .map((pipe) => (
+              <PipeCard
+                key={pipe.slug}
+                pipe={pipe}
+                isInstalled={installedNames.has(pipe.slug)}
+                hasUpdate={!!availableUpdates[pipe.slug]}
+                onInstall={() => requestInstall(pipe)}
+                installing={installing === pipe.slug}
+                onClick={() => openDetail(pipe.slug)}
+              />
+            ))}
         </div>
       )}
 
@@ -1048,13 +1165,18 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       {installGateDialog}
 
       {/* Confirm overwrite when updating a locally-edited pipe */}
-      <Dialog open={!!updateConfirm} onOpenChange={(open) => !open && setUpdateConfirm(null)}>
+      <Dialog
+        open={!!updateConfirm}
+        onOpenChange={(open) => !open && setUpdateConfirm(null)}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>update {updateConfirm?.pipeName}?</DialogTitle>
             <DialogDescription>
               <span className="inline-flex items-center gap-2 mt-2">
-                <Badge variant="outline">v{updateConfirm?.installedVersion}</Badge>
+                <Badge variant="outline">
+                  v{updateConfirm?.installedVersion}
+                </Badge>
                 <span>→</span>
                 <Badge variant="outline">v{updateConfirm?.latestVersion}</Badge>
               </span>
@@ -1063,9 +1185,10 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
           <div className="flex items-start gap-2 p-3 rounded-none bg-muted border border-border">
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
             <p className="text-sm text-muted-foreground">
-              you have local edits to this pipe. updating overwrites your prompt changes.
-              a backup is saved as <code className="text-xs">pipe.md.bak</code>, and your
-              schedule, model, and enabled state are preserved.
+              you have local edits to this pipe. updating overwrites your prompt
+              changes. a backup is saved as{" "}
+              <code className="text-xs">pipe.md.bak</code>, and your schedule,
+              model, and enabled state are preserved.
             </p>
           </div>
           <DialogFooter className="gap-2 sm:gap-0">
@@ -1075,7 +1198,10 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
             <Button
               onClick={() => {
                 if (updateConfirm) {
-                  void handleStoreUpdate(updateConfirm.slug, updateConfirm.pipeName);
+                  void handleStoreUpdate(
+                    updateConfirm.slug,
+                    updateConfirm.pipeName,
+                  );
                   setUpdateConfirm(null);
                 }
               }}
@@ -1085,7 +1211,6 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
     </div>
   );
 }
@@ -1129,7 +1254,7 @@ function PipeCard({
           variant={isInstalled && !hasUpdate ? "outline" : "default"}
           className={cn(
             "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-            isInstalled && !hasUpdate && "pointer-events-none"
+            isInstalled && !hasUpdate && "pointer-events-none",
           )}
           disabled={installing || (isInstalled && !hasUpdate)}
           onClick={(e) => {
@@ -1153,7 +1278,9 @@ function PipeCard({
       </div>
 
       {/* Title — full width, no truncation */}
-      <h4 className="text-sm font-semibold mt-3 line-clamp-2 leading-snug">{pipe.title}</h4>
+      <h4 className="text-sm font-semibold mt-3 line-clamp-2 leading-snug">
+        {pipe.title}
+      </h4>
       <div className="flex items-center gap-1 text-xs text-muted-foreground mt-1">
         <span className="truncate">{pipe.author}</span>
         {pipe.author_verified && (
@@ -1172,7 +1299,10 @@ function PipeCard({
           {pipe.featured && (
             <Star className="h-3 w-3 fill-amber-400 text-amber-400 flex-shrink-0" />
           )}
-          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
+          <Badge
+            variant="secondary"
+            className="text-[10px] px-2 py-0.5 font-normal rounded-none"
+          >
             {pipe.category}
           </Badge>
         </div>
@@ -1213,7 +1343,11 @@ function PipeDetailPanel({
 }) {
   const { toast } = useToast();
   const unrestricted = isUnrestricted(pipe.permissions);
-  const isOwner = !!(currentUserId && pipe.author_id && currentUserId === pipe.author_id);
+  const isOwner = !!(
+    currentUserId &&
+    pipe.author_id &&
+    currentUserId === pipe.author_id
+  );
 
   const [editing, setEditing] = useState(false);
   const [editReadme, setEditReadme] = useState("");
@@ -1225,12 +1359,12 @@ function PipeDetailPanel({
     ? pipe.readme_md
     : pipe.source
       ? getReadmeFromPipeMd(pipe.source)
-      : (pipe.full_description || pipe.description);
+      : pipe.full_description || pipe.description;
 
-  const isDirty = editing && (
-    editReadme !== (readmeContent || "") ||
-    editSource !== (pipe.source || "")
-  );
+  const isDirty =
+    editing &&
+    (editReadme !== (readmeContent || "") ||
+      editSource !== (pipe.source || ""));
 
   const startEditing = () => {
     setEditReadme(readmeContent || "");
@@ -1316,7 +1450,9 @@ function PipeDetailPanel({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="text-xl font-semibold tracking-tight">{pipe.title || pipe.slug || "untitled pipe"}</h2>
+              <h2 className="text-xl font-semibold tracking-tight">
+                {pipe.title || pipe.slug || "untitled pipe"}
+              </h2>
               <div className="flex items-center gap-2 mt-1 flex-wrap">
                 {pipe.author ? (
                   <div className="flex items-center gap-1 text-sm text-muted-foreground">
@@ -1328,14 +1464,23 @@ function PipeDetailPanel({
                 ) : null}
                 {pipe.version ? (
                   <>
-                    {pipe.author && <span className="text-xs text-muted-foreground/50">·</span>}
-                    <span className="text-xs text-muted-foreground">v{pipe.version}</span>
+                    {pipe.author && (
+                      <span className="text-xs text-muted-foreground/50">
+                        ·
+                      </span>
+                    )}
+                    <span className="text-xs text-muted-foreground">
+                      v{pipe.version}
+                    </span>
                   </>
                 ) : null}
                 {pipe.category ? (
                   <>
                     <span className="text-xs text-muted-foreground/50">·</span>
-                    <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
+                    <Badge
+                      variant="secondary"
+                      className="text-[10px] px-2 py-0.5 font-normal rounded-none"
+                    >
                       {pipe.category}
                     </Badge>
                   </>
@@ -1445,7 +1590,7 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
                 variant={isInstalled && !hasUpdate ? "outline" : "default"}
                 className={cn(
                   "h-9 px-5 text-sm font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-                  isInstalled && !hasUpdate && "pointer-events-none"
+                  isInstalled && !hasUpdate && "pointer-events-none",
                 )}
                 disabled={
                   installing === pipe.slug || (isInstalled && !hasUpdate)
@@ -1479,7 +1624,8 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
       {/* README section */}
       <div className="space-y-3">
         <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-widest">
-          README {editing && <span className="text-foreground/50">(editing)</span>}
+          README{" "}
+          {editing && <span className="text-foreground/50">(editing)</span>}
         </h4>
         {editing ? (
           <div className="space-y-2">
@@ -1496,7 +1642,9 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
               >
                 preview
               </button>
-              <span className="text-[9px] text-muted-foreground/50 ml-auto">cmd+s to publish</span>
+              <span className="text-[9px] text-muted-foreground/50 ml-auto">
+                cmd+s to publish
+              </span>
             </div>
             {previewReadme ? (
               <div className="border border-border rounded-none p-6">
@@ -1505,7 +1653,12 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
                   className="prose prose-sm dark:prose-invert max-w-none prose-pre:bg-muted prose-pre:text-foreground prose-pre:rounded-md prose-pre:border prose-pre:border-border prose-pre:text-xs prose-code:bg-muted prose-code:text-foreground prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:before:content-none prose-code:after:content-none"
                   components={{
                     a: ({ href, children }) => (
-                      <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                      <a
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-primary hover:underline"
+                      >
                         {children}
                       </a>
                     ),
@@ -1546,7 +1699,9 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
                 {readmeContent}
               </MemoizedReactMarkdown>
             ) : (
-              <p className="text-sm text-muted-foreground">no description available</p>
+              <p className="text-sm text-muted-foreground">
+                no description available
+              </p>
             )}
           </div>
         )}
@@ -1609,7 +1764,8 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
             </p>
             {!pipe.author_verified && (
               <p className="text-xs text-muted-foreground leading-relaxed">
-                this publisher is not verified. use the source section below if you want to inspect the pipe before installing.
+                this publisher is not verified. use the source section below if
+                you want to inspect the pipe before installing.
               </p>
             )}
           </div>
@@ -1627,7 +1783,8 @@ if the pipe's final user-facing file lives outside the pipe's own \`./output/\` 
           ) : (
             <ChevronRight className="h-3.5 w-3.5" />
           )}
-          Source (pipe.md) {editing && <span className="text-foreground/50">(editing)</span>}
+          Source (pipe.md){" "}
+          {editing && <span className="text-foreground/50">(editing)</span>}
         </button>
         {editing ? (
           <textarea
@@ -1664,8 +1821,10 @@ function redactSecrets(text: string): { redacted: string; count: number } {
     [/AIza[a-zA-Z0-9_-]{30,}/g, "AIza***REDACTED***"],
     [/AKIA[A-Z0-9]{16,}/g, "AKIA***REDACTED***"],
     [/Bearer\s+ey[a-zA-Z0-9._-]+/g, "Bearer ***REDACTED***"],
-    [/((?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS)\s*[=:]\s*["']?)([a-zA-Z0-9_-]{8,})(["']?)/gi,
-      "$1***REDACTED***$3"],
+    [
+      /((?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS)\s*[=:]\s*["']?)([a-zA-Z0-9_-]{8,})(["']?)/gi,
+      "$1***REDACTED***$3",
+    ],
   ];
   let result = text;
   for (const [pattern, replacement] of patterns) {
@@ -1709,7 +1868,9 @@ export function PublishDialog({
       .then((r) => r.json())
       .then((data) => {
         const list = Array.isArray(data) ? data : data.data || data.pipes || [];
-        setLocalPipes(list.map((p: any) => ({ name: p.config?.name || p.name, ...p })));
+        setLocalPipes(
+          list.map((p: any) => ({ name: p.config?.name || p.name, ...p })),
+        );
       })
       .catch(() => setLocalPipes([]))
       .finally(() => setLoadingPipes(false));
@@ -1790,7 +1951,9 @@ STEP 5: PUBLISH (only after user says yes)
         const { redacted, count } = redactSecrets(sourceMd);
         if (count > 0) {
           sourceMd = redacted;
-          toast({ title: `redacted ${count} secret(s) from pipe before publishing` });
+          toast({
+            title: `redacted ${count} secret(s) from pipe before publishing`,
+          });
         }
       }
 
@@ -1858,7 +2021,8 @@ STEP 5: PUBLISH (only after user says yes)
               <div>
                 <p className="text-sm font-medium">help me publish</p>
                 <p className="text-[11px] text-muted-foreground">
-                  ai will make your pipe generic, write a README, and publish it for you
+                  ai will make your pipe generic, write a README, and publish it
+                  for you
                 </p>
               </div>
             </button>
@@ -1946,7 +2110,10 @@ STEP 5: PUBLISH (only after user says yes)
                 checked={redactEnabled}
                 onCheckedChange={(v) => setRedactEnabled(v === true)}
               />
-              <Label htmlFor="redact-secrets" className="text-xs text-muted-foreground">
+              <Label
+                htmlFor="redact-secrets"
+                className="text-xs text-muted-foreground"
+              >
                 redact API keys & secrets before publishing
               </Label>
             </div>
@@ -2076,7 +2243,9 @@ export function InstallRiskSummary({
             ) : (
               <Shield className="h-4 w-4" />
             )}
-            {unrestricted ? "Can access all your screen data" : "Requested access"}
+            {unrestricted
+              ? "Can access all your screen data"
+              : "Requested access"}
           </div>
           <p className="text-xs text-muted-foreground leading-relaxed">
             {unrestricted
@@ -2097,7 +2266,11 @@ export function InstallRiskSummary({
         {accessLabels.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {accessLabels.map((label) => (
-              <Badge key={label} variant="secondary" className="rounded-none text-[10px] lowercase">
+              <Badge
+                key={label}
+                variant="secondary"
+                className="rounded-none text-[10px] lowercase"
+              >
                 {label}
               </Badge>
             ))}

@@ -45,6 +45,12 @@ import {
 import type { ContentBlock, Message } from "@/lib/chat/types";
 import { hasCloudEntitlement } from "@/lib/app-entitlement";
 import { canUseProviderForAuxiliaryAI } from "@/lib/chat/free-tier-turn-marker";
+import {
+  isSamePiConversationAccount,
+  piConversationAuthIdentity,
+  type PiConversationAuthIdentity,
+} from "@/lib/chat/auth-conversation-boundary";
+import type { PiAuthIdentity } from "@/components/chat/standalone/hooks/pi-types";
 
 // --- Hook options ---
 
@@ -85,6 +91,12 @@ interface UseChatConversationsOpts {
   pastedImagesRef?: MutableRefObject<string[]>;
   attachedDocsRef?: MutableRefObject<any[]>;
   pendingDocsRef?: MutableRefObject<any[]>;
+  /** Invalidates FileReader/fs/extraction work owned by the outgoing chat. */
+  invalidatePendingAttachmentWork?: () => void;
+  /** Binds async conversation switches to the account that initiated them. */
+  authIdentityRef?: MutableRefObject<PiAuthIdentity>;
+  /** Synchronously invalidates panel-global async state before a chat switch. */
+  onConversationOperationStart?: () => void;
   settings: any;
   selectedPreset?: AIPreset | null;
   selectedPresetRef?: MutableRefObject<AIPreset | undefined | null>;
@@ -106,8 +118,10 @@ interface SaveConversationOptions {
 function newestUserMessageTimestamp(messages: Message[]): number | undefined {
   let latest: number | undefined;
   for (const message of messages) {
-    if (message.role !== "user" || typeof message.timestamp !== "number") continue;
-    if (latest == null || message.timestamp > latest) latest = message.timestamp;
+    if (message.role !== "user" || typeof message.timestamp !== "number")
+      continue;
+    if (latest == null || message.timestamp > latest)
+      latest = message.timestamp;
   }
   return latest;
 }
@@ -142,6 +156,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     pastedImagesRef,
     attachedDocsRef,
     pendingDocsRef,
+    invalidatePendingAttachmentWork,
+    authIdentityRef,
+    onConversationOperationStart,
     settings,
     selectedPreset,
     inlineHistoryEnabled = true,
@@ -151,19 +168,101 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       ? (opts.selectedPresetRef.current ?? null)
       : opts.selectedPreset;
   const componentUnmountedRef = useRef(false);
+  const conversationOperationGenerationRef = useRef(0);
+  const conversationOperationPendingRef = useRef(false);
+  const [conversationOperationPending, setConversationOperationPending] =
+    useState(false);
+  // Conversation reads/writes are local account-owned operations. A refreshed
+  // JWT for the same stable user must not cancel a half-committed conversation
+  // switch: loadConversation updates the foreground session ref before its disk
+  // hydration awaits complete, so cancelling only on raw token generation can
+  // leave the ref/store on B while the visible panel still says A. Keep a live
+  // stable-account boundary instead. Real logout/account changes still cancel
+  // immediately; when no user id is available the helper falls back to exact
+  // token equality and therefore remains fail-closed.
+  const conversationAccountIdentity = piConversationAuthIdentity({
+    id: settings?.user?.id,
+    token: settings?.user?.token ?? authIdentityRef?.current.token,
+  });
+  const conversationAccountIdentityRef = useRef<PiConversationAuthIdentity>(
+    conversationAccountIdentity,
+  );
+  conversationAccountIdentityRef.current = conversationAccountIdentity;
+  const beginConversationOperation = () => {
+    onConversationOperationStart?.();
+    conversationOperationPendingRef.current = true;
+    setConversationOperationPending(true);
+    return {
+      generation: ++conversationOperationGenerationRef.current,
+      accountIdentity: { ...conversationAccountIdentityRef.current },
+    };
+  };
+  const conversationOperationIsCurrent = (boundary: {
+    generation: number;
+    accountIdentity: PiConversationAuthIdentity;
+  }) =>
+    boundary.generation === conversationOperationGenerationRef.current &&
+    isSamePiConversationAccount(
+      boundary.accountIdentity,
+      conversationAccountIdentityRef.current,
+    );
+  const finishConversationOperation = (boundary: {
+    generation: number;
+    accountIdentity: PiConversationAuthIdentity;
+  }) => {
+    if (boundary.generation !== conversationOperationGenerationRef.current)
+      return;
+    conversationOperationPendingRef.current = false;
+    setConversationOperationPending(false);
+  };
+  const cancelConversationOperations = useCallback(() => {
+    conversationOperationGenerationRef.current += 1;
+    conversationOperationPendingRef.current = false;
+    setConversationOperationPending(false);
+    invalidatePendingAttachmentWork?.();
+  }, [invalidatePendingAttachmentWork]);
+  const previousConversationAccountIdentityRef = useRef(
+    conversationAccountIdentity,
+  );
+  useEffect(() => {
+    const previous = previousConversationAccountIdentityRef.current;
+    previousConversationAccountIdentityRef.current =
+      conversationAccountIdentity;
+    if (
+      !isSamePiConversationAccount(previous, conversationAccountIdentity)
+    ) {
+      cancelConversationOperations();
+    }
+  }, [
+    cancelConversationOperations,
+    conversationAccountIdentity.authenticated,
+    conversationAccountIdentity.token,
+    conversationAccountIdentity.userId,
+  ]);
 
   const [showHistory, setShowHistoryRaw] = useState(() => {
-    try { return localStorage.getItem("screenpipe:chat-history-open") === "true"; } catch { return false; }
+    try {
+      return localStorage.getItem("screenpipe:chat-history-open") === "true";
+    } catch {
+      return false;
+    }
   });
-  const setShowHistory = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
-    setShowHistoryRaw((prev) => {
-      const next = typeof v === "function" ? v(prev) : v;
-      try { localStorage.setItem("screenpipe:chat-history-open", String(next)); } catch {}
-      return next;
-    });
-  }, []);
+  const setShowHistory = useCallback(
+    (v: boolean | ((prev: boolean) => boolean)) => {
+      setShowHistoryRaw((prev) => {
+        const next = typeof v === "function" ? v(prev) : v;
+        try {
+          localStorage.setItem("screenpipe:chat-history-open", String(next));
+        } catch {}
+        return next;
+      });
+    },
+    [],
+  );
   const [historySearch, setHistorySearch] = useState("");
-  const [fileConversations, setFileConversations] = useState<ConversationMeta[]>([]);
+  const [fileConversations, setFileConversations] = useState<
+    ConversationMeta[]
+  >([]);
 
   // Track component unmount to prevent post-unmount work in async AI title callback
   useEffect(() => {
@@ -177,7 +276,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   const historyRequestRef = useRef(0);
   const lastHistoryQueryRef = useRef<string | null>(null);
   const [historyReady, setHistoryReady] = useState(false);
-  const historyRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const historyRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const loadConversationMetas = useCallback(async (query: string) => {
     const options = {
       limit: CHAT_HISTORY_INITIAL_LIMIT,
@@ -187,109 +288,139 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     return q ? searchConversations(q, options) : listConversations(options);
   }, []);
 
-  const upsertFileConversationMeta = useCallback((conversation: ChatConversation) => {
-    if (historySearch.trim()) return;
+  const upsertFileConversationMeta = useCallback(
+    (conversation: ChatConversation) => {
+      if (historySearch.trim()) return;
 
-    const msgs = Array.isArray(conversation.messages) ? conversation.messages : [];
-    const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
-    const lastUserMessageAt =
-      computedLastUserMessageAt == null
-        ? conversation.lastUserMessageAt
-        : Math.max(conversation.lastUserMessageAt ?? 0, computedLastUserMessageAt);
+      const msgs = Array.isArray(conversation.messages)
+        ? conversation.messages
+        : [];
+      const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
+      const lastUserMessageAt =
+        computedLastUserMessageAt == null
+          ? conversation.lastUserMessageAt
+          : Math.max(
+              conversation.lastUserMessageAt ?? 0,
+              computedLastUserMessageAt,
+            );
 
-    const meta: ConversationMeta = {
-      id: conversation.id,
-      title: typeof conversation.title === "string" ? conversation.title : "untitled",
-      createdAt: typeof conversation.createdAt === "number" ? conversation.createdAt : 0,
-      updatedAt: typeof conversation.updatedAt === "number" ? conversation.updatedAt : 0,
-      messageCount: msgs.length,
-      pinned: conversation.pinned === true,
-      hidden: conversation.hidden === true,
-      lastUserMessageAt,
-      lastContentAt: conversation.lastContentAt,
-      lastViewedAt: conversation.lastViewedAt,
-      kind: conversation.kind ?? "chat",
-      pipeContext: conversation.pipeContext,
-      sidebarGroup: conversation.sidebarGroup,
-      titleSource: conversation.titleSource,
-      dedupKey: conversationDedupKey(conversation) ?? undefined,
-    };
+      const meta: ConversationMeta = {
+        id: conversation.id,
+        title:
+          typeof conversation.title === "string"
+            ? conversation.title
+            : "untitled",
+        createdAt:
+          typeof conversation.createdAt === "number"
+            ? conversation.createdAt
+            : 0,
+        updatedAt:
+          typeof conversation.updatedAt === "number"
+            ? conversation.updatedAt
+            : 0,
+        messageCount: msgs.length,
+        pinned: conversation.pinned === true,
+        hidden: conversation.hidden === true,
+        lastUserMessageAt,
+        lastContentAt: conversation.lastContentAt,
+        lastViewedAt: conversation.lastViewedAt,
+        kind: conversation.kind ?? "chat",
+        pipeContext: conversation.pipeContext,
+        sidebarGroup: conversation.sidebarGroup,
+        titleSource: conversation.titleSource,
+        dedupKey: conversationDedupKey(conversation) ?? undefined,
+      };
 
-    setFileConversations((prev) => {
-      const existing = prev.find((c) => c.id === meta.id);
-      const nextMeta = existing
-        ? { ...existing, ...meta, pinned: existing.pinned || meta.pinned }
-        : meta;
-      const without = prev.filter((c) => c.id !== meta.id);
-      const next = nextMeta.hidden ? without : [nextMeta, ...without];
-      return next
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, CHAT_HISTORY_INITIAL_LIMIT);
-    });
-    lastHistoryQueryRef.current = "";
-  }, [historySearch]);
+      setFileConversations((prev) => {
+        const existing = prev.find((c) => c.id === meta.id);
+        const nextMeta = existing
+          ? { ...existing, ...meta, pinned: existing.pinned || meta.pinned }
+          : meta;
+        const without = prev.filter((c) => c.id !== meta.id);
+        const next = nextMeta.hidden ? without : [nextMeta, ...without];
+        return next
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .slice(0, CHAT_HISTORY_INITIAL_LIMIT);
+      });
+      lastHistoryQueryRef.current = "";
+    },
+    [historySearch],
+  );
 
-  const syncConversationTitleState = useCallback(async (
-    id: string,
-    {
-      title,
-      titleSource,
-    }: {
-      title?: string | null;
-      titleSource?: "fallback" | "ai" | "user";
-    } = {},
-  ) => {
-    let resolvedTitle = title?.trim() || null;
-    let resolvedTitleSource = titleSource;
-    let loadedConversation: ChatConversation | null = null;
+  const syncConversationTitleState = useCallback(
+    async (
+      id: string,
+      {
+        title,
+        titleSource,
+      }: {
+        title?: string | null;
+        titleSource?: "fallback" | "ai" | "user";
+      } = {},
+    ) => {
+      let resolvedTitle = title?.trim() || null;
+      let resolvedTitleSource = titleSource;
+      let loadedConversation: ChatConversation | null = null;
 
-    if (!resolvedTitle || !resolvedTitleSource) {
-      try {
-        await markConversationFileChanged(id);
-        loadedConversation = await loadConversationFile(id);
-        if (!loadedConversation) return;
-        resolvedTitle = resolvedTitle || loadedConversation.title?.trim() || null;
-        resolvedTitleSource = resolvedTitleSource || loadedConversation.titleSource;
-      } catch {
-        return;
+      if (!resolvedTitle || !resolvedTitleSource) {
+        try {
+          await markConversationFileChanged(id);
+          loadedConversation = await loadConversationFile(id);
+          if (!loadedConversation) return;
+          resolvedTitle =
+            resolvedTitle || loadedConversation.title?.trim() || null;
+          resolvedTitleSource =
+            resolvedTitleSource || loadedConversation.titleSource;
+        } catch {
+          return;
+        }
       }
-    }
 
-    if (!resolvedTitle) return;
+      if (!resolvedTitle) return;
 
-    try {
-      const { useChatStore } = await import("@/lib/stores/chat-store");
-      const session = useChatStore.getState().sessions[id];
-      if (session) {
-        // Never downgrade title priority (fallback < ai < user).
-        if (!shouldAcceptTitleSource(session.titleSource, resolvedTitleSource)) return;
-        useChatStore.getState().actions.patch(id, {
-          title: resolvedTitle,
-          ...(resolvedTitleSource ? { titleSource: resolvedTitleSource } : {}),
-          // Clear any in-flight streaming partial when a higher-priority title
-          // (user rename or finalized AI) arrives from another window.
-          ...(resolvedTitleSource === "user" || resolvedTitleSource === "ai"
-            ? { streamingTitle: undefined }
-            : {}),
+      try {
+        const { useChatStore } = await import("@/lib/stores/chat-store");
+        const session = useChatStore.getState().sessions[id];
+        if (session) {
+          // Never downgrade title priority (fallback < ai < user).
+          if (
+            !shouldAcceptTitleSource(session.titleSource, resolvedTitleSource)
+          )
+            return;
+          useChatStore.getState().actions.patch(id, {
+            title: resolvedTitle,
+            ...(resolvedTitleSource
+              ? { titleSource: resolvedTitleSource }
+              : {}),
+            // Clear any in-flight streaming partial when a higher-priority title
+            // (user rename or finalized AI) arrives from another window.
+            ...(resolvedTitleSource === "user" || resolvedTitleSource === "ai"
+              ? { streamingTitle: undefined }
+              : {}),
+          });
+        }
+      } catch (e) {
+        console.warn("[chat-title] failed to sync local title state", {
+          id,
+          error: e,
         });
       }
-    } catch (e) {
-      console.warn("[chat-title] failed to sync local title state", { id, error: e });
-    }
 
-    if (!loadedConversation) {
-      try {
-        await markConversationFileChanged(id);
-        loadedConversation = await loadConversationFile(id);
-      } catch {
-        loadedConversation = null;
+      if (!loadedConversation) {
+        try {
+          await markConversationFileChanged(id);
+          loadedConversation = await loadConversationFile(id);
+        } catch {
+          loadedConversation = null;
+        }
       }
-    }
 
-    if (loadedConversation) {
-      upsertFileConversationMeta(loadedConversation);
-    }
-  }, [upsertFileConversationMeta]);
+      if (loadedConversation) {
+        upsertFileConversationMeta(loadedConversation);
+      }
+    },
+    [upsertFileConversationMeta],
+  );
 
   useEffect(() => {
     if (!inlineHistoryEnabled || !showHistory) {
@@ -323,23 +454,32 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const q = historySearch.trim();
     if (lastHistoryQueryRef.current === q) return;
     const requestId = ++historyRequestRef.current;
-    const timer = setTimeout(() => {
-      loadConversationMetas(q)
-        .then((convs) => {
-          if (historyRequestRef.current === requestId) {
-            setFileConversations(convs);
-            lastHistoryQueryRef.current = q;
-          }
-        })
-        .catch(() => {
-          if (historyRequestRef.current === requestId) {
-            setFileConversations([]);
-          }
-        });
-    }, q ? 200 : 0);
+    const timer = setTimeout(
+      () => {
+        loadConversationMetas(q)
+          .then((convs) => {
+            if (historyRequestRef.current === requestId) {
+              setFileConversations(convs);
+              lastHistoryQueryRef.current = q;
+            }
+          })
+          .catch(() => {
+            if (historyRequestRef.current === requestId) {
+              setFileConversations([]);
+            }
+          });
+      },
+      q ? 200 : 0,
+    );
 
     return () => clearTimeout(timer);
-  }, [historyReady, historySearch, inlineHistoryEnabled, loadConversationMetas, showHistory]);
+  }, [
+    historyReady,
+    historySearch,
+    inlineHistoryEnabled,
+    loadConversationMetas,
+    showHistory,
+  ]);
 
   const refreshFileConversations = useCallback(async () => {
     if (!inlineHistoryEnabled || !showHistory) return;
@@ -349,15 +489,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     lastHistoryQueryRef.current = q;
   }, [historySearch, inlineHistoryEnabled, loadConversationMetas, showHistory]);
 
-  const scheduleHistoryRefresh = useCallback((delayMs = 80) => {
-    if (historyRefreshTimerRef.current) {
-      clearTimeout(historyRefreshTimerRef.current);
-    }
-    historyRefreshTimerRef.current = setTimeout(() => {
-      historyRefreshTimerRef.current = null;
-      void refreshFileConversations().catch(() => {});
-    }, delayMs);
-  }, [refreshFileConversations]);
+  const scheduleHistoryRefresh = useCallback(
+    (delayMs = 80) => {
+      if (historyRefreshTimerRef.current) {
+        clearTimeout(historyRefreshTimerRef.current);
+      }
+      historyRefreshTimerRef.current = setTimeout(() => {
+        historyRefreshTimerRef.current = null;
+        void refreshFileConversations().catch(() => {});
+      }, delayMs);
+    },
+    [refreshFileConversations],
+  );
 
   useEffect(() => {
     return () => {
@@ -409,24 +552,25 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       );
       unlistenFns.push(unlistenVisibility);
 
-      const unlistenSaved = await listen<{ id: string; title?: string; titleSource?: "fallback" | "ai" | "user" }>(
-        "chat-conversation-saved",
-        async (event) => {
-          if (cancelled) return;
-          const { id, title, titleSource } = event.payload ?? {};
-          if (!id) return;
+      const unlistenSaved = await listen<{
+        id: string;
+        title?: string;
+        titleSource?: "fallback" | "ai" | "user";
+      }>("chat-conversation-saved", async (event) => {
+        if (cancelled) return;
+        const { id, title, titleSource } = event.payload ?? {};
+        if (!id) return;
 
-          // The current conversation's transcript may be newer in local state
-          // than on disk, but title metadata should still converge to the
-          // persisted value across windows.
-          if (id === conversationId || id === piSessionIdRef.current) {
-            await syncConversationTitleState(id, { title, titleSource });
-            return;
-          }
-
+        // The current conversation's transcript may be newer in local state
+        // than on disk, but title metadata should still converge to the
+        // persisted value across windows.
+        if (id === conversationId || id === piSessionIdRef.current) {
           await syncConversationTitleState(id, { title, titleSource });
-        },
-      );
+          return;
+        }
+
+        await syncConversationTitleState(id, { title, titleSource });
+      });
       unlistenFns.push(unlistenSaved);
 
       const unlistenRenamed = await listen<{ id: string; title: string }>(
@@ -440,16 +584,16 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       );
       unlistenFns.push(unlistenRenamed);
 
-      const unlistenGroupChanged = await listen<{ id: string; sidebarGroup?: string }>(
-        "chat-sidebar-group-changed",
-        (event) => {
-          if (cancelled) return;
-          const { id } = event.payload ?? {};
-          if (!id) return;
-          invalidateConversationListCache();
-          scheduleHistoryRefresh();
-        },
-      );
+      const unlistenGroupChanged = await listen<{
+        id: string;
+        sidebarGroup?: string;
+      }>("chat-sidebar-group-changed", (event) => {
+        if (cancelled) return;
+        const { id } = event.payload ?? {};
+        if (!id) return;
+        invalidateConversationListCache();
+        scheduleHistoryRefresh();
+      });
       unlistenFns.push(unlistenGroupChanged);
     })().catch(() => {
       // ignore: chat still works without cross-window sync listeners
@@ -472,7 +616,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // ---- saveConversation ----
   const saveConversation = async (
     msgs: Message[],
-    options: SaveConversationOptions = {}
+    options: SaveConversationOptions = {},
   ) => {
     if (msgs.length === 0) return;
 
@@ -522,18 +666,16 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     );
 
     // Find first real user message, skipping injected metadata.
-    const firstUserMsg = msgs.find((m) => (
-      m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
-    ));
+    const firstUserMsg = msgs.find(
+      (m) => m.role === "user" && !isInjectedTitleSourcePrompt(m.content),
+    );
     const fallbackTitle = deriveFallbackConversationTitle(firstUserMsg);
     const existingTitle = existing?.title?.trim() || null;
     const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
 
     const currentPreset = getSelectedPreset();
     const hasValidPreset =
-      currentPreset &&
-      currentPreset.provider &&
-      currentPreset.model?.trim();
+      currentPreset && currentPreset.provider && currentPreset.model?.trim();
 
     const existingSource = existing?.titleSource;
     const existingLooksFallback = isFallbackLikeTitle(
@@ -562,7 +704,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // echoed verbatim into the title.
     const rawContent =
       firstUserMsg?.displayContent?.trim() ||
-      (firstUserMsg?.content ? stripPromptPlumbing(firstUserMsg.content) : "") ||
+      (firstUserMsg?.content
+        ? stripPromptPlumbing(firstUserMsg.content)
+        : "") ||
       null;
     // Opt-out: when the user disables auto title generation (to save tokens),
     // skip the extra LLM call entirely — chats keep the fallback title.
@@ -575,7 +719,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // `pipeName #executionId`, set by the recorder / watch session.
     // Only allow AI titles when the user manually renames (titleSource
     // would be "user" at that point, so this gate is a no-op for renames).
-    const isPipeChat = existing?.kind === "pipe-run" || existing?.kind === "pipe-watch";
+    const isPipeChat =
+      existing?.kind === "pipe-run" || existing?.kind === "pipe-watch";
     if (
       autoTitleEnabled &&
       titleProviderIsFunded &&
@@ -598,13 +743,20 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             settings?.user?.token ?? null,
             async (partial) => {
               try {
-                const { useChatStore } = await import("@/lib/stores/chat-store");
+                const { useChatStore } =
+                  await import("@/lib/stores/chat-store");
                 const session = useChatStore.getState().sessions[convId];
                 // Only stream partial title while still at fallback priority.
                 // If the user renamed (titleSource === "user") or AI already
                 // settled, stop updating.
-                if (!session || (session.titleSource && session.titleSource !== "fallback")) return;
-                useChatStore.getState().actions.patch(convId, { streamingTitle: partial });
+                if (
+                  !session ||
+                  (session.titleSource && session.titleSource !== "fallback")
+                )
+                  return;
+                useChatStore
+                  .getState()
+                  .actions.patch(convId, { streamingTitle: partial });
               } catch {}
             },
           );
@@ -615,14 +767,20 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             if (!existingConv) {
               // Conversation deleted — clear streaming state
               try {
-                const { useChatStore } = await import("@/lib/stores/chat-store");
-                useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+                const { useChatStore } =
+                  await import("@/lib/stores/chat-store");
+                useChatStore
+                  .getState()
+                  .actions.patch(convId, { streamingTitle: undefined });
               } catch {}
               return;
             }
 
             // Only update if current title is still fallback priority
-            if (existingConv.titleSource === "fallback" || !existingConv.titleSource) {
+            if (
+              existingConv.titleSource === "fallback" ||
+              !existingConv.titleSource
+            ) {
               existingConv.title = aiTitle;
               existingConv.titleSource = "ai";
               await saveConversationFile(existingConv);
@@ -631,14 +789,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
               // so the sidebar transitions directly from partial → final
               // with no fallback flicker.
               try {
-                const { useChatStore } = await import("@/lib/stores/chat-store");
+                const { useChatStore } =
+                  await import("@/lib/stores/chat-store");
                 useChatStore.getState().actions.patch(convId, {
                   title: aiTitle,
                   titleSource: "ai",
                   streamingTitle: undefined,
                 });
               } catch (e) {
-                console.warn("[chat-title] failed to update chat store", { convId, error: e });
+                console.warn("[chat-title] failed to update chat store", {
+                  convId,
+                  error: e,
+                });
               }
 
               try {
@@ -659,8 +821,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
               // Title was upgraded (e.g. user renamed) while we were generating —
               // just clear the streaming state. Keep guard entry to prevent re-trigger.
               try {
-                const { useChatStore } = await import("@/lib/stores/chat-store");
-                useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+                const { useChatStore } =
+                  await import("@/lib/stores/chat-store");
+                useChatStore
+                  .getState()
+                  .actions.patch(convId, { streamingTitle: undefined });
               } catch {}
             }
           } else {
@@ -668,7 +833,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             aiTitleAttempted.delete(convId);
             try {
               const { useChatStore } = await import("@/lib/stores/chat-store");
-              useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+              useChatStore
+                .getState()
+                .actions.patch(convId, { streamingTitle: undefined });
             } catch {}
           }
         } catch (error) {
@@ -676,7 +843,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           aiTitleAttempted.delete(convId);
           try {
             const { useChatStore } = await import("@/lib/stores/chat-store");
-            useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+            useChatStore
+              .getState()
+              .actions.patch(convId, { streamingTitle: undefined });
           } catch {}
           console.warn("[chat-title] background title generation failed", {
             convId,
@@ -695,14 +864,15 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       // past 100 messages walked forward and lost its early history. If
       // file size becomes a problem for power users we cap at the render
       // layer, never on disk.
-      messages: msgs.map(m => {
+      messages: msgs.map((m) => {
         // For tool-only responses, content may be empty but contentBlocks has the data.
         let content = m.content;
         if (!content && m.contentBlocks?.length) {
-          content = m.contentBlocks
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text)
-            .join("\n") || "(tool result)";
+          content =
+            m.contentBlocks
+              .filter((b: any) => b.type === "text")
+              .map((b: any) => b.text)
+              .join("\n") || "(tool result)";
         }
         // Persist contentBlocks so tool calls/results survive reload.
         // Strip isRunning (stale) and cap result length to keep file small.
@@ -733,7 +903,13 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           ...(m.displayContent ? { displayContent: m.displayContent } : {}),
           ...(blocks?.length ? { contentBlocks: blocks } : {}),
           ...(m.images?.length ? { images: m.images } : {}),
-          ...((m as any).attachments?.length ? { attachments: (m as any).attachments } : {}),
+          ...((m as any).attachments?.length
+            ? { attachments: (m as any).attachments }
+            : {}),
+          ...(m.hostedTurnId ? { hostedTurnId: m.hostedTurnId } : {}),
+          ...(m.hostedTurnPrompt
+            ? { hostedTurnPrompt: m.hostedTurnPrompt }
+            : {}),
           ...(m.model ? { model: m.model } : {}),
           ...(m.provider ? { provider: m.provider } : {}),
           ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
@@ -749,7 +925,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       // plain chat (kind/pipeContext dropped on disk).
       ...(existing?.kind ? { kind: existing.kind } : {}),
       ...(existing?.pipeContext ? { pipeContext: existing.pipeContext } : {}),
-      ...(existing?.sidebarGroup ? { sidebarGroup: existing.sidebarGroup } : {}),
+      ...(existing?.sidebarGroup
+        ? { sidebarGroup: existing.sidebarGroup }
+        : {}),
       ...(browserState ? { browserState } : {}),
       ...(existing?.pinned ? { pinned: existing.pinned } : {}),
       ...(existing?.hidden ? { hidden: existing.hidden } : {}),
@@ -767,7 +945,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           computedLastUserMessageAt ??
           storeSession?.lastUserMessageAt ??
           existing?.lastUserMessageAt;
-        const lastContentAt = storeSession?.lastContentAt ?? existing?.lastContentAt;
+        const lastContentAt =
+          storeSession?.lastContentAt ?? existing?.lastContentAt;
         const lastViewedAt =
           storeSession?.lastViewedAt ??
           existing?.lastViewedAt ??
@@ -780,7 +959,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       })()),
       // Persist the preset ID so the model selection survives app restart
       // and is restored when switching between chats.
-      ...(currentPreset?.id ? { presetId: currentPreset.id } : existing?.presetId ? { presetId: existing.presetId } : {}),
+      ...(currentPreset?.id
+        ? { presetId: currentPreset.id }
+        : existing?.presetId
+          ? { presetId: existing.presetId }
+          : {}),
     };
 
     // Mirror the final messages into the in-memory chat-store BEFORE
@@ -797,7 +980,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     try {
       const { useChatStore } = await import("@/lib/stores/chat-store");
       if (useChatStore.getState().sessions[convId]) {
-        useChatStore.getState().actions.setMessages(convId, conversation.messages as any);
+        useChatStore
+          .getState()
+          .actions.setMessages(convId, conversation.messages as any);
       }
     } catch (e) {
       console.warn("[chat] failed to mirror messages to store before save:", e);
@@ -906,7 +1091,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // a response is streaming so a crash/quit drops at most a second of
   // tokens. Pipe-watch conversations are still skipped — same rule as
   // the edge save: only persist if at least one message is user-typed.
-  const streamingSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamingSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   // Snapshot of last-saved content length per message id so we don't
   // rewrite the file when only React re-rendered (e.g. cursor blink).
   const lastSavedSigRef = useRef<string>("");
@@ -925,9 +1112,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
 
     // Cheap signature: total length of all message content + last id.
     // If neither moved, no point re-serialising the whole transcript.
-    const sig = `${messages.length}|${messages[messages.length - 1]?.id ?? ""}|${
-      messages.reduce((n, m) => n + (m.content?.length ?? 0), 0)
-    }`;
+    const sig = `${messages.length}|${messages[messages.length - 1]?.id ?? ""}|${messages.reduce(
+      (n, m) => n + (m.content?.length ?? 0),
+      0,
+    )}`;
     if (sig === lastSavedSigRef.current) return;
     lastSavedSigRef.current = sig;
 
@@ -959,7 +1147,12 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const { loadConversationFile } = await import("@/lib/chat-storage");
     const conv = await loadConversationFile(convId);
     if (!conv) return;
-    await saveConversationFile({ ...conv, title: trimmed, titleSource: "user", updatedAt: Date.now() });
+    await saveConversationFile({
+      ...conv,
+      title: trimmed,
+      titleSource: "user",
+      updatedAt: Date.now(),
+    });
     await refreshFileConversations();
     // Mirror to the in-memory store so the chat sidebar reflects the new
     // title without waiting for app restart. Some call sites already patch
@@ -968,7 +1161,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     try {
       const { useChatStore } = await import("@/lib/stores/chat-store");
       if (useChatStore.getState().sessions[convId]) {
-        useChatStore.getState().actions.patch(convId, { title: trimmed, titleSource: "user", streamingTitle: undefined });
+        useChatStore.getState().actions.patch(convId, {
+          title: trimmed,
+          titleSource: "user",
+          streamingTitle: undefined,
+        });
       }
     } catch (e) {
       console.warn("[chat] failed to sync rename to store:", e);
@@ -1041,307 +1238,383 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   //      the pi-event router has been accumulating its background
   //      tokens). Fall back to disk only when the store is cold for
   //      this id.
-  const loadConversation = async (conv: ChatConversation | ConversationMeta) => {
-    const { useChatStore } = await import("@/lib/stores/chat-store");
-    const store = useChatStore.getState();
-    const outgoingSid = piSessionIdRef.current;
-    const viewedAt = Date.now();
+  const loadConversation = async (
+    conv: ChatConversation | ConversationMeta,
+  ) => {
+    invalidatePendingAttachmentWork?.();
+    const operationBoundary = beginConversationOperation();
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (!conversationOperationIsCurrent(operationBoundary)) return;
+      const store = useChatStore.getState();
+      const outgoingSid = piSessionIdRef.current;
+      const viewedAt = Date.now();
 
-    // (1) Snapshot OUTGOING session — atomic so router writes that
-    //     race against this update can't land between the messages
-    //     write and the streaming-refs write (which would point the
-    //     router at a streamingMessageId not yet present in messages).
-    //     Pipe-watch sessions are owned by `pipe-watch-writer`, which
-    //     keeps the chat-store as the source of truth — snapshotting
-    //     the panel's mirrored copy back over the writer's accumulator
-    //     would be a regression (lossy round-trip via React state).
-    if (outgoingSid && store.sessions[outgoingSid]) {
-      const outgoingKind = store.sessions[outgoingSid].kind;
-      if (outgoingKind !== "pipe-watch") {
-        store.actions.snapshotSession(outgoingSid, {
-          messages: messages as any,
-          streamingText: piStreamingTextRef.current,
-          streamingMessageId: piMessageIdRef.current,
-          contentBlocks: [...piContentBlocksRef.current],
-          isStreaming,
-          isLoading,
-        });
-      }
-      // (1b) Snapshot OUTGOING composer draft — what the user had
-      // typed + staged but not yet sent. Restored when they come back
-      // to this chat. Mirrors how messages/streamingText are stored.
-      // No-op when the caller didn't pass the value refs (other hook
-      // consumers just get the clear, no restore).
-      if (inputValueRef && pastedImagesRef) {
-        store.actions.setComposerDraft(outgoingSid, {
-          input: inputValueRef.current,
-          pastedImages: [...pastedImagesRef.current],
-          attachedDocs: attachedDocsRef ? [...attachedDocsRef.current] : [],
-          pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
-        });
-      }
-    }
-
-    // (2) Reset panel flags — these are panel-local, not session-local.
-    piStreamingTextRef.current = "";
-    piMessageIdRef.current = null;
-    piContentBlocksRef.current = [];
-    setIsLoading(false);
-    setIsStreaming(false);
-    // Composer state (text, images, docs) is scoped to the chat the user
-    // was composing in. Switching to another conversation must not carry
-    // any of it over — otherwise the user can send a draft into the wrong
-    // thread (or silently inject a PDF/image they thought belonged to the
-    // previous chat). Mirrors startNewConversation, which already clears
-    // the full composer on "+ new chat". The block below then restores
-    // the INCOMING chat's saved draft after switching — ChatGPT/Claude
-    // parity. The clear is intentional even with restore: if the
-    // incoming chat has no draft, we want a clean composer, not the
-    // outgoing chat's contents lingering for a frame.
-    setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
-    setPastedImages([]);
-    setAttachedDocs?.([]);
-    setPendingDocs?.([]);
-
-    // Switch to this conversation's session. Pair the panel's ref
-    // switch with `setCurrent` on the store so the router's
-    // foreground/background skip logic flips at the same instant the
-    // panel's filter does. Without this pairing, callers that reach
-    // loadConversation from a path other than the sidebar (deep-link
-    // from another window, settings-driven activeConversationId, etc.)
-    // would temporarily have the panel and the router disagree on
-    // which session is foreground — producing duplicated writes for
-    // the new session and silently dropped writes for the old one.
-    piSessionIdRef.current = conv.id;
-    store.actions.setCurrent(conv.id);
-
-    // (3) Prefer the store whenever it has messages for this id. Two
-    //     ways messages get there: (a) `markHydrated` was called on a
-    //     prior view (`hydratedAt` set), or (b) the router accumulated
-    //     them while the session was streaming in the background. Case
-    //     (b) is the up-to-the-millisecond truth — the disk file may
-    //     be one save behind the in-memory state, so falling through to
-    //     disk would silently drop tokens that arrived since the last
-    //     persisted agent_end.
-    const existing = store.sessions[conv.id];
-    const needsPersistedSync =
-      !existing ||
-      !existing.hydratedAt ||
-      !existing.messages ||
-      existing.messages.length === 0 ||
-      existing.titleSource == null;
-    let persisted: ChatConversation | null = null;
-
-    if (needsPersistedSync) {
-      const { loadConversationFile } = await import("@/lib/chat-storage");
-      persisted = await loadConversationFile(conv.id);
-      if (persisted) {
-        if (!store.sessions[conv.id]) {
-          store.actions.upsert({
-            id: conv.id,
-            title: persisted.title || "untitled",
-            ...(persisted.titleSource ? { titleSource: persisted.titleSource } : {}),
-            preview: "",
-            status: "idle",
-            messageCount: persisted.messages?.length ?? 0,
-            createdAt: persisted.createdAt ?? Date.now(),
-            updatedAt: persisted.updatedAt ?? Date.now(),
-            pinned: persisted.pinned === true,
-            unread: false,
-            ...(persisted.hidden === true ? { hidden: true } : {}),
-            ...(persisted.kind ? { kind: persisted.kind } : {}),
-            ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
-            ...(persisted.sidebarGroup ? { sidebarGroup: persisted.sidebarGroup } : {}),
-            ...(persisted.lastContentAt ? { lastContentAt: persisted.lastContentAt } : {}),
-            ...(typeof persisted.lastViewedAt === "number"
-              ? { lastViewedAt: persisted.lastViewedAt }
-              : {}),
+      // (1) Snapshot OUTGOING session — atomic so router writes that
+      //     race against this update can't land between the messages
+      //     write and the streaming-refs write (which would point the
+      //     router at a streamingMessageId not yet present in messages).
+      //     Pipe-watch sessions are owned by `pipe-watch-writer`, which
+      //     keeps the chat-store as the source of truth — snapshotting
+      //     the panel's mirrored copy back over the writer's accumulator
+      //     would be a regression (lossy round-trip via React state).
+      if (outgoingSid && store.sessions[outgoingSid]) {
+        const outgoingKind = store.sessions[outgoingSid].kind;
+        if (outgoingKind !== "pipe-watch") {
+          store.actions.snapshotSession(outgoingSid, {
+            messages: messages as any,
+            streamingText: piStreamingTextRef.current,
+            streamingMessageId: piMessageIdRef.current,
+            contentBlocks: [...piContentBlocksRef.current],
+            isStreaming,
+            isLoading,
           });
-        } else {
-          store.actions.patch(conv.id, {
-            title: persisted.title || existing?.title || "untitled",
-            ...(persisted.titleSource ? { titleSource: persisted.titleSource } : {}),
-            pinned: persisted.pinned === true,
-            hidden: persisted.hidden === true,
-            updatedAt: Math.max(existing?.updatedAt ?? 0, persisted.updatedAt ?? 0),
-            ...(persisted.kind ? { kind: persisted.kind } : {}),
-            ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
-            ...(persisted.sidebarGroup ? { sidebarGroup: persisted.sidebarGroup } : {}),
-            ...(typeof persisted.lastViewedAt === "number"
-              ? { lastViewedAt: persisted.lastViewedAt }
-              : {}),
+        }
+        // (1b) Snapshot OUTGOING composer draft — what the user had
+        // typed + staged but not yet sent. Restored when they come back
+        // to this chat. Mirrors how messages/streamingText are stored.
+        // No-op when the caller didn't pass the value refs (other hook
+        // consumers just get the clear, no restore).
+        if (inputValueRef && pastedImagesRef) {
+          store.actions.setComposerDraft(outgoingSid, {
+            input: inputValueRef.current,
+            pastedImages: [...pastedImagesRef.current],
+            attachedDocs: attachedDocsRef ? [...attachedDocsRef.current] : [],
+            pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
           });
         }
       }
-    }
-    let messagesForPanel: any[];
-    if (existing?.messages && existing.messages.length > 0) {
-      messagesForPanel = existing.messages as any[];
-      // Restore in-flight streaming markers so the panel resumes
-      // exactly where the user left it. The router has been keeping
-      // these up-to-date for any tokens that arrived while the user
-      // was elsewhere.
-      piStreamingTextRef.current = existing.streamingText ?? "";
-      piMessageIdRef.current = existing.streamingMessageId ?? null;
-      piContentBlocksRef.current = (existing.contentBlocks as any[]) ?? [];
-      // Self-heal a stuck `isStreaming` flag. The router bumps
-      // `updatedAt` on every token via patchMessage, so silence past
-      // STALE_MS means the stream is dead (Pi process died without
-      // firing agent_end, network cut mid-stream, etc.) — not just
-      // slow. Without this guard, returning to such a session shows
-      // the typing-cursor / loading dots forever.
-      const STALE_MS = 30_000;
-      const isStale =
-        !!existing.isStreaming && Date.now() - existing.updatedAt > STALE_MS;
-      if (isStale) {
-        store.actions.endTurn(conv.id);
-        piStreamingTextRef.current = "";
-        piMessageIdRef.current = null;
-        piContentBlocksRef.current = [];
-      } else {
-        if (existing.isLoading) setIsLoading(true);
-        if (existing.isStreaming) setIsStreaming(true);
-      }
-      store.actions.markHydrated(conv.id);
-    } else {
-      // Cold session — load from disk and seed the store.
-      const full =
-        persisted ||
-        (Array.isArray((conv as ChatConversation).messages)
-          ? (conv as ChatConversation)
-          : null);
-      if (!full) {
-        await refreshFileConversations();
-        return;
-      }
-      messagesForPanel = full.messages.map((m) => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        ...((m as any).intent ? { intent: (m as any).intent } : {}),
-        ...((m as any).turnIntentId ? { turnIntentId: (m as any).turnIntentId } : {}),
-        timestamp: m.timestamp,
-        ...(m.displayContent ? { displayContent: m.displayContent } : {}),
-        ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
-        ...((m as any).sourceCitations?.length
-          ? { sourceCitations: (m as any).sourceCitations }
-          : {}),
-        ...((m as any).images?.length
-          ? { images: (m as any).images }
-          : (m as any).image
-            ? { images: [(m as any).image] }
-            : {}),
-        ...((m as any).model ? { model: (m as any).model } : {}),
-        ...((m as any).provider ? { provider: (m as any).provider } : {}),
-        ...((m as any).interruptedBySteer ? { interruptedBySteer: true } : {}),
-        ...((m as any).steeredResponse ? { steeredResponse: true } : {}),
-        ...((m as any).workDurationMs ? { workDurationMs: (m as any).workDurationMs } : {}),
-        ...((m as any).stoppedByUser ? { stoppedByUser: true } : {}),
-      }));
-      // Make sure a record exists, then seed messages and mark hydrated.
-      if (!store.sessions[conv.id]) {
-        store.actions.upsert({
-          id: conv.id,
-          title: full.title || "untitled",
-          ...(full.titleSource ? { titleSource: full.titleSource } : {}),
-          preview: "",
-          status: "idle",
-          messageCount: messagesForPanel.length,
-          createdAt: full.createdAt ?? Date.now(),
-          updatedAt: full.updatedAt ?? Date.now(),
-          pinned: full.pinned === true,
-          unread: false,
-          // Propagate kind / pipeContext from the synthetic conv when
-          // initWatch creates a pipe-watch session — the banner reads
-          // this off the session record so it persists across
-          // foreground/background swaps.
-          ...(conv.kind ? { kind: conv.kind } : full.kind ? { kind: full.kind } : {}),
-          ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : full.pipeContext ? { pipeContext: full.pipeContext } : {}),
-          ...(conv.sidebarGroup ? { sidebarGroup: conv.sidebarGroup } : full.sidebarGroup ? { sidebarGroup: full.sidebarGroup } : {}),
-          ...(full.lastContentAt ? { lastContentAt: full.lastContentAt } : {}),
-          ...(typeof full.lastViewedAt === "number"
-            ? { lastViewedAt: full.lastViewedAt }
-            : {}),
-        });
-      } else if (conv.kind || conv.pipeContext || conv.sidebarGroup || full.sidebarGroup) {
-        store.actions.patch(conv.id, {
-          title: full.title || store.sessions[conv.id]?.title || "untitled",
-          ...(full.titleSource ? { titleSource: full.titleSource } : {}),
-          pinned: full.pinned === true,
-          hidden: full.hidden === true,
-          updatedAt: Math.max(store.sessions[conv.id]?.updatedAt ?? 0, full.updatedAt ?? 0),
-          ...(conv.kind ? { kind: conv.kind } : {}),
-          ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : {}),
-          ...(conv.sidebarGroup ? { sidebarGroup: conv.sidebarGroup } : full.sidebarGroup ? { sidebarGroup: full.sidebarGroup } : {}),
-        });
-      }
-      store.actions.setMessages(conv.id, messagesForPanel as any);
-      store.actions.markHydrated(conv.id);
-    }
-    store.actions.patch(conv.id, { lastViewedAt: viewedAt });
-    try {
-      await updateConversationFlags(conv.id, { lastViewedAt: viewedAt });
-    } catch {
-      // Best-effort: unread clears live immediately; the next full save can
-      // still persist the watermark if this patch fails.
-    }
 
-    setMessages(messagesForPanel);
-    setConversationId(conv.id);
-    setShowHistory(false);
-    piSessionSyncedRef.current = false;
+      // (2) Reset panel flags — these are panel-local, not session-local.
+      piStreamingTextRef.current = "";
+      piMessageIdRef.current = null;
+      piContentBlocksRef.current = [];
+      setIsLoading(false);
+      setIsStreaming(false);
+      // Composer state (text, images, docs) is scoped to the chat the user
+      // was composing in. Switching to another conversation must not carry
+      // any of it over — otherwise the user can send a draft into the wrong
+      // thread (or silently inject a PDF/image they thought belonged to the
+      // previous chat). Mirrors startNewConversation, which already clears
+      // the full composer on "+ new chat". The block below then restores
+      // the INCOMING chat's saved draft after switching — ChatGPT/Claude
+      // parity. The clear is intentional even with restore: if the
+      // incoming chat has no draft, we want a clean composer, not the
+      // outgoing chat's contents lingering for a frame.
+      setInput("");
+      if (inputRef.current) inputRef.current.style.height = "auto";
+      setPastedImages([]);
+      setAttachedDocs?.([]);
+      setPendingDocs?.([]);
 
-    // (3) Restore INCOMING composer draft, if any. Reads from the
-    // store snapshot taken last time the user left this chat
-    // (or set live by the panel's mirror effect). Safe no-op when
-    // there's no saved draft — the composer was just cleared above,
-    // so we're either restoring a real draft or staying empty.
-    // Only runs when value refs were wired by the caller.
-    const incomingDraft = store.sessions[conv.id]?.composerDraft;
-    if (incomingDraft && inputValueRef) {
-      if (incomingDraft.input) {
-        setInput(incomingDraft.input);
-      }
-      if ((incomingDraft.pastedImages?.length ?? 0) > 0) {
-        setPastedImages(incomingDraft.pastedImages as string[]);
-      }
-      if (setAttachedDocs && (incomingDraft.attachedDocs?.length ?? 0) > 0) {
-        setAttachedDocs(incomingDraft.attachedDocs as any[]);
-      }
-      if (setPendingDocs && (incomingDraft.pendingDocs?.length ?? 0) > 0) {
-        setPendingDocs(incomingDraft.pendingDocs as any[]);
-      }
-    }
+      // Switch to this conversation's session. Pair the panel's ref
+      // switch with `setCurrent` on the store so the router's
+      // foreground/background skip logic flips at the same instant the
+      // panel's filter does. Without this pairing, callers that reach
+      // loadConversation from a path other than the sidebar (deep-link
+      // from another window, settings-driven activeConversationId, etc.)
+      // would temporarily have the panel and the router disagree on
+      // which session is foreground — producing duplicated writes for
+      // the new session and silently dropped writes for the old one.
+      piSessionIdRef.current = conv.id;
+      store.actions.setCurrent(conv.id);
 
-    // Update activeConversationId in store
-    try {
-      const { getStore } = await import("@/lib/hooks/use-settings");
-      const store = await getStore();
-      const freshSettings = await store.get<any>("settings");
-      if (freshSettings?.chatHistory) {
-        await store.set("settings", {
-          ...freshSettings,
-          chatHistory: {
-            ...freshSettings.chatHistory,
-            activeConversationId: conv.id,
+      // (3) Prefer the store whenever it has messages for this id. Two
+      //     ways messages get there: (a) `markHydrated` was called on a
+      //     prior view (`hydratedAt` set), or (b) the router accumulated
+      //     them while the session was streaming in the background. Case
+      //     (b) is the up-to-the-millisecond truth — the disk file may
+      //     be one save behind the in-memory state, so falling through to
+      //     disk would silently drop tokens that arrived since the last
+      //     persisted agent_end.
+      const existing = store.sessions[conv.id];
+      const needsPersistedSync =
+        !existing ||
+        !existing.hydratedAt ||
+        !existing.messages ||
+        existing.messages.length === 0 ||
+        existing.titleSource == null;
+      let persisted: ChatConversation | null = null;
+
+      if (needsPersistedSync) {
+        const { loadConversationFile } = await import("@/lib/chat-storage");
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        persisted = await loadConversationFile(conv.id);
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        if (persisted) {
+          if (!store.sessions[conv.id]) {
+            store.actions.upsert({
+              id: conv.id,
+              title: persisted.title || "untitled",
+              ...(persisted.titleSource
+                ? { titleSource: persisted.titleSource }
+                : {}),
+              preview: "",
+              status: "idle",
+              messageCount: persisted.messages?.length ?? 0,
+              createdAt: persisted.createdAt ?? Date.now(),
+              updatedAt: persisted.updatedAt ?? Date.now(),
+              pinned: persisted.pinned === true,
+              unread: false,
+              ...(persisted.hidden === true ? { hidden: true } : {}),
+              ...(persisted.kind ? { kind: persisted.kind } : {}),
+              ...(persisted.pipeContext
+                ? { pipeContext: persisted.pipeContext }
+                : {}),
+              ...(persisted.sidebarGroup
+                ? { sidebarGroup: persisted.sidebarGroup }
+                : {}),
+              ...(persisted.lastContentAt
+                ? { lastContentAt: persisted.lastContentAt }
+                : {}),
+              ...(typeof persisted.lastViewedAt === "number"
+                ? { lastViewedAt: persisted.lastViewedAt }
+                : {}),
+            });
+          } else {
+            store.actions.patch(conv.id, {
+              title: persisted.title || existing?.title || "untitled",
+              ...(persisted.titleSource
+                ? { titleSource: persisted.titleSource }
+                : {}),
+              pinned: persisted.pinned === true,
+              hidden: persisted.hidden === true,
+              updatedAt: Math.max(
+                existing?.updatedAt ?? 0,
+                persisted.updatedAt ?? 0,
+              ),
+              ...(persisted.kind ? { kind: persisted.kind } : {}),
+              ...(persisted.pipeContext
+                ? { pipeContext: persisted.pipeContext }
+                : {}),
+              ...(persisted.sidebarGroup
+                ? { sidebarGroup: persisted.sidebarGroup }
+                : {}),
+              ...(typeof persisted.lastViewedAt === "number"
+                ? { lastViewedAt: persisted.lastViewedAt }
+                : {}),
+            });
           }
-        });
-        await store.save();
+        }
       }
-    } catch (e) {
-      console.warn("Failed to update active conversation:", e);
-    }
-
-    // Emit the preset ID so the chat panel can restore the model selection.
-    // This ensures the model selector reflects the preset used in this chat.
-    const presetId = persisted?.presetId ?? (conv as ChatConversation).presetId;
-    if (presetId) {
+      let messagesForPanel: any[];
+      if (existing?.messages && existing.messages.length > 0) {
+        messagesForPanel = existing.messages as any[];
+        // Restore in-flight streaming markers so the panel resumes
+        // exactly where the user left it. The router has been keeping
+        // these up-to-date for any tokens that arrived while the user
+        // was elsewhere.
+        piStreamingTextRef.current = existing.streamingText ?? "";
+        piMessageIdRef.current = existing.streamingMessageId ?? null;
+        piContentBlocksRef.current = (existing.contentBlocks as any[]) ?? [];
+        // Self-heal a stuck `isStreaming` flag. The router bumps
+        // `updatedAt` on every token via patchMessage, so silence past
+        // STALE_MS means the stream is dead (Pi process died without
+        // firing agent_end, network cut mid-stream, etc.) — not just
+        // slow. Without this guard, returning to such a session shows
+        // the typing-cursor / loading dots forever.
+        const STALE_MS = 30_000;
+        const isStale =
+          !!existing.isStreaming && Date.now() - existing.updatedAt > STALE_MS;
+        if (isStale) {
+          store.actions.endTurn(conv.id);
+          piStreamingTextRef.current = "";
+          piMessageIdRef.current = null;
+          piContentBlocksRef.current = [];
+        } else {
+          if (existing.isLoading) setIsLoading(true);
+          if (existing.isStreaming) setIsStreaming(true);
+        }
+        store.actions.markHydrated(conv.id);
+      } else {
+        // Cold session — load from disk and seed the store.
+        const full =
+          persisted ||
+          (Array.isArray((conv as ChatConversation).messages)
+            ? (conv as ChatConversation)
+            : null);
+        if (!full) {
+          await refreshFileConversations();
+          if (!conversationOperationIsCurrent(operationBoundary)) return;
+          return;
+        }
+        messagesForPanel = full.messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          ...((m as any).intent ? { intent: (m as any).intent } : {}),
+          ...((m as any).turnIntentId
+            ? { turnIntentId: (m as any).turnIntentId }
+            : {}),
+          ...((m as any).hostedTurnId
+            ? { hostedTurnId: (m as any).hostedTurnId }
+            : {}),
+          ...((m as any).hostedTurnPrompt
+            ? { hostedTurnPrompt: (m as any).hostedTurnPrompt }
+            : {}),
+          timestamp: m.timestamp,
+          ...(m.displayContent ? { displayContent: m.displayContent } : {}),
+          ...(m.contentBlocks?.length
+            ? { contentBlocks: m.contentBlocks }
+            : {}),
+          ...((m as any).sourceCitations?.length
+            ? { sourceCitations: (m as any).sourceCitations }
+            : {}),
+          ...((m as any).images?.length
+            ? { images: (m as any).images }
+            : (m as any).image
+              ? { images: [(m as any).image] }
+              : {}),
+          ...((m as any).model ? { model: (m as any).model } : {}),
+          ...((m as any).provider ? { provider: (m as any).provider } : {}),
+          ...((m as any).interruptedBySteer
+            ? { interruptedBySteer: true }
+            : {}),
+          ...((m as any).steeredResponse ? { steeredResponse: true } : {}),
+          ...((m as any).workDurationMs
+            ? { workDurationMs: (m as any).workDurationMs }
+            : {}),
+          ...((m as any).stoppedByUser ? { stoppedByUser: true } : {}),
+        }));
+        // Make sure a record exists, then seed messages and mark hydrated.
+        if (!store.sessions[conv.id]) {
+          store.actions.upsert({
+            id: conv.id,
+            title: full.title || "untitled",
+            ...(full.titleSource ? { titleSource: full.titleSource } : {}),
+            preview: "",
+            status: "idle",
+            messageCount: messagesForPanel.length,
+            createdAt: full.createdAt ?? Date.now(),
+            updatedAt: full.updatedAt ?? Date.now(),
+            pinned: full.pinned === true,
+            unread: false,
+            // Propagate kind / pipeContext from the synthetic conv when
+            // initWatch creates a pipe-watch session — the banner reads
+            // this off the session record so it persists across
+            // foreground/background swaps.
+            ...(conv.kind
+              ? { kind: conv.kind }
+              : full.kind
+                ? { kind: full.kind }
+                : {}),
+            ...(conv.pipeContext
+              ? { pipeContext: conv.pipeContext }
+              : full.pipeContext
+                ? { pipeContext: full.pipeContext }
+                : {}),
+            ...(conv.sidebarGroup
+              ? { sidebarGroup: conv.sidebarGroup }
+              : full.sidebarGroup
+                ? { sidebarGroup: full.sidebarGroup }
+                : {}),
+            ...(full.lastContentAt
+              ? { lastContentAt: full.lastContentAt }
+              : {}),
+            ...(typeof full.lastViewedAt === "number"
+              ? { lastViewedAt: full.lastViewedAt }
+              : {}),
+          });
+        } else if (
+          conv.kind ||
+          conv.pipeContext ||
+          conv.sidebarGroup ||
+          full.sidebarGroup
+        ) {
+          store.actions.patch(conv.id, {
+            title: full.title || store.sessions[conv.id]?.title || "untitled",
+            ...(full.titleSource ? { titleSource: full.titleSource } : {}),
+            pinned: full.pinned === true,
+            hidden: full.hidden === true,
+            updatedAt: Math.max(
+              store.sessions[conv.id]?.updatedAt ?? 0,
+              full.updatedAt ?? 0,
+            ),
+            ...(conv.kind ? { kind: conv.kind } : {}),
+            ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : {}),
+            ...(conv.sidebarGroup
+              ? { sidebarGroup: conv.sidebarGroup }
+              : full.sidebarGroup
+                ? { sidebarGroup: full.sidebarGroup }
+                : {}),
+          });
+        }
+        store.actions.setMessages(conv.id, messagesForPanel as any);
+        store.actions.markHydrated(conv.id);
+      }
+      store.actions.patch(conv.id, { lastViewedAt: viewedAt });
       try {
-        await emit("chat-preset-restore", { presetId });
+        await updateConversationFlags(conv.id, { lastViewedAt: viewedAt });
       } catch {
-        // ignore broadcast failures
+        // Best-effort: unread clears live immediately; the next full save can
+        // still persist the watermark if this patch fails.
       }
+      if (!conversationOperationIsCurrent(operationBoundary)) return;
+
+      setMessages(messagesForPanel);
+      setConversationId(conv.id);
+      setShowHistory(false);
+      piSessionSyncedRef.current = false;
+
+      // (3) Restore INCOMING composer draft, if any. Reads from the
+      // store snapshot taken last time the user left this chat
+      // (or set live by the panel's mirror effect). Safe no-op when
+      // there's no saved draft — the composer was just cleared above,
+      // so we're either restoring a real draft or staying empty.
+      // Only runs when value refs were wired by the caller.
+      const incomingDraft = store.sessions[conv.id]?.composerDraft;
+      if (incomingDraft && inputValueRef) {
+        if (incomingDraft.input) {
+          setInput(incomingDraft.input);
+        }
+        if ((incomingDraft.pastedImages?.length ?? 0) > 0) {
+          setPastedImages(incomingDraft.pastedImages as string[]);
+        }
+        if (setAttachedDocs && (incomingDraft.attachedDocs?.length ?? 0) > 0) {
+          setAttachedDocs(incomingDraft.attachedDocs as any[]);
+        }
+        if (setPendingDocs && (incomingDraft.pendingDocs?.length ?? 0) > 0) {
+          setPendingDocs(incomingDraft.pendingDocs as any[]);
+        }
+      }
+
+      // Update activeConversationId in store
+      try {
+        const { getStore } = await import("@/lib/hooks/use-settings");
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        const store = await getStore();
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        const freshSettings = await store.get<any>("settings");
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        if (freshSettings?.chatHistory) {
+          await store.set("settings", {
+            ...freshSettings,
+            chatHistory: {
+              ...freshSettings.chatHistory,
+              activeConversationId: conv.id,
+            },
+          });
+          if (!conversationOperationIsCurrent(operationBoundary)) return;
+          await store.save();
+          if (!conversationOperationIsCurrent(operationBoundary)) return;
+        }
+      } catch (e) {
+        console.warn("Failed to update active conversation:", e);
+      }
+
+      // Emit the preset ID so the chat panel can restore the model selection.
+      // This ensures the model selector reflects the preset used in this chat.
+      const presetId =
+        persisted?.presetId ?? (conv as ChatConversation).presetId;
+      if (presetId && conversationOperationIsCurrent(operationBoundary)) {
+        try {
+          await emit("chat-preset-restore", { presetId });
+        } catch {
+          // ignore broadcast failures
+        }
+      }
+    } finally {
+      finishConversationOperation(operationBoundary);
     }
   };
 
@@ -1355,132 +1628,168 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
 
     const branchedMessages = messages.slice(0, msgIndex + 1);
     if (branchedMessages.length === 0) return;
-
-    const { useChatStore } = await import("@/lib/stores/chat-store");
-    const store = useChatStore.getState();
-    const outgoingSid = piSessionIdRef.current;
-    if (outgoingSid && store.sessions[outgoingSid]) {
-      const outgoingKind = store.sessions[outgoingSid].kind;
-      if (outgoingKind !== "pipe-watch") {
-        store.actions.snapshotSession(outgoingSid, {
-          messages: messages as any,
-          streamingText: piStreamingTextRef.current,
-          streamingMessageId: piMessageIdRef.current,
-          contentBlocks: [...piContentBlocksRef.current],
-          isStreaming,
-          isLoading,
-        });
-      }
-    }
-
-    const newId = crypto.randomUUID();
-    const currentTitle = store.sessions[outgoingSid]?.title?.trim();
-    const title = currentTitle || "Branched Chat";
-    const createdAt = Date.now();
-    const lastUserMessageAt = [...branchedMessages]
-      .reverse()
-      .find((m) => m.role === "user")?.timestamp;
-
-    const conversation: ChatConversation = {
-      id: newId,
-      title,
-      messages: branchedMessages.slice(-100).map((m) => {
-        let content = m.content;
-        if (!content && m.contentBlocks?.length) {
-          content = m.contentBlocks
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text)
-            .join("\n") || "(tool result)";
+    invalidatePendingAttachmentWork?.();
+    const operationBoundary = beginConversationOperation();
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (!conversationOperationIsCurrent(operationBoundary)) return;
+      const store = useChatStore.getState();
+      const outgoingSid = piSessionIdRef.current;
+      if (outgoingSid && store.sessions[outgoingSid]) {
+        const outgoingKind = store.sessions[outgoingSid].kind;
+        if (outgoingKind !== "pipe-watch") {
+          store.actions.snapshotSession(outgoingSid, {
+            messages: messages as any,
+            streamingText: piStreamingTextRef.current,
+            streamingMessageId: piMessageIdRef.current,
+            contentBlocks: [...piContentBlocksRef.current],
+            isStreaming,
+            isLoading,
+          });
         }
-        const blocks = m.contentBlocks?.map((b: any) => {
-          if (b.type === "tool") {
-            const { isRunning, ...rest } = b.toolCall;
-            return { type: "tool", toolCall: { ...rest, isRunning: false, result: rest.result?.slice(0, 4000) } };
-          }
-          if (b.type === "thinking") return { ...b, isThinking: false };
-          return b;
-        });
-        return {
-          id: m.id,
-          role: m.role,
-          content,
-          ...(m.intent ? { intent: m.intent } : {}),
-          ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
-          timestamp: m.timestamp,
-          ...(m.displayContent ? { displayContent: m.displayContent } : {}),
-          ...(blocks?.length ? { contentBlocks: blocks } : {}),
-          ...(m.images?.length ? { images: m.images } : {}),
-          ...((m as any).attachments?.length ? { attachments: (m as any).attachments } : {}),
-          ...(m.model ? { model: m.model } : {}),
-          ...(m.provider ? { provider: m.provider } : {}),
-          ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
-          ...(m.steeredResponse ? { steeredResponse: true } : {}),
-          ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
-          ...(m.stoppedByUser ? { stoppedByUser: true } : {}),
-        };
-      }),
-      createdAt,
-      updatedAt: createdAt,
-      ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
-    };
-
-    await saveConversationFile(conversation);
-    await refreshFileConversations();
-
-    try {
-      store.actions.upsert({
-        id: newId,
-        title: conversation.title,
-        preview: "",
-        status: "idle",
-        messageCount: conversation.messages.length,
-        createdAt: conversation.createdAt,
-        updatedAt: conversation.updatedAt,
-        pinned: false,
-        hidden: false,
-        unread: false,
-        draft: false,
-        ...(conversation.lastUserMessageAt
-          ? { lastUserMessageAt: conversation.lastUserMessageAt }
-          : {}),
-      });
-      store.actions.setMessages(newId, conversation.messages as any);
-      store.actions.setCurrent(newId);
-      store.actions.setPanelSession(newId);
-    } catch (e) {
-      console.warn("[chat] failed to sync branched conversation to store:", e);
-    }
-
-    try {
-      await emit("chat-conversation-saved", {
-        id: conversation.id,
-        title: conversation.title,
-      });
-    } catch {
-      // ignore broadcast failures; local branch save already succeeded
-    }
-    emit("chat-current-session", { id: newId });
-
-    // Switch to the branched conversation
-    piSessionIdRef.current = newId;
-    piSessionSyncedRef.current = false;
-    setMessages(branchedMessages);
-    setConversationId(newId);
-    setShowHistory(false);
-
-    try {
-      const { getStore } = await import("@/lib/hooks/use-settings");
-      const store = await getStore();
-      const freshSettings = await store.get<any>("settings");
-      if (freshSettings?.chatHistory) {
-        await store.set("settings", {
-          ...freshSettings,
-          chatHistory: { ...freshSettings.chatHistory, activeConversationId: newId },
-        });
-        await store.save();
       }
-    } catch (e) {
-      console.warn("[chat] failed to update activeConversationId for branch:", e);
+
+      const newId = crypto.randomUUID();
+      const currentTitle = store.sessions[outgoingSid]?.title?.trim();
+      const title = currentTitle || "Branched Chat";
+      const createdAt = Date.now();
+      const lastUserMessageAt = [...branchedMessages]
+        .reverse()
+        .find((m) => m.role === "user")?.timestamp;
+
+      const conversation: ChatConversation = {
+        id: newId,
+        title,
+        messages: branchedMessages.slice(-100).map((m) => {
+          let content = m.content;
+          if (!content && m.contentBlocks?.length) {
+            content =
+              m.contentBlocks
+                .filter((b: any) => b.type === "text")
+                .map((b: any) => b.text)
+                .join("\n") || "(tool result)";
+          }
+          const blocks = m.contentBlocks?.map((b: any) => {
+            if (b.type === "tool") {
+              const { isRunning, ...rest } = b.toolCall;
+              return {
+                type: "tool",
+                toolCall: {
+                  ...rest,
+                  isRunning: false,
+                  result: rest.result?.slice(0, 4000),
+                },
+              };
+            }
+            if (b.type === "thinking") return { ...b, isThinking: false };
+            return b;
+          });
+          return {
+            id: m.id,
+            role: m.role,
+            content,
+            ...(m.intent ? { intent: m.intent } : {}),
+            ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
+            timestamp: m.timestamp,
+            ...(m.displayContent ? { displayContent: m.displayContent } : {}),
+            ...(blocks?.length ? { contentBlocks: blocks } : {}),
+            ...(m.images?.length ? { images: m.images } : {}),
+            ...((m as any).attachments?.length
+              ? { attachments: (m as any).attachments }
+              : {}),
+            ...(m.hostedTurnId ? { hostedTurnId: m.hostedTurnId } : {}),
+            ...(m.hostedTurnPrompt
+              ? { hostedTurnPrompt: m.hostedTurnPrompt }
+              : {}),
+            ...(m.model ? { model: m.model } : {}),
+            ...(m.provider ? { provider: m.provider } : {}),
+            ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
+            ...(m.steeredResponse ? { steeredResponse: true } : {}),
+            ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
+            ...(m.stoppedByUser ? { stoppedByUser: true } : {}),
+          };
+        }),
+        createdAt,
+        updatedAt: createdAt,
+        ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
+      };
+
+      await saveConversationFile(conversation);
+      if (!conversationOperationIsCurrent(operationBoundary)) return;
+      await refreshFileConversations();
+      if (!conversationOperationIsCurrent(operationBoundary)) return;
+
+      try {
+        store.actions.upsert({
+          id: newId,
+          title: conversation.title,
+          preview: "",
+          status: "idle",
+          messageCount: conversation.messages.length,
+          createdAt: conversation.createdAt,
+          updatedAt: conversation.updatedAt,
+          pinned: false,
+          hidden: false,
+          unread: false,
+          draft: false,
+          ...(conversation.lastUserMessageAt
+            ? { lastUserMessageAt: conversation.lastUserMessageAt }
+            : {}),
+        });
+        store.actions.setMessages(newId, conversation.messages as any);
+        store.actions.setCurrent(newId);
+        store.actions.setPanelSession(newId);
+      } catch (e) {
+        console.warn(
+          "[chat] failed to sync branched conversation to store:",
+          e,
+        );
+      }
+
+      try {
+        await emit("chat-conversation-saved", {
+          id: conversation.id,
+          title: conversation.title,
+        });
+      } catch {
+        // ignore broadcast failures; local branch save already succeeded
+      }
+      if (!conversationOperationIsCurrent(operationBoundary)) return;
+      emit("chat-current-session", { id: newId });
+
+      // Switch to the branched conversation
+      piSessionIdRef.current = newId;
+      piSessionSyncedRef.current = false;
+      setMessages(branchedMessages);
+      setConversationId(newId);
+      setShowHistory(false);
+
+      try {
+        const { getStore } = await import("@/lib/hooks/use-settings");
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        const store = await getStore();
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        const freshSettings = await store.get<any>("settings");
+        if (!conversationOperationIsCurrent(operationBoundary)) return;
+        if (freshSettings?.chatHistory) {
+          await store.set("settings", {
+            ...freshSettings,
+            chatHistory: {
+              ...freshSettings.chatHistory,
+              activeConversationId: newId,
+            },
+          });
+          if (!conversationOperationIsCurrent(operationBoundary)) return;
+          await store.save();
+        }
+      } catch (e) {
+        console.warn(
+          "[chat] failed to update activeConversationId for branch:",
+          e,
+        );
+      }
+    } finally {
+      finishConversationOperation(operationBoundary);
     }
   };
 
@@ -1495,74 +1804,85 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // chat agree from message 0). Passing one avoids the
   // generate-then-overwrite dance which left store.currentId pointing
   // at the throwaway uuid.
-  const startNewConversation = async (explicitId?: string) => {
-    // Snapshot OUTGOING session into the store so the previous chat's
-    // in-flight state survives the switch to "new chat". Without this,
-    // hitting "+ new chat" in the middle of a stream would silently
-    // discard everything the user couldn't yet see, even though the
-    // Pi process keeps running. Mirrors the snapshot in loadConversation.
-    const { useChatStore, getOrCreateEmptyChatId } = await import("@/lib/stores/chat-store");
-    const store = useChatStore.getState();
-    const outgoingSid = piSessionIdRef.current;
-    if (outgoingSid && store.sessions[outgoingSid]) {
-      store.actions.snapshotSession(outgoingSid, {
-        messages: messages as any,
-        streamingText: piStreamingTextRef.current,
-        streamingMessageId: piMessageIdRef.current,
-        contentBlocks: [...piContentBlocksRef.current],
-        isStreaming,
-        isLoading,
-      });
-      // Snapshot the outgoing composer draft so coming back to this
-      // chat (via the sidebar) restores text + attachments. Same
-      // shape as the snapshot in loadConversation.
-      if (inputValueRef && pastedImagesRef) {
-        store.actions.setComposerDraft(outgoingSid, {
-          input: inputValueRef.current,
-          pastedImages: [...pastedImagesRef.current],
-          attachedDocs: attachedDocsRef ? [...attachedDocsRef.current] : [],
-          pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
+  const startNewConversation = async (
+    explicitId?: string,
+  ): Promise<string | null> => {
+    invalidatePendingAttachmentWork?.();
+    const operationBoundary = beginConversationOperation();
+    try {
+      // Snapshot OUTGOING session into the store so the previous chat's
+      // in-flight state survives the switch to "new chat". Without this,
+      // hitting "+ new chat" in the middle of a stream would silently
+      // discard everything the user couldn't yet see, even though the
+      // Pi process keeps running. Mirrors the snapshot in loadConversation.
+      const { useChatStore, getOrCreateEmptyChatId } =
+        await import("@/lib/stores/chat-store");
+      if (!conversationOperationIsCurrent(operationBoundary)) return null;
+      const store = useChatStore.getState();
+      const outgoingSid = piSessionIdRef.current;
+      if (outgoingSid && store.sessions[outgoingSid]) {
+        store.actions.snapshotSession(outgoingSid, {
+          messages: messages as any,
+          streamingText: piStreamingTextRef.current,
+          streamingMessageId: piMessageIdRef.current,
+          contentBlocks: [...piContentBlocksRef.current],
+          isStreaming,
+          isLoading,
         });
+        // Snapshot the outgoing composer draft so coming back to this
+        // chat (via the sidebar) restores text + attachments. Same
+        // shape as the snapshot in loadConversation.
+        if (inputValueRef && pastedImagesRef) {
+          store.actions.setComposerDraft(outgoingSid, {
+            input: inputValueRef.current,
+            pastedImages: [...pastedImagesRef.current],
+            attachedDocs: attachedDocsRef ? [...attachedDocsRef.current] : [],
+            pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
+          });
+        }
       }
+
+      // Clear panel state
+      piStreamingTextRef.current = "";
+      piMessageIdRef.current = null;
+      piContentBlocksRef.current = [];
+      setIsLoading(false);
+      setIsStreaming(false);
+      setMessages([]);
+      setConversationId(null);
+      setInput("");
+      if (inputRef.current) inputRef.current.style.height = "auto";
+      setShowHistory(false);
+      setPastedImages([]);
+      // Clear any in-progress doc attachments — they belong to the chat the
+      // user was on, not to the new one we're switching to.
+      setAttachedDocs?.([]);
+      setPendingDocs?.([]);
+
+      // New session ID — Pi will be started fresh when the first message is sent.
+      // Pair with setCurrent so the router immediately knows the new id is
+      // foreground (and won't accumulate writes for it). See the matching
+      // pairing in loadConversation for the same reasoning.
+      // Reuse an existing empty chat when the caller didn't pin an id (#4719),
+      // so a header "+ new chat" (or an agent-evicted / post-delete restart)
+      // doesn't mint a throwaway uuid when a blank chat is already available.
+      const newSid = explicitId ?? getOrCreateEmptyChatId().id;
+      piSessionIdRef.current = newSid;
+      piSessionSyncedRef.current = true;
+      store.actions.setCurrent(newSid);
+      // Set conversationId to the new Pi session id immediately. The chat
+      // panel's foreground bus registration (registerForeground) is keyed by
+      // conversationId, and Pi events arrive with sessionId === piSessionId.
+      // If we leave conversationId null until first save, the panel never
+      // registers — Pi events go to the default handler, the chat-shaped
+      // handlers in the panel never fire, and isLoading stays true forever
+      // ("analyzing…" stuck). Setting conversationId here keeps the
+      // foreground key in sync with piSessionIdRef from message 0.
+      setConversationId(newSid);
+      return newSid;
+    } finally {
+      finishConversationOperation(operationBoundary);
     }
-
-    // Clear panel state
-    piStreamingTextRef.current = "";
-    piMessageIdRef.current = null;
-    piContentBlocksRef.current = [];
-    setIsLoading(false);
-    setIsStreaming(false);
-    setMessages([]);
-    setConversationId(null);
-    setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
-    setShowHistory(false);
-    setPastedImages([]);
-    // Clear any in-progress doc attachments — they belong to the chat the
-    // user was on, not to the new one we're switching to.
-    setAttachedDocs?.([]);
-    setPendingDocs?.([]);
-
-    // New session ID — Pi will be started fresh when the first message is sent.
-    // Pair with setCurrent so the router immediately knows the new id is
-    // foreground (and won't accumulate writes for it). See the matching
-    // pairing in loadConversation for the same reasoning.
-    // Reuse an existing empty chat when the caller didn't pin an id (#4719),
-    // so a header "+ new chat" (or an agent-evicted / post-delete restart)
-    // doesn't mint a throwaway uuid when a blank chat is already available.
-    const newSid = explicitId ?? getOrCreateEmptyChatId().id;
-    piSessionIdRef.current = newSid;
-    piSessionSyncedRef.current = true;
-    store.actions.setCurrent(newSid);
-    // Set conversationId to the new Pi session id immediately. The chat
-    // panel's foreground bus registration (registerForeground) is keyed by
-    // conversationId, and Pi events arrive with sessionId === piSessionId.
-    // If we leave conversationId null until first save, the panel never
-    // registers — Pi events go to the default handler, the chat-shaped
-    // handlers in the panel never fire, and isLoading stays true forever
-    // ("analyzing…" stuck). Setting conversationId here keeps the
-    // foreground key in sync with piSessionIdRef from message 0.
-    setConversationId(newSid);
   };
 
   // ---- filteredConversations ----
@@ -1594,10 +1914,14 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }
     }
 
-    if (todayConvs.length > 0) groups.push({ label: "Today", conversations: todayConvs });
-    if (yesterdayConvs.length > 0) groups.push({ label: "Yesterday", conversations: yesterdayConvs });
-    if (lastWeekConvs.length > 0) groups.push({ label: "Last 7 Days", conversations: lastWeekConvs });
-    if (olderConvs.length > 0) groups.push({ label: "Older", conversations: olderConvs });
+    if (todayConvs.length > 0)
+      groups.push({ label: "Today", conversations: todayConvs });
+    if (yesterdayConvs.length > 0)
+      groups.push({ label: "Yesterday", conversations: yesterdayConvs });
+    if (lastWeekConvs.length > 0)
+      groups.push({ label: "Last 7 Days", conversations: lastWeekConvs });
+    if (olderConvs.length > 0)
+      groups.push({ label: "Older", conversations: olderConvs });
 
     return groups;
   }, [filteredConversations]);
@@ -1615,5 +1939,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     renameConversation,
     startNewConversation,
     branchConversation,
+    conversationOperationPending,
+    conversationOperationPendingRef,
+    cancelConversationOperations,
   };
 }

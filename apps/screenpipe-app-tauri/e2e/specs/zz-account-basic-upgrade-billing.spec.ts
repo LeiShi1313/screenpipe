@@ -219,7 +219,11 @@ async function clearBasicAccountUser(): Promise<void> {
   }
 
   // Keep this spec isolated even if the UI logout is interrupted by a reload.
-  const result = await invoke("set_cloud_token", { token: null });
+  const result = await invoke("set_cloud_token", {
+    token: null,
+    expectedCurrentToken: null,
+    forceClear: true,
+  });
   expect(result.ok).toBe(true);
   await browser.waitUntil(
     async () => (await loginStatusText()).includes("not logged in"),

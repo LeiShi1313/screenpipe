@@ -9,6 +9,9 @@ import { platform } from "@tauri-apps/plugin-os";
 import { commands } from "@/lib/utils/tauri";
 import { getStore } from "@/lib/hooks/use-settings";
 import { localFetch } from "@/lib/api";
+import { hasEnabledCodexMcp } from "@/lib/utils/codex-mcp-config";
+
+export { hasEnabledCodexMcp } from "@/lib/utils/codex-mcp-config";
 
 export interface HardcodedTile {
   id: string;
@@ -130,13 +133,6 @@ export async function isCursorMcpInstalled(): Promise<boolean> {
 export async function getCodexConfigPath(): Promise<string> {
   const home = await homeDir();
   return join(home, ".codex", "config.toml");
-}
-
-const CODEX_SCREENPIPE_TABLE = /(?:^|\n)\[mcp_servers\.screenpipe\][\s\S]*?(?=\n\[(?!mcp_servers\.screenpipe(?:\.|\]))[^\]]+\]|\s*$)/;
-
-export function hasEnabledCodexMcp(content: string): boolean {
-  const table = content.match(CODEX_SCREENPIPE_TABLE)?.[0] ?? "";
-  return !!table && !/^\s*enabled\s*=\s*false\s*$/m.test(table);
 }
 
 export async function isCodexMcpInstalled(): Promise<boolean> {

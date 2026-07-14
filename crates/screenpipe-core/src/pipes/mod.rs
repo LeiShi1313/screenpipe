@@ -20,8 +20,7 @@ pub mod sync;
 pub(crate) mod trajectory;
 
 use crate::agents::{
-    pi::{PiExecutor, SCREENPIPE_API_URL},
-    AgentExecutor, ExecutionHandle, SharedPid, STOP_REQUESTED_PID,
+    pi::PiExecutor, AgentExecutor, ExecutionHandle, SharedPid, STOP_REQUESTED_PID,
 };
 use crate::pipes::connections::parse_mcp_connection_id;
 use crate::pipes::mcp_access::McpSessionAccessRegistry;
@@ -1143,9 +1142,13 @@ pub trait PipeStore: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Resolved model + provider from an AI preset.
+#[derive(Debug)]
 struct ResolvedPreset {
     model: String,
-    provider: Option<String>,
+    /// Canonical Pi provider name. Persisted presets must always resolve to an
+    /// explicit provider; `None` means Screenpipe Cloud elsewhere in the
+    /// executor and is therefore unsafe for malformed/unknown saved values.
+    provider: String,
     /// Provider base URL (e.g. `http://localhost:11434/v1` for Ollama).
     url: Option<String>,
     /// API key for the provider (custom / openai BYOK).
@@ -1158,7 +1161,7 @@ struct ResolvedPreset {
 ///
 /// Primary source: secrets store (`oauth:chatgpt` key in encrypted SQLite DB).
 /// Fallback: legacy `chatgpt-oauth.json` file for pre-migration installs.
-fn read_chatgpt_oauth_token() -> Option<String> {
+pub(crate) fn read_chatgpt_oauth_token() -> Option<String> {
     // Try secrets store first (current path)
     #[cfg(feature = "secrets")]
     {
@@ -1367,52 +1370,74 @@ fn read_store_bin(path: &Path) -> Option<serde_json::Value> {
 }
 
 /// Read `~/.screenpipe/store.bin` and find the preset by id.
-/// Falls back to the default preset if `preset_id` is `"default"`.
-/// Creates store.bin with a default preset if it doesn't exist (CLI mode).
-fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
+/// Resolves `"default"` to the explicitly marked default preset.
+/// Creates store.bin with the current safe `auto` cloud preset if it doesn't
+/// exist (CLI mode). A matched preset with a missing/unknown provider is an
+/// error: it must never collapse to `None`, which the executor interprets as
+/// Screenpipe Cloud.
+fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Result<Option<ResolvedPreset>> {
     // store.bin lives at ~/.screenpipe/store.bin (sibling of pipes/)
-    let store_path = pipes_dir.parent()?.join("store.bin");
+    let parent = pipes_dir.parent().ok_or_else(|| {
+        anyhow!(
+            "cannot resolve AI preset '{}': pipes directory has no parent",
+            preset_id
+        )
+    })?;
+    let store_path = parent.join("store.bin");
 
     if !store_path.exists() {
         // Bootstrap for CLI users who don't have the app.
-        // Default to screenpipe cloud — user needs SCREENPIPE_API_KEY env var.
-        // Mirrors the app's first-install seed (use-settings.tsx makeDefaultPresets):
-        // non-pro Sonnet for chat, Haiku for pipes. Users can swap to Opus 4.7 later.
+        // Mirror the app's current non-pro first-install seed: an explicit
+        // Screenpipe Cloud provider on `auto`. The gateway remains the source
+        // of truth for model/entitlement routing; never pin a stale paid model.
         let default_store = serde_json::json!({
             "settings": {
                 "aiPresets": [
                     {
-                        "id": "chat",
-                        "model": "claude-sonnet-4-5",
+                        "id": "screenpipe",
+                        "model": "auto",
                         "provider": "screenpipe-cloud",
                         "defaultPreset": true,
-                        "maxContextChars": 200000
-                    },
-                    {
-                        "id": "pipes",
-                        "model": "claude-haiku-4-5",
-                        "provider": "screenpipe-cloud",
-                        "defaultPreset": false,
                         "maxContextChars": 200000
                     }
                 ]
             }
         });
-        if let Ok(json) = serde_json::to_string_pretty(&default_store) {
-            let _ = std::fs::write(&store_path, &json);
-            // Restrict permissions — file contains API keys and credentials
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600));
-            }
-            info!("created store.bin with default presets (chat: sonnet, pipes: haiku)");
+        let json = serde_json::to_string_pretty(&default_store)?;
+        std::fs::write(&store_path, &json).map_err(|error| {
+            anyhow!(
+                "failed to create default AI preset store at {}: {}",
+                store_path.display(),
+                error
+            )
+        })?;
+        // Restrict permissions — file can contain API keys and credentials.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600));
         }
+        info!("created store.bin with explicit screenpipe-cloud/auto preset");
     }
 
-    let store = read_store_bin(&store_path)?;
-    let presets = store.get("settings")?.get("aiPresets")?.as_array()?;
+    let store = read_store_bin(&store_path).ok_or_else(|| {
+        anyhow!(
+            "cannot resolve AI preset '{}': {} is unreadable, malformed, or encrypted without an available key",
+            preset_id,
+            store_path.display()
+        )
+    })?;
+    let presets = store
+        .get("settings")
+        .and_then(|settings| settings.get("aiPresets"))
+        .and_then(|presets| presets.as_array())
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot resolve AI preset '{}': settings.aiPresets is missing or invalid in {}",
+                preset_id,
+                store_path.display()
+            )
+        })?;
 
     // Normalize legacy preset IDs to current names
     let normalized_id = match preset_id {
@@ -1438,30 +1463,61 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
                     .iter()
                     .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(preset_id))
             })
-    }?;
+    };
 
-    let model = preset.get("model")?.as_str()?.to_string();
+    let Some(preset) = preset else {
+        return Ok(None);
+    };
 
-    // Map app provider types to pipe provider strings
-    let provider = preset
+    let model = preset
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("AI preset '{}' has no valid model", preset_id))?
+        .to_string();
+
+    // Map persisted app provider types to canonical Pi provider strings. Keep
+    // this exhaustive and fail closed: unknown/missing values previously
+    // became None, which Pi interpreted as Screenpipe Cloud.
+    let persisted_provider = preset
         .get("provider")
         .and_then(|v| v.as_str())
-        .and_then(|p| match p {
-            "screenpipe-cloud" | "pi" => Some("screenpipe"),
-            "native-ollama" => Some("ollama"),
-            "openai" => Some("openai"),
-            "openai-chatgpt" => Some("openai-chatgpt"),
-            "anthropic" => Some("anthropic"),
-            "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
-            _ => None,
-        })
-        .map(|s| s.to_string());
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("AI preset '{}' has no provider", preset_id))?;
+    let provider = match persisted_provider {
+        "screenpipe-cloud" | "pi" => "screenpipe",
+        // `ollama` is accepted as the legacy CLI spelling, but both spellings
+        // resolve only to Pi's local Ollama provider.
+        "native-ollama" | "ollama" => "ollama",
+        "openai" => "openai",
+        "openai-chatgpt" => "openai-chatgpt",
+        "anthropic" => "anthropic",
+        "custom" => "custom",
+        other => {
+            return Err(anyhow!(
+                "AI preset '{}' uses unsupported provider '{}'; refusing to fall back to Screenpipe Cloud",
+                preset_id,
+                other
+            ));
+        }
+    }
+    .to_string();
 
     let url = preset
         .get("url")
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+
+    if provider == "custom" && url.is_none() {
+        return Err(anyhow!(
+            "AI preset '{}' uses custom provider but has no provider URL",
+            preset_id
+        ));
+    }
 
     let mut api_key = preset
         .get("apiKey")
@@ -1471,7 +1527,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
 
     // ChatGPT OAuth: read token from secrets store (primary) or legacy file (fallback),
     // auto-refreshing if expired.
-    if provider.as_deref() == Some("openai-chatgpt") && api_key.is_none() {
+    if provider == "openai-chatgpt" && api_key.is_none() {
         api_key = read_chatgpt_oauth_token();
     }
 
@@ -1481,13 +1537,13 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    Some(ResolvedPreset {
+    Ok(Some(ResolvedPreset {
         model,
         provider,
         url,
         api_key,
         prompt,
-    })
+    }))
 }
 
 /// Enumerate the preset IDs currently in `store.bin`, for surfacing in error
@@ -1510,6 +1566,27 @@ fn list_available_preset_ids(pipes_dir: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Resolve a preset that a pipe is about to execute. Missing, unreadable, or
+/// invalid selected/default presets are execution errors rather than an
+/// invitation to fall through to `provider: None` (Screenpipe Cloud).
+fn resolve_required_preset(pipes_dir: &Path, preset_id: &str) -> Result<ResolvedPreset> {
+    if let Some(resolved) = resolve_preset(pipes_dir, preset_id)? {
+        return Ok(resolved);
+    }
+
+    let available = list_available_preset_ids(pipes_dir);
+    let available_hint = if available.is_empty() {
+        String::from("no presets are configured")
+    } else {
+        format!("available presets: {}", available.join(", "))
+    };
+    Err(anyhow!(
+        "AI preset '{}' not found in settings — {}",
+        preset_id,
+        available_hint
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2755,6 +2832,31 @@ impl PipeManager {
             ));
         }
 
+        // Resolve before claiming the running/PID locks. A missing, unreadable,
+        // or invalid selected preset is a visible start error and must never
+        // fall through to config.provider=None (hosted Screenpipe Cloud).
+        let selected_preset = config
+            .preset
+            .first()
+            .map(String::as_str)
+            .unwrap_or("default");
+        let resolved =
+            resolve_required_preset(&self.pipes_dir, selected_preset).map_err(|error| {
+                anyhow!(
+                    "pipe '{}': cannot use preset '{}': {}",
+                    name,
+                    selected_preset,
+                    error
+                )
+            })?;
+        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) = (
+            resolved.model,
+            Some(resolved.provider),
+            resolved.url,
+            resolved.api_key,
+            resolved.prompt,
+        );
+
         // Shared PID — updated synchronously by the executor as soon as the
         // subprocess spawns. The stop API can set an early-stop sentinel on
         // this atomic before the PID exists.
@@ -2800,45 +2902,6 @@ impl PipeManager {
         // write our own PID — for in-process pi-agent runs there is no child,
         // and a self-PID file would make the next startup SIGKILL the app.
         write_pid_file(&self.pipes_dir, name, 0);
-
-        // Resolve preset
-        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) =
-            if let Some(preset_id) = config.preset.first() {
-                match resolve_preset(&self.pipes_dir, preset_id) {
-                    Some(resolved) => (
-                        resolved.model,
-                        resolved.provider,
-                        resolved.url,
-                        resolved.api_key,
-                        resolved.prompt,
-                    ),
-                    None => (
-                        config.model.clone(),
-                        config.provider.clone(),
-                        None,
-                        None,
-                        None,
-                    ),
-                }
-            } else {
-                // No preset — use user's default preset
-                match resolve_preset(&self.pipes_dir, "default") {
-                    Some(resolved) => (
-                        resolved.model,
-                        resolved.provider,
-                        resolved.url,
-                        resolved.api_key,
-                        resolved.prompt,
-                    ),
-                    None => (
-                        config.model.clone(),
-                        config.provider.clone(),
-                        None,
-                        None,
-                        None,
-                    ),
-                }
-            };
 
         // Create DB execution row
         let exec_id = if let Some(ref store) = self.store {
@@ -2895,22 +2958,8 @@ impl PipeManager {
             self.pipes_dir.clone(),
         );
 
-        // Pre-configure pi
         let mut pipe_token: Option<String> = None;
         if config.agent == "pi" {
-            let cloud_token = executor.user_token();
-            if let Err(e) = PiExecutor::ensure_pi_config(
-                cloud_token.as_deref(),
-                SCREENPIPE_API_URL,
-                run_provider.as_deref(),
-                Some(&run_model),
-                run_provider_url.as_deref(),
-            )
-            .await
-            {
-                warn!("failed to pre-configure pi provider: {}", e);
-            }
-
             pipe_token =
                 setup_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await;
         }
@@ -3312,10 +3361,10 @@ impl PipeManager {
                     .pick_preset_with_floor(&config.preset, retry_depth)
                     .ok_or_else(|| anyhow!("pipe '{}': no presets configured", name))?;
 
-                match resolve_preset(&self.pipes_dir, preset_id) {
-                    Some(resolved) => {
+                match resolve_required_preset(&self.pipes_dir, preset_id) {
+                    Ok(resolved) => {
                         info!(
-                            "pipe '{}': using preset '{}' → model={}, provider={:?}{}",
+                            "pipe '{}': using preset '{}' → model={}, provider={}{}",
                             name,
                             preset_id,
                             resolved.model,
@@ -3328,7 +3377,7 @@ impl PipeManager {
                         );
                         (
                             resolved.model,
-                            resolved.provider,
+                            Some(resolved.provider),
                             resolved.url,
                             resolved.api_key,
                             resolved.prompt,
@@ -3336,21 +3385,17 @@ impl PipeManager {
                             Some(idx),
                         )
                     }
-                    None => {
-                        let available = list_available_preset_ids(&self.pipes_dir);
-                        let available_hint = if available.is_empty() {
-                            String::from("no presets are configured")
-                        } else {
-                            format!("available presets: {}", available.join(", "))
-                        };
+                    Err(error) => {
+                        self.running.lock().await.remove(name);
+                        remove_pid_file(&self.pipes_dir, name);
                         return Err(anyhow!(
-                            "pipe '{}': preset '{}' not found in settings — {}. \
+                            "pipe '{}': cannot use preset '{}': {}. \
                              Set one of those in the pipe's `preset:` field, or \
                              create a new preset with `screenpipe pipe models create {} --provider … --model …`, \
                              or remove the `preset:` line to use the default.",
                             name,
                             preset_id,
-                            available_hint,
+                            error,
                             preset_id
                         ));
                     }
@@ -3359,15 +3404,15 @@ impl PipeManager {
                 // No preset in pipe config — use the user's default preset
                 // so pipes respect the user's AI settings instead of silently
                 // falling through to screenpipe cloud.
-                match resolve_preset(&self.pipes_dir, "default") {
-                    Some(resolved) => {
+                match resolve_required_preset(&self.pipes_dir, "default") {
+                    Ok(resolved) => {
                         info!(
-                            "pipe '{}': no preset configured, using user's default preset → model={}, provider={:?}",
+                            "pipe '{}': no preset configured, using user's default preset → model={}, provider={}",
                             name, resolved.model, resolved.provider
                         );
                         (
                             resolved.model,
-                            resolved.provider,
+                            Some(resolved.provider),
                             resolved.url,
                             resolved.api_key,
                             resolved.prompt,
@@ -3375,17 +3420,14 @@ impl PipeManager {
                             None,
                         )
                     }
-                    None => {
-                        // No default preset found — fall back to pipe's own config
-                        (
-                            config.model.clone(),
-                            config.provider.clone(),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
+                    Err(error) => {
+                        self.running.lock().await.remove(name);
+                        remove_pid_file(&self.pipes_dir, name);
+                        return Err(anyhow!(
+                            "pipe '{}': cannot use the default AI preset: {}",
+                            name,
+                            error
+                        ));
                     }
                 }
             };
@@ -3444,22 +3486,8 @@ impl PipeManager {
                 self.pipes_dir.clone(),
             );
 
-            // Pre-configure pi with the pipe's provider so models.json has the
-            // right entry before the agent subprocess starts.
             let mut pipe_token: Option<String> = None;
             if config.agent == "pi" {
-                if let Err(e) = PiExecutor::ensure_pi_config(
-                    None,
-                    SCREENPIPE_API_URL,
-                    run_provider.as_deref(),
-                    Some(&run_model),
-                    run_provider_url.as_deref(),
-                )
-                .await
-                {
-                    warn!("failed to pre-configure pi provider: {}", e);
-                }
-
                 pipe_token = setup_pipe_permissions(
                     &self.pipes_dir.join(name),
                     &config,
@@ -4238,6 +4266,72 @@ impl PipeManager {
         }
     }
 
+    /// Stop every pipe execution currently owned by this manager.
+    ///
+    /// Credential rotations use this as a fail-closed boundary: a Pi child
+    /// receives provider credentials at spawn, so replacing or deleting an
+    /// OAuth identity must drain already-dispatched background work before the
+    /// durable credential changes. Snapshot names first because `stop_pipe`
+    /// takes the same internal running-map lock.
+    pub async fn stop_all_running_pipes(&self) -> Result<Vec<(String, PipeStopStatus)>> {
+        let mut names = self
+            .running
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+
+        let mut stopped = Vec::with_capacity(names.len());
+        for name in names {
+            let status = self.stop_pipe(&name).await?;
+            stopped.push((name, status));
+        }
+        Ok(stopped)
+    }
+
+    /// Stop all current executions and wait for subprocesses that had already
+    /// published a PID to exit. Pending (PID-less) starts are left marked with
+    /// `STOP_REQUESTED_PID`; executors must check that sentinel before spawn.
+    pub async fn stop_all_running_pipes_and_wait(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<(String, PipeStopStatus)>> {
+        let statuses = self.stop_all_running_pipes().await?;
+        let wait_for = statuses
+            .iter()
+            .filter_map(|(name, status)| {
+                (*status == PipeStopStatus::Stopping).then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        if wait_for.is_empty() {
+            return Ok(statuses);
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let still_alive = {
+                let running = self.running.lock().await;
+                wait_for.iter().any(|name| {
+                    running.get(name).is_some_and(|handle| {
+                        let pid = handle.current_pid();
+                        pid != 0 && !handle.is_finished() && is_process_alive(pid)
+                    })
+                })
+            };
+            if !still_alive {
+                return Ok(statuses);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "timed out waiting for credential-bearing pipe processes to stop"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// Start the background scheduler.  Spawns a tokio task that checks
     /// pipe schedules and runs them when due.
     pub async fn start_scheduler(&mut self) -> Result<()> {
@@ -4634,76 +4728,104 @@ impl PipeManager {
                         qr.insert(name.clone());
                     }
 
-                    // Resolve preset → model/provider overrides (same as run_pipe)
-                    let (model, provider, provider_url, api_key, preset_prompt) = if let Some(
-                        preset_id,
-                    ) =
-                        config.preset.first()
-                    {
-                        match resolve_preset(&pipes_dir, preset_id) {
-                            Some(resolved) => {
-                                info!("scheduler: pipe '{}' using preset '{}' → model={}, provider={:?}",
-                                        name, preset_id, resolved.model, resolved.provider);
-                                (
-                                    resolved.model,
-                                    resolved.provider,
-                                    resolved.url,
-                                    resolved.api_key,
-                                    resolved.prompt,
-                                )
+                    // Resolve the selected/default preset exactly as manual and
+                    // background starts do. Never substitute provider=None on a
+                    // missing/invalid preset: that would spend hosted credits.
+                    let selected_preset = config
+                        .preset
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("default");
+                    let resolved = match resolve_required_preset(&pipes_dir, selected_preset) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let failed_at = Utc::now();
+                            let message = format!(
+                                "pipe '{}' skipped: cannot use AI preset '{}': {}",
+                                name, selected_preset, error
+                            );
+                            error!("scheduler: {}", message);
+                            queued_or_running.lock().await.remove(name);
+
+                            if let Some(ref store) = store {
+                                match store
+                                    .create_execution(
+                                        name,
+                                        if triggered_by_event {
+                                            "event"
+                                        } else {
+                                            "scheduled"
+                                        },
+                                        &config.model,
+                                        config.provider.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(id) => {
+                                        let _ = store
+                                            .finish_execution(
+                                                id,
+                                                "failed",
+                                                "",
+                                                &message,
+                                                None,
+                                                Some("provider_config_invalid"),
+                                                Some(&message),
+                                                None,
+                                            )
+                                            .await;
+                                    }
+                                    Err(store_error) => warn!(
+                                        "scheduler: failed to persist preset resolution error: {}",
+                                        store_error
+                                    ),
+                                }
+                                let _ = store.upsert_scheduler_state(name, false).await;
                             }
-                            None => (
-                                config.model.clone(),
-                                config.provider.clone(),
-                                None,
-                                None,
-                                None,
-                            ),
-                        }
-                    } else {
-                        // No preset in pipe config — use the user's default preset
-                        // so scheduled pipes respect the user's AI settings instead
-                        // of silently falling through to screenpipe cloud.
-                        match resolve_preset(&pipes_dir, "default") {
-                            Some(resolved) => {
-                                info!(
-                                    "scheduler: pipe '{}' has no preset configured, using user's default preset → model={}, provider={:?}",
-                                    name, resolved.model, resolved.provider
-                                );
-                                (
-                                    resolved.model,
-                                    resolved.provider,
-                                    resolved.url,
-                                    resolved.api_key,
-                                    resolved.prompt,
-                                )
+
+                            {
+                                let mut logs_guard = logs.lock().await;
+                                let entry =
+                                    logs_guard.entry(name.clone()).or_insert_with(VecDeque::new);
+                                entry.push_front(PipeRunLog {
+                                    pipe_name: name.clone(),
+                                    started_at: failed_at,
+                                    finished_at: failed_at,
+                                    success: false,
+                                    stdout: String::new(),
+                                    stderr: message.clone(),
+                                });
+                                if entry.len() > PIPE_LOG_ACTIVE_KEEP_PER_PIPE {
+                                    entry.pop_back();
+                                }
                             }
-                            None => (
-                                config.model.clone(),
-                                config.provider.clone(),
-                                None,
-                                None,
-                                None,
-                            ),
+                            if let Some(ref cb) = on_run_complete {
+                                cb(name, None, false, 0.0, Some("provider_config_invalid"));
+                            }
+                            continue;
                         }
                     };
+                    if config.preset.is_empty() {
+                        info!(
+                            "scheduler: pipe '{}' has no preset configured, using user's default preset → model={}, provider={}",
+                            name, resolved.model, resolved.provider
+                        );
+                    } else {
+                        info!(
+                            "scheduler: pipe '{}' using preset '{}' → model={}, provider={}",
+                            name, selected_preset, resolved.model, resolved.provider
+                        );
+                    }
+                    let (model, provider, provider_url, api_key, preset_prompt) = (
+                        resolved.model,
+                        Some(resolved.provider),
+                        resolved.url,
+                        resolved.api_key,
+                        resolved.prompt,
+                    );
 
-                    // Pre-configure pi with the pipe's provider
                     let mut pipe_token: Option<String> = None;
                     if config.agent == "pi" {
-                        let cloud_token = executor.user_token();
-                        if let Err(e) = PiExecutor::ensure_pi_config(
-                            cloud_token.as_deref(),
-                            SCREENPIPE_API_URL,
-                            provider.as_deref(),
-                            Some(&model),
-                            provider_url.as_deref(),
-                        )
-                        .await
-                        {
-                            warn!("scheduler: failed to pre-configure pi provider: {}", e);
-                        }
-
                         pipe_token = setup_pipe_permissions(
                             &pipes_dir.join(name),
                             config,
@@ -6456,18 +6578,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Encode a working-directory path the same way Pi does for session storage.
-/// Pi uses the CWD as a key: `~/.pi/agent/sessions/<encoded-cwd>/`.
+/// Pi uses the CWD as a key below the runtime's `sessions/` directory.
 /// The encoding wraps the path with `--` and replaces `/` (or `\`) with `-`.
 /// Example: `/Users/me/.screenpipe/pipes/foo/` → `--Users-me-.screenpipe-pipes-foo--`
-fn encode_pi_session_dir(working_dir: &Path) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let sessions_base = home.join(".pi").join("agent").join("sessions");
-    // Pi encodes: strip leading/trailing separators, replace all separators
-    // with `-`, wrap with `--` prefix and `--` suffix
+fn encode_pi_session_name(working_dir: &Path) -> String {
     let cwd_str = working_dir.to_string_lossy();
     let stripped = cwd_str.trim_matches(|c| c == '/' || c == '\\');
-    let encoded = format!("--{}--", stripped.replace(['/', '\\'], "-"));
-    Some(sessions_base.join(encoded))
+    format!("--{}--", stripped.replace(['/', '\\'], "-"))
+}
+
+fn encode_pi_session_dir(working_dir: &Path) -> Option<PathBuf> {
+    let runtime = PiExecutor::runtime_config_dir_for_working_dir(working_dir).ok()?;
+    Some(
+        runtime
+            .join("sessions")
+            .join(encode_pi_session_name(working_dir)),
+    )
 }
 
 /// Find the most recently modified Pi session file for a pipe's working directory.
@@ -6491,11 +6617,12 @@ pub fn find_latest_pi_session(pipe_dir: &Path) -> Option<PathBuf> {
 
 /// Delete all Pi session files for a pipe's working directory.
 pub fn delete_pi_sessions(pipe_dir: &Path) -> Result<()> {
-    let session_dir = encode_pi_session_dir(pipe_dir)
-        .ok_or_else(|| anyhow!("could not determine Pi session directory"))?;
-    if session_dir.exists() {
-        std::fs::remove_dir_all(&session_dir)?;
-        info!("deleted Pi sessions at {:?}", session_dir);
+    let removed = crate::agents::pi::delete_pi_runtime_sessions_for_working_dir(pipe_dir)?;
+    if removed > 0 {
+        info!(
+            "deleted Pi sessions for {:?} from {} runtime location(s)",
+            pipe_dir, removed
+        );
     }
     Ok(())
 }
@@ -6530,6 +6657,7 @@ impl Drop for PipeManager {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
+    use serde_json::json;
     use std::sync::atomic::Ordering;
 
     // -- scheduler lifecycle tests ------------------------------------------
@@ -6793,6 +6921,54 @@ mod tests {
         assert_eq!(shared_pid.load(Ordering::SeqCst), STOP_REQUESTED_PID);
         assert!(stop_requested.load(Ordering::SeqCst));
         assert!(pm.running.lock().await.contains_key("demo"));
+    }
+
+    #[tokio::test]
+    async fn stop_all_running_pipes_marks_every_pending_spawn() {
+        let pm = test_pipe_manager();
+        let alpha_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let beta_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        pm.running
+            .lock()
+            .await
+            .insert("beta".to_string(), ExecutionHandle::new(beta_pid.clone()));
+        pm.running
+            .lock()
+            .await
+            .insert("alpha".to_string(), ExecutionHandle::new(alpha_pid.clone()));
+
+        let statuses = pm.stop_all_running_pipes().await.unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![
+                ("alpha".to_string(), PipeStopStatus::StopPending),
+                ("beta".to_string(), PipeStopStatus::StopPending),
+            ]
+        );
+        assert_eq!(alpha_pid.load(Ordering::SeqCst), STOP_REQUESTED_PID);
+        assert_eq!(beta_pid.load(Ordering::SeqCst), STOP_REQUESTED_PID);
+    }
+
+    #[tokio::test]
+    async fn stop_all_and_wait_does_not_block_on_pidless_pending_spawn() {
+        let pm = test_pipe_manager();
+        let shared_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        pm.running.lock().await.insert(
+            "pending".to_string(),
+            ExecutionHandle::new(shared_pid.clone()),
+        );
+
+        let statuses = pm
+            .stop_all_running_pipes_and_wait(std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![("pending".to_string(), PipeStopStatus::StopPending)]
+        );
+        assert_eq!(shared_pid.load(Ordering::SeqCst), STOP_REQUESTED_PID);
     }
 
     #[tokio::test]
@@ -7224,6 +7400,159 @@ mod tests {
     fn test_parse_frontmatter_unclosed() {
         let result = parse_frontmatter("---\nschedule: manual\nno closing");
         assert!(result.is_err());
+    }
+
+    fn write_preset_store(root: &Path, preset: serde_json::Value) -> PathBuf {
+        let pipes_dir = root.join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+        std::fs::write(
+            root.join("store.bin"),
+            serde_json::to_string_pretty(&json!({
+                "settings": {"aiPresets": [preset]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        pipes_dir
+    }
+
+    #[test]
+    fn preset_unknown_provider_fails_without_cloud_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = write_preset_store(
+            root.path(),
+            json!({
+                "id": "future-provider",
+                "model": "future-model",
+                "provider": "new-provider-from-future",
+                "defaultPreset": true
+            }),
+        );
+
+        let error = resolve_required_preset(&pipes_dir, "future-provider")
+            .expect_err("unknown provider must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("unsupported provider 'new-provider-from-future'"));
+        assert!(message.contains("refusing to fall back to Screenpipe Cloud"));
+    }
+
+    #[test]
+    fn preset_missing_provider_fails_without_cloud_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = write_preset_store(
+            root.path(),
+            json!({
+                "id": "missing-provider",
+                "model": "auto",
+                "defaultPreset": true
+            }),
+        );
+
+        let error = resolve_required_preset(&pipes_dir, "missing-provider")
+            .expect_err("missing provider must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "AI preset 'missing-provider' has no provider"
+        );
+    }
+
+    #[test]
+    fn preset_custom_without_url_fails_without_cloud_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = write_preset_store(
+            root.path(),
+            json!({
+                "id": "custom-without-url",
+                "model": "my-model",
+                "provider": "custom",
+                "url": "   ",
+                "defaultPreset": true
+            }),
+        );
+
+        let error = resolve_required_preset(&pipes_dir, "custom-without-url")
+            .expect_err("custom provider without URL must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "AI preset 'custom-without-url' uses custom provider but has no provider URL"
+        );
+    }
+
+    #[test]
+    fn preset_screenpipe_cloud_maps_only_when_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = write_preset_store(
+            root.path(),
+            json!({
+                "id": "hosted",
+                "model": "auto",
+                "provider": "screenpipe-cloud",
+                "defaultPreset": true
+            }),
+        );
+
+        let resolved = resolve_required_preset(&pipes_dir, "hosted").unwrap();
+        assert_eq!(resolved.provider, "screenpipe");
+        assert_eq!(resolved.model, "auto");
+        assert!(resolved.url.is_none());
+    }
+
+    #[test]
+    fn preset_native_ollama_maps_only_to_local_ollama() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = write_preset_store(
+            root.path(),
+            json!({
+                "id": "local",
+                "model": "qwen3:8b",
+                "provider": "native-ollama",
+                "defaultPreset": true
+            }),
+        );
+
+        let resolved = resolve_required_preset(&pipes_dir, "local").unwrap();
+        assert_eq!(resolved.provider, "ollama");
+        assert_eq!(resolved.model, "qwen3:8b");
+    }
+
+    #[test]
+    fn missing_selected_preset_is_an_error_for_all_start_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = write_preset_store(
+            root.path(),
+            json!({
+                "id": "existing",
+                "model": "auto",
+                "provider": "screenpipe-cloud",
+                "defaultPreset": true
+            }),
+        );
+
+        let error = resolve_required_preset(&pipes_dir, "renamed-or-deleted")
+            .expect_err("selected preset must not fall back to config.provider=None");
+        let message = error.to_string();
+        assert!(message.contains("'renamed-or-deleted' not found"));
+        assert!(message.contains("available presets: existing"));
+    }
+
+    #[test]
+    fn missing_store_bootstrap_uses_current_explicit_auto_cloud_preset() {
+        let root = tempfile::tempdir().unwrap();
+        let pipes_dir = root.path().join("pipes");
+        std::fs::create_dir_all(&pipes_dir).unwrap();
+
+        let resolved = resolve_required_preset(&pipes_dir, "default").unwrap();
+        assert_eq!(resolved.provider, "screenpipe");
+        assert_eq!(resolved.model, "auto");
+
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.path().join("store.bin")).unwrap())
+                .unwrap();
+        let presets = store["settings"]["aiPresets"].as_array().unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0]["id"], json!("screenpipe"));
+        assert_eq!(presets[0]["provider"], json!("screenpipe-cloud"));
+        assert_eq!(presets[0]["model"], json!("auto"));
     }
 
     // -- serialize_pipe roundtrip -------------------------------------------
@@ -8279,23 +8608,19 @@ mod tests {
         // Verify the encoding matches Pi's actual format:
         // /Users/me/.screenpipe/pipes/foo → --Users-me-.screenpipe-pipes-foo--
         let dir = Path::new("/Users/me/.screenpipe/pipes/foo");
-        let result = encode_pi_session_dir(dir);
-        // We can't assert the full path (depends on $HOME), but we can check
-        // the directory name component
-        if let Some(path) = result {
-            let dir_name = path.file_name().unwrap().to_str().unwrap();
-            assert_eq!(dir_name, "--Users-me-.screenpipe-pipes-foo--");
-        }
+        assert_eq!(
+            encode_pi_session_name(dir),
+            "--Users-me-.screenpipe-pipes-foo--"
+        );
     }
 
     #[test]
     fn test_encode_pi_session_dir_trailing_slash() {
         let dir = Path::new("/Users/me/.screenpipe/pipes/foo/");
-        if let Some(path) = encode_pi_session_dir(dir) {
-            let dir_name = path.file_name().unwrap().to_str().unwrap();
-            // Trailing slash is stripped
-            assert_eq!(dir_name, "--Users-me-.screenpipe-pipes-foo--");
-        }
+        assert_eq!(
+            encode_pi_session_name(dir),
+            "--Users-me-.screenpipe-pipes-foo--"
+        );
     }
 
     // -- frontmatter history flag -------------------------------------------

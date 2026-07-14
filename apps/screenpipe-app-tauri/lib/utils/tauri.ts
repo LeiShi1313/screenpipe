@@ -1264,6 +1264,19 @@ async piCancelQueued(sessionId: string | null, promptId: string) : Promise<Resul
 }
 },
 /**
+ * Invalidate every queued prompt that has not reached Pi stdin yet. Used at
+ * the start of a deferred provider/model switch so old-provider follow-ups
+ * cannot run under the newly selected provider.
+ */
+async piInvalidateQueuedPrompts(sessionId: string | null) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_invalidate_queued_prompts", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Check if pi is available
  */
 async piCheck() : Promise<Result<PiCheckResult, string>> {
@@ -2001,9 +2014,9 @@ async setCloudMediaAnalysisSkill(enabled: boolean) : Promise<Result<null, string
  * `models.json` apiKey share the same `Arc<ArcSwap<Option<String>>>`,
  * so one write here updates both readers on the next pipe run.
  */
-async setCloudToken(token: string | null) : Promise<Result<null, string>> {
+async setCloudToken(token: string | null, expectedCurrentToken: string | null, forceClear: boolean) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_cloud_token", { token }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_cloud_token", { token, expectedCurrentToken, forceClear }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

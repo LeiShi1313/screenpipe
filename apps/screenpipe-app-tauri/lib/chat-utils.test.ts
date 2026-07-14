@@ -4,11 +4,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const {
-  emitMock,
-  showWindowMock,
-  getCurrentWindowMock,
-} = vi.hoisted(() => ({
+const { emitMock, showWindowMock, getCurrentWindowMock } = vi.hoisted(() => ({
   emitMock: vi.fn(async () => undefined),
   showWindowMock: vi.fn(async () => undefined),
   getCurrentWindowMock: vi.fn(() => ({ label: "chat" })),
@@ -30,6 +26,7 @@ vi.mock("@/lib/utils/tauri", () => ({
 }));
 
 import {
+  chatAuthBoundaryForToken,
   clearSearchOpenedFromChatSurface,
   markSearchOpenedFromChatSurface,
   openChatConversationInCurrentChatSurface,
@@ -92,19 +89,19 @@ describe("chat-utils", () => {
       shouldHandleChatLoadConversationForWindow(
         { conversationId: "chat-1" },
         "chat",
-      )
+      ),
     ).toBe(true);
     expect(
       shouldHandleChatLoadConversationForWindow(
         { conversationId: "chat-1", targetWindow: "chat" },
         "chat",
-      )
+      ),
     ).toBe(true);
     expect(
       shouldHandleChatLoadConversationForWindow(
         { conversationId: "chat-1", targetWindow: "home" },
         "chat",
-      )
+      ),
     ).toBe(false);
   });
 
@@ -112,19 +109,19 @@ describe("chat-utils", () => {
     expect(
       shouldActivateHomeSectionForChatLoadConversation({
         conversationId: "chat-1",
-      })
+      }),
     ).toBe(true);
     expect(
       shouldActivateHomeSectionForChatLoadConversation({
         conversationId: "chat-1",
         targetWindow: "home",
-      })
+      }),
     ).toBe(true);
     expect(
       shouldActivateHomeSectionForChatLoadConversation({
         conversationId: "chat-1",
         targetWindow: "chat",
-      })
+      }),
     ).toBe(false);
   });
 
@@ -141,28 +138,82 @@ describe("chat-utils", () => {
 
     expect(readSearchOpenedFromChatSurface()).toBeNull();
   });
+
+  it("uses the JWT account id, not raw credentials, to own delayed prefills", () => {
+    const encode = (value: object) =>
+      btoa(JSON.stringify(value))
+        .replace(/=/g, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
+    const first = `header.${encode({ sub: "user-a", nonce: 1 })}.sig-a`;
+    const refreshed = `header.${encode({ sub: "user-a", nonce: 2 })}.sig-b`;
+    const other = `header.${encode({ sub: "user-b" })}.sig-c`;
+
+    expect(chatAuthBoundaryForToken(first)).toBe("account:user-a");
+    expect(chatAuthBoundaryForToken(refreshed)).toBe("account:user-a");
+    expect(chatAuthBoundaryForToken(other)).toBe("account:user-b");
+    expect(chatAuthBoundaryForToken(first)).not.toContain(first);
+  });
+
+  it("isolates signed-out and opaque credential owners", () => {
+    expect(chatAuthBoundaryForToken(null)).toBe("signed-out");
+    expect(chatAuthBoundaryForToken("opaque-a")).not.toBe(
+      chatAuthBoundaryForToken("opaque-b"),
+    );
+    expect(chatAuthBoundaryForToken("opaque-a")).not.toContain("opaque-a");
+  });
 });
 
 describe("shouldHandleChatPrefillForWindow", () => {
   it("routes a targeted prefill to only its target window", () => {
-    expect(shouldHandleChatPrefillForWindow({ targetWindow: "chat", autoSend: true }, "chat")).toBe(true);
-    expect(shouldHandleChatPrefillForWindow({ targetWindow: "chat", autoSend: true }, "home")).toBe(false);
-    expect(shouldHandleChatPrefillForWindow({ targetWindow: "home", autoSend: true }, "home")).toBe(true);
-    expect(shouldHandleChatPrefillForWindow({ targetWindow: "home", autoSend: true }, "chat")).toBe(false);
+    expect(
+      shouldHandleChatPrefillForWindow(
+        { targetWindow: "chat", autoSend: true },
+        "chat",
+      ),
+    ).toBe(true);
+    expect(
+      shouldHandleChatPrefillForWindow(
+        { targetWindow: "chat", autoSend: true },
+        "home",
+      ),
+    ).toBe(false);
+    expect(
+      shouldHandleChatPrefillForWindow(
+        { targetWindow: "home", autoSend: true },
+        "home",
+      ),
+    ).toBe(true);
+    expect(
+      shouldHandleChatPrefillForWindow(
+        { targetWindow: "home", autoSend: true },
+        "chat",
+      ),
+    ).toBe(false);
   });
 
   it("pins an UNtargeted autoSend prefill to the home window only (the dup fix)", () => {
     // Without this, both the home and overlay panels would auto-send and each
     // create its own conversation — the duplicate-chat bug.
-    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "home")).toBe(true);
-    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "chat")).toBe(false);
+    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "home")).toBe(
+      true,
+    );
+    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "chat")).toBe(
+      false,
+    );
     // A stray third window never claims it either.
-    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "main")).toBe(false);
+    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "main")).toBe(
+      false,
+    );
   });
 
   it("leaves untargeted NON-autoSend prefills permissive (input fill is harmless)", () => {
-    expect(shouldHandleChatPrefillForWindow({ autoSend: false }, "home")).toBe(true);
-    expect(shouldHandleChatPrefillForWindow({ autoSend: false }, "chat")).toBe(true);
+    expect(shouldHandleChatPrefillForWindow({ autoSend: false }, "home")).toBe(
+      true,
+    );
+    expect(shouldHandleChatPrefillForWindow({ autoSend: false }, "chat")).toBe(
+      true,
+    );
     expect(shouldHandleChatPrefillForWindow({}, "chat")).toBe(true);
   });
 

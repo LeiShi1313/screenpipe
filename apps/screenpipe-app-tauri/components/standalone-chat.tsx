@@ -24,7 +24,10 @@ import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { useChatFilePreview } from "@/lib/hooks/use-chat-file-preview";
 import { useChatInspector } from "@/lib/hooks/use-chat-inspector";
 import { ChatInspector } from "@/components/chat/chat-inspector";
-import { useSqlAutocomplete, useTagAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
+import {
+  useSqlAutocomplete,
+  useTagAutocomplete,
+} from "@/lib/hooks/use-sql-autocomplete";
 import {
   buildAppMentionSuggestions,
   buildTagMentionSuggestions,
@@ -32,14 +35,13 @@ import {
   isInjectedTitleSourcePrompt,
 } from "@/lib/chat-utils";
 import { useAutoSuggestions } from "@/lib/hooks/use-auto-suggestions";
-import {
-  buildInvalidatedAuthTokenMessage,
-} from "@/lib/chat/auth-errors";
+import { buildInvalidatedAuthTokenMessage } from "@/lib/chat/auth-errors";
 import { usePipes } from "@/lib/hooks/use-pipes";
-import { connectInlineConnection, type InlineConnectStatus } from "@/lib/connections/inline-connect";
 import {
-  computeChatCitationPlan,
-} from "@/lib/source-citations";
+  connectInlineConnection,
+  type InlineConnectStatus,
+} from "@/lib/connections/inline-connect";
+import { computeChatCitationPlan } from "@/lib/source-citations";
 import { INTEGRATION_ICON_KEYS } from "@/components/settings/connections-section";
 import { ImageViewerDialog } from "@/components/chat/standalone/image-viewer-dialog";
 import { StandaloneChatHeader } from "@/components/chat/standalone/standalone-chat-header";
@@ -48,7 +50,10 @@ import { ChatComposer } from "@/components/chat/standalone/chat-composer";
 import { useChatScroll } from "@/components/chat/standalone/hooks/use-chat-scroll";
 import { useChatConnections } from "@/components/chat/standalone/hooks/use-chat-connections";
 import { useChatAttachments } from "@/components/chat/standalone/hooks/use-chat-attachments";
-import { useChatMentions, type MentionSuggestion } from "@/components/chat/standalone/hooks/use-chat-mentions";
+import {
+  useChatMentions,
+  type MentionSuggestion,
+} from "@/components/chat/standalone/hooks/use-chat-mentions";
 import { usePiChatState } from "@/components/chat/standalone/hooks/use-pi-chat-state";
 import { useChatQueue } from "@/components/chat/standalone/hooks/use-chat-queue";
 import { useChatStreamRender } from "@/components/chat/standalone/hooks/use-chat-stream-render";
@@ -72,6 +77,7 @@ import { useChatComposerDraftSync } from "@/components/chat/standalone/hooks/use
 import { usePipeWatchSession } from "@/components/chat/standalone/hooks/use-pipe-watch-session";
 import { useChatTemplateSettings } from "@/components/chat/standalone/hooks/use-chat-template-settings";
 import { useTryInChatEvent } from "@/components/chat/standalone/hooks/use-try-in-chat-event";
+import { useUsageStatus } from "@/lib/hooks/use-usage-status";
 import {
   useChatConversationRoutingEvents,
   useChatE2EGlobals,
@@ -83,9 +89,22 @@ import type { ContentBlock, Message } from "@/lib/chat/types";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { AGENT_TOPICS, type AgentEventEnvelope } from "@/lib/events/types";
 import { parseFreeChatLimitMessage } from "@/lib/chat/quota-errors";
-import { isScreenpipeCloudProvider } from "@/lib/chat/free-tier-turn-marker";
+import {
+  isFreeScreenpipeCloudTextOnly,
+  isSamePiAuthIdentity,
+  isScreenpipeCloudProvider,
+} from "@/lib/chat/free-tier-turn-marker";
+import {
+  createPiAuthConversationReset,
+  isSamePiConversationAccount,
+  piConversationAuthIdentity,
+} from "@/lib/chat/auth-conversation-boundary";
 import { FreeTierUpgradeDialog } from "@/components/chat/free-tier-upgrade-dialog";
-import { hasCloudEntitlement } from "@/lib/app-entitlement";
+import {
+  hasCloudEntitlement,
+  isDevBillingBypassEnabled,
+} from "@/lib/app-entitlement";
+import { buildFreeTierAiSetupPage } from "@/lib/chat/free-tier-provider-setup";
 
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
@@ -102,7 +121,11 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
   { tag: "@last-hour", description: "past hour", category: "time" },
   { tag: "@audio", description: "audio/meetings only", category: "content" },
   { tag: "@screen", description: "screen text only", category: "content" },
-  { tag: "@input", description: "UI events (clicks, keys)", category: "content" },
+  {
+    tag: "@input",
+    description: "UI events (clicks, keys)",
+    category: "content",
+  },
 ];
 
 /**
@@ -127,22 +150,42 @@ export function StandaloneChat({
    *  padding on the chat header since the sidebar no longer covers them. */
   sidebarCollapsed?: boolean;
 } = {}) {
-  const { settings, updateSettings, isSettingsLoaded, reloadStore } = useSettings();
+  const { settings, updateSettings, isSettingsLoaded, reloadStore } =
+    useSettings();
+  const usageStatus = useUsageStatus();
   const { isMac, isWindows, isLoading: isPlatformLoading } = usePlatform();
   const hardcodedConnectionTiles = useHardcodedTiles();
   // Drop the macOS traffic-light reservation when the window is fullscreen
   // (the buttons hide). Only relevant in standalone mode (no parent
   // className) — the embedded variant is below the host's chrome anyway.
   const isFullscreen = useIsFullscreen();
-  const { items: appItems, isLoading: appsLoading, refresh: refreshAppItems } = useSqlAutocomplete("app");
-  const { items: tagItems, isLoading: tagsLoading, refresh: refreshTagItems } = useTagAutocomplete();
-  const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
+  const {
+    items: appItems,
+    isLoading: appsLoading,
+    refresh: refreshAppItems,
+  } = useSqlAutocomplete("app");
+  const {
+    items: tagItems,
+    isLoading: tagsLoading,
+    refresh: refreshTagItems,
+  } = useTagAutocomplete();
+  const {
+    suggestions: autoSuggestions,
+    refreshing: suggestionsRefreshing,
+    forceRefresh: refreshSuggestions,
+  } = useAutoSuggestions();
   const { pipes, templatePipes } = usePipes();
   // Connected integrations (google-calendar, google-docs, slack, etc.) surfaced in the
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
   const [showConnectBanner, setShowConnectBanner] = useState(() => {
-    try { return localStorage.getItem("screenpipe_connect_banner_dismissed") !== "true"; } catch { return true; }
+    try {
+      return (
+        localStorage.getItem("screenpipe_connect_banner_dismissed") !== "true"
+      );
+    } catch {
+      return true;
+    }
   });
   const {
     allConnectionItems,
@@ -163,16 +206,15 @@ export function StandaloneChat({
   // Always opens a new chat so the prompt never lands in an existing conversation.
   // Uses a ref so the effect doesn't need startNewConversation as a dep (avoids
   // re-registering the listener on every render while still calling the latest fn).
-  const tryInChatStartNewRef = useRef<(() => Promise<void> | void) | null>(null);
-  const {
-    customTemplates,
-    saveCustomTemplate,
-    deleteCustomTemplate,
-  } = useChatTemplateSettings({
-    isSettingsLoaded,
-    settings,
-    updateSettings,
-  });
+  const tryInChatStartNewRef = useRef<
+    (() => Promise<string | null> | void) | null
+  >(null);
+  const { customTemplates, saveCustomTemplate, deleteCustomTemplate } =
+    useChatTemplateSettings({
+      isSettingsLoaded,
+      settings,
+      updateSettings,
+    });
 
   const {
     input,
@@ -189,11 +231,23 @@ export function StandaloneChat({
     setChipScrollTop,
     clearConnectionChip,
   } = useChatComposerShell();
+  const authIdentityRef = useRef({
+    token: settings.user?.token ?? null,
+    generation: 0,
+  });
+  const currentAuthToken = settings.user?.token ?? null;
+  if (authIdentityRef.current.token !== currentAuthToken) {
+    authIdentityRef.current = {
+      token: currentAuthToken,
+      generation: authIdentityRef.current.generation + 1,
+    };
+  }
   useTryInChatEvent({
     startNewRef: tryInChatStartNewRef,
     setConnectionChip,
     setInput,
     inputRef,
+    authIdentityRef,
   });
   // Local buffer for regular (agent) sessions. Pipe-watch sessions source
   // their messages from the chat store instead — see the `messages` derivation
@@ -201,53 +255,90 @@ export function StandaloneChat({
   const [localMessages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<
+    string | null
+  >(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [freeTierDialogOpen, setFreeTierDialogOpen] = useState(false);
   const [freeTierLimit, setFreeTierLimit] = useState(2);
   const handledFreeLimitIdsRef = useRef<Set<string> | null>(null);
   const activePresetRef = useRef<AIPreset | undefined>(activePreset);
   activePresetRef.current = activePreset;
+  const hostedPreviewTextOnly = isFreeScreenpipeCloudTextOnly(
+    activePreset?.provider,
+    hasCloudEntitlement(settings.user) || isDevBillingBypassEnabled(),
+  );
+  const hostedPreviewUsage =
+    hostedPreviewTextOnly && settings.user?.token
+      ? usageStatus?.free_chat
+      : undefined;
+  const currentConversationAuthIdentity = React.useMemo(
+    () => piConversationAuthIdentity(settings.user),
+    [settings.user?.id, settings.user?.token],
+  );
+  const previousConversationAuthIdentityRef = useRef(
+    currentConversationAuthIdentity,
+  );
+  const conversationAuthResetPending = !isSamePiConversationAccount(
+    previousConversationAuthIdentityRef.current,
+    currentConversationAuthIdentity,
+  );
+  const authSafeInput = conversationAuthResetPending ? "" : input;
+  const authSafeConnectionChip = conversationAuthResetPending
+    ? null
+    : connectionChip;
 
-  const handleSetActivePreset = useCallback((preset: AIPreset | undefined | ((prev: AIPreset | undefined) => AIPreset | undefined)) => {
-    if (typeof preset === "function") {
-      setActivePreset((prev) => {
-        const next = preset(prev);
-        activePresetRef.current = next;
-        return next;
-      });
-    } else {
-      activePresetRef.current = preset;
-      setActivePreset(preset);
-      // Persist to localStorage so the preset survives full navigation
-      // (settings → home). Only for direct user selection, not the
-      // lifecycle fallback which uses the function form.
-      if (preset?.id) {
-        try { localStorage.setItem("chat-active-preset-id", preset.id); } catch {}
+  const handleSetActivePreset = useCallback(
+    (
+      preset:
+        | AIPreset
+        | undefined
+        | ((prev: AIPreset | undefined) => AIPreset | undefined),
+    ) => {
+      if (typeof preset === "function") {
+        setActivePreset((prev) => {
+          const next = preset(prev);
+          activePresetRef.current = next;
+          return next;
+        });
+      } else {
+        activePresetRef.current = preset;
+        setActivePreset(preset);
+        // Persist to localStorage so the preset survives full navigation
+        // (settings → home). Only for direct user selection, not the
+        // lifecycle fallback which uses the function form.
+        if (preset?.id) {
+          try {
+            localStorage.setItem("chat-active-preset-id", preset.id);
+          } catch {}
+        }
       }
-    }
-  }, []);
+    },
+    [],
+  );
   const isStreamingRef = useRef(false);
   // Mirrors of streaming-relevant state so the unmount-snapshot effect (which
   // runs with `[]` deps) can read the latest values instead of stale closures.
   const isLoadingRef = useRef(false);
   const messagesRef = useRef<Message[]>([]);
-  const connectionCardCleanupTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const connectionCardCleanupTimersRef = useRef<
+    ReturnType<typeof setTimeout>[]
+  >([]);
   const inlineConnectAbortRef = useRef<AbortController | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const appMentionSuggestions = React.useMemo(
     () => buildAppMentionSuggestions(appItems, APP_SUGGESTION_LIMIT),
-    [appItems]
+    [appItems],
   );
   const tagMentionSuggestions = React.useMemo(
     () => buildTagMentionSuggestions(tagItems, TAG_SUGGESTION_LIMIT),
-    [tagItems]
+    [tagItems],
   );
   const allTagMentionSuggestions = React.useMemo(
     () => buildTagMentionSuggestions(tagItems, tagItems.length),
-    [tagItems]
+    [tagItems],
   );
   const tagMentionSections = React.useMemo(() => {
     type TagCountKey = "memory_count" | "audio_count" | "frame_count";
@@ -291,7 +382,7 @@ export function StandaloneChat({
 
   const atMentionSuggestions = React.useMemo(
     () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions],
-    [appMentionSuggestions]
+    [appMentionSuggestions],
   );
   const {
     showMentionDropdown,
@@ -334,10 +425,10 @@ export function StandaloneChat({
     handleMentionInputChange,
     insertMention,
   } = useChatMentions({
-    input,
+    input: authSafeInput,
     setInput,
     inputRef,
-    hasConnectionChip: Boolean(connectionChip),
+    hasConnectionChip: Boolean(authSafeConnectionChip),
     setChipScrollTop,
     appTagMap,
     atMentionSuggestions,
@@ -360,7 +451,7 @@ export function StandaloneChat({
     setPrefillFrameId,
     isPreparingPrefill,
     setIsPreparingPrefill,
-  } = useChatExternalEvents();
+  } = useChatExternalEvents(authIdentityRef);
   const isEmbedded = !!className; // embedded in settings vs overlay panel
   const {
     isDragging,
@@ -373,6 +464,7 @@ export function StandaloneChat({
     pendingDocs,
     setPendingDocs,
     pendingDocsRef,
+    invalidatePendingAttachmentWork,
     attachPastedText,
     handleFilePicker,
     handlePastedFiles,
@@ -384,7 +476,20 @@ export function StandaloneChat({
     setInput,
     setShowMentionDropdown,
     setMentionFilter,
+    authIdentityRef,
+    allowImages: !hostedPreviewTextOnly,
   });
+  const authSafePastedImages = conversationAuthResetPending ? [] : pastedImages;
+  const authSafeAttachedDocs = conversationAuthResetPending ? [] : attachedDocs;
+  const authSafePendingDocs = conversationAuthResetPending ? [] : pendingDocs;
+  const authSafeAttachedDocsRef = useRef(attachedDocsRef.current);
+  const authSafePendingDocsRef = useRef(pendingDocsRef.current);
+  authSafeAttachedDocsRef.current = conversationAuthResetPending
+    ? []
+    : attachedDocsRef.current;
+  authSafePendingDocsRef.current = conversationAuthResetPending
+    ? []
+    : pendingDocsRef.current;
   const steerShortcutInFlightRef = useRef(false);
 
   const {
@@ -399,7 +504,9 @@ export function StandaloneChat({
     invalidatedAuthHandledRef,
     piStartInFlightRef,
     sendDispatchInFlightRef,
+    sendDispatchOwnerRef,
     forceQueueModeRef,
+    piAsyncOperationGenerationRef,
     piFirstCallRetried,
     piRateLimitRetries,
     sessionActivityLastEmitAtRef,
@@ -455,22 +562,48 @@ export function StandaloneChat({
   const handleInvalidatedAuthToken = useCallback(async () => {
     if (invalidatedAuthHandledRef.current) return;
     invalidatedAuthHandledRef.current = true;
-    posthog.capture("session_expired", { source: "pi_stream", reason: "token_invalidated" });
+    posthog.capture("session_expired", {
+      source: "pi_stream",
+      reason: "token_invalidated",
+    });
 
-    await updateSettings({ user: null as any });
+    const expectedToken = authIdentityRef.current.token;
     try {
-      await commands.setCloudToken(null);
+      const result = await commands.setCloudToken(null, expectedToken, false);
+      if (result?.status === "error") {
+        console.warn(
+          "native token persistence failed after Pi auth invalidation:",
+          result.error,
+        );
+        invalidatedAuthHandledRef.current = false;
+        return;
+      }
     } catch (e) {
       console.warn("failed to clear cloud token after Pi auth error:", e);
+      invalidatedAuthHandledRef.current = false;
+      return;
     }
     try {
       const result = await commands.piUpdateConfig(null, null);
       if (result.status === "error") {
-        console.warn("failed to clear Pi auth config after token invalidation:", result.error);
+        console.warn(
+          "failed to clear Pi auth config after token invalidation:",
+          result.error,
+        );
+        invalidatedAuthHandledRef.current = false;
+        return;
       }
     } catch (e) {
-      console.warn("failed to clear Pi auth config after token invalidation:", e);
+      console.warn(
+        "failed to clear Pi auth config after token invalidation:",
+        e,
+      );
     }
+    if (authIdentityRef.current.token !== expectedToken) {
+      invalidatedAuthHandledRef.current = false;
+      return;
+    }
+    await updateSettings({ user: null as any });
 
     toast({
       title: "sign in required",
@@ -489,7 +622,15 @@ export function StandaloneChat({
   const lastPiDispatchPromptRef = useRef<string>("");
 
   // Ref to sendMessage so useEffect callbacks can call it without stale closures
-  const sendMessageRef = useRef<(msg: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>>();
+  const sendMessageRef =
+    useRef<
+      (
+        msg: string,
+        displayLabel?: string,
+        imageDataUrls?: string[],
+        sendOptions?: import("@/components/chat/standalone/hooks/pi-types").PiMessageSendOptions,
+      ) => Promise<boolean>
+    >();
   // Bypass guard for auto-send from chat-prefill (Pi confirmed running but React state stale)
   const autoSendBypassRef = useRef(false);
 
@@ -508,7 +649,8 @@ export function StandaloneChat({
   );
   const runningConfigSessionIdRef = useRef(initialSessionIdRef.current);
   useEffect(() => {
-    if (!conversationId || runningConfigSessionIdRef.current === conversationId) return;
+    if (!conversationId || runningConfigSessionIdRef.current === conversationId)
+      return;
     // Pi processes are keyed by conversation. Never carry provider truth or
     // retry bytes from the previous native session into an already-running
     // session we are attaching to; until status is rediscovered, dispatch
@@ -550,10 +692,16 @@ export function StandaloneChat({
       ? state.sessions[conversationId]?.messages
       : undefined,
   );
-  const messages = (pipeWatchMessages ?? localMessages) as Message[];
+  // During the render before the auth-reset effect mints a new session, expose
+  // an empty history synchronously. A click/event in this narrow window must
+  // not build account B's prompt from account A's still-mounted local state.
+  const messages = (
+    conversationAuthResetPending ? [] : (pipeWatchMessages ?? localMessages)
+  ) as Message[];
 
   useEffect(() => {
-    const runningProvider = piRunningConfigRef.current?.provider ?? activePreset?.provider;
+    const runningProvider =
+      piRunningConfigRef.current?.provider ?? activePreset?.provider;
     if (!isScreenpipeCloudProvider(runningProvider)) return;
 
     if (!handledFreeLimitIdsRef.current) {
@@ -571,7 +719,8 @@ export function StandaloneChat({
 
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
-      if (message.role !== "assistant" || typeof message.content !== "string") continue;
+      if (message.role !== "assistant" || typeof message.content !== "string")
+        continue;
       const quota = parseFreeChatLimitMessage(message.content);
       if (!quota) continue;
 
@@ -595,15 +744,28 @@ export function StandaloneChat({
   }, [messages, activePreset?.provider, conversationId, piRunningConfigRef]);
 
   const {
+    clearPendingAttachments,
     consumePendingAttachments,
     stagePendingAttachments,
   } = useNextTurnAttachments(conversationId);
+  const consumeAuthSafePendingAttachments = useCallback(
+    () =>
+      conversationAuthResetPending ? undefined : consumePendingAttachments(),
+    [consumePendingAttachments, conversationAuthResetPending],
+  );
   const { filePreview, openFilePreview, closeFilePreview } =
     useChatFilePreview(conversationId);
-  const { inspectorOpen, setInspectorOpen, outputs: inspectorOutputs, sources: inspectorSources } =
-    useChatInspector(messages);
-  const [activeSideView, setActiveSideView] = useState<"inspector" | "side" | null>(null);
-  const [browserHiddenBehindInspector, setBrowserHiddenBehindInspector] = useState(false);
+  const {
+    inspectorOpen,
+    setInspectorOpen,
+    outputs: inspectorOutputs,
+    sources: inspectorSources,
+  } = useChatInspector(messages);
+  const [activeSideView, setActiveSideView] = useState<
+    "inspector" | "side" | null
+  >(null);
+  const [browserHiddenBehindInspector, setBrowserHiddenBehindInspector] =
+    useState(false);
   const [browserPanelState, setBrowserPanelState] = useState({
     hasUrl: false,
     open: false,
@@ -612,8 +774,7 @@ export function StandaloneChat({
   const sidePanelHasContent = filePreviewOpen || browserPanelState.hasUrl;
   const sidePanelOpen = activeSideView === "side" && sidePanelHasContent;
   const inspectorHasContent =
-    inspectorOutputs.length > 0 ||
-    inspectorSources.length > 0;
+    inspectorOutputs.length > 0 || inspectorSources.length > 0;
 
   useEffect(() => {
     setInspectorOpen(false);
@@ -716,7 +877,139 @@ export function StandaloneChat({
     finishQueuedAction,
     removeQueuedPrompt,
     cancelQueuedPrompt,
-  } = useChatQueue(currentQueueSessionId, piSessionIdRef);
+    clearAllQueuedPrompts,
+  } = useChatQueue(currentQueueSessionId, piSessionIdRef, authIdentityRef);
+  const authSafeQueuedPrompts = conversationAuthResetPending
+    ? []
+    : queuedPrompts;
+
+  // A Pi subprocess and its frontend queue are both scoped to the account
+  // credential that spawned them. Native `set_cloud_token` kills every UUID
+  // process when that identity changes; clear the matching ephemeral UI state
+  // so an old queued prompt cannot reappear under a newly signed-in account.
+  const previousAuthTokenRef = useRef(settings.user?.token ?? null);
+  useEffect(() => {
+    const currentToken = settings.user?.token ?? null;
+    const previousToken = previousAuthTokenRef.current;
+    previousAuthTokenRef.current = currentToken;
+    const conversationReset = createPiAuthConversationReset<Message>(
+      previousConversationAuthIdentityRef.current,
+      currentConversationAuthIdentity,
+      () => crypto.randomUUID(),
+    );
+    previousConversationAuthIdentityRef.current =
+      currentConversationAuthIdentity;
+    if (previousToken === currentToken && !conversationReset) return;
+
+    clearAllQueuedPrompts();
+    pendingNextPiUserIntentRef.current = null;
+    pendingNextPiUserDisplayRef.current = null;
+    optimisticSteerRef.current = null;
+    pendingSteerBatchRef.current = [];
+    pendingSteerFlushInFlightRef.current = false;
+    turnIntentLedgerRef.current = [];
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    inlineConnectAbortRef.current?.abort();
+    inlineConnectAbortRef.current = null;
+    for (const timer of connectionCardCleanupTimersRef.current)
+      clearTimeout(timer);
+    connectionCardCleanupTimersRef.current = [];
+    autoSendBypassRef.current = false;
+    forceQueueModeRef.current = false;
+    sendDispatchInFlightRef.current = false;
+    sendDispatchOwnerRef.current = null;
+    piStartInFlightRef.current = false;
+    piFirstCallRetried.current = false;
+    piRateLimitRetries.current = 0;
+    piCrashCountRef.current = 0;
+    piLastCrashRef.current = 0;
+    piLastErrorRef.current = null;
+    piTerminationDedupRef.current = {};
+    piThinkingStartRef.current = null;
+    piStoppedIntentionallyRef.current = false;
+    piIntentionallyStoppedPidsRef.current.clear();
+    piActiveStopRequestedRef.current = false;
+    piAsyncOperationGenerationRef.current += 1;
+    piSessionSyncedRef.current = false;
+    invalidatePendingAttachmentWork();
+    if (conversationReset) {
+      inputValueRef.current = "";
+      pastedImagesRef.current = [];
+      attachedDocsRef.current = [];
+      messagesRef.current = [];
+      clearPendingAttachments();
+      clearConnectionChip();
+      setInput("");
+      setPastedImages([]);
+      setAttachedDocs([]);
+      setPrefillContext(null);
+      setPrefillFrameId(null);
+      setPrefillSource("search");
+      setIsPreparingPrefill(false);
+      handledFreeLimitIdsRef.current = null;
+      setFreeTierDialogOpen(false);
+      setFreeTierLimit(2);
+      try {
+        sessionStorage.removeItem("pendingChatPrefill");
+      } catch {
+        // Session storage can be unavailable in hardened webviews.
+      }
+      piSessionIdRef.current = conversationReset.sessionId;
+      piSessionSyncedRef.current = true;
+      useChatStore.getState().actions.setCurrent(conversationReset.sessionId);
+      setConversationId(conversationReset.sessionId);
+      setMessages(conversationReset.messages);
+    }
+    setPiStarting(false);
+    lastPiDispatchPromptRef.current = "";
+    lastUserMessageRef.current = "";
+    piRunningConfigRef.current = null;
+    piMessageIdRef.current = null;
+    piStreamingTextRef.current = "";
+    piContentBlocksRef.current = [];
+    setIsLoading(false);
+    setIsStreaming(false);
+    setPiInfo(null);
+  }, [
+    clearAllQueuedPrompts,
+    clearPendingAttachments,
+    currentConversationAuthIdentity,
+    invalidatePendingAttachmentWork,
+    settings.user?.token,
+  ]);
+
+  const resetForegroundPiOperationBoundary = useCallback(() => {
+    piAsyncOperationGenerationRef.current += 1;
+    pendingNextPiUserIntentRef.current = null;
+    pendingNextPiUserDisplayRef.current = null;
+    optimisticSteerRef.current = null;
+    pendingSteerFlushInFlightRef.current = false;
+    piActiveStopRequestedRef.current = false;
+    autoSendBypassRef.current = false;
+    forceQueueModeRef.current = false;
+    sendDispatchInFlightRef.current = false;
+    sendDispatchOwnerRef.current = null;
+    piStartInFlightRef.current = false;
+    setPiStarting(false);
+  }, []);
+  const activePresetBoundaryKey = JSON.stringify({
+    id: activePreset?.id ?? null,
+    provider: activePreset?.provider ?? null,
+    model: activePreset?.model ?? null,
+    url: activePreset?.url ?? null,
+    apiKey: activePreset?.apiKey ?? null,
+    maxTokens: activePreset?.maxTokens ?? null,
+    prompt: activePreset?.prompt ?? null,
+  });
+  const previousPresetBoundaryKeyRef = useRef(activePresetBoundaryKey);
+  useEffect(() => {
+    if (previousPresetBoundaryKeyRef.current === activePresetBoundaryKey)
+      return;
+    previousPresetBoundaryKeyRef.current = activePresetBoundaryKey;
+    resetForegroundPiOperationBoundary();
+  }, [activePresetBoundaryKey, resetForegroundPiOperationBoundary]);
+
   useChatConversationEvents({ conversationId, inputRef });
   const {
     isUserScrolledUp,
@@ -732,40 +1025,49 @@ export function StandaloneChat({
     messagesEndRef,
   });
 
-  const focusMessageById = useCallback((messageId: string) => {
-    let attempts = 0;
-    const findAndFocus = () => {
-      const container = scrollContainerRef.current;
-      const target = container
-        ? Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]"))
-            .find((el) => el.dataset.messageId === messageId)
-        : null;
+  const focusMessageById = useCallback(
+    (messageId: string) => {
+      let attempts = 0;
+      const findAndFocus = () => {
+        const container = scrollContainerRef.current;
+        const target = container
+          ? Array.from(
+              container.querySelectorAll<HTMLElement>("[data-message-id]"),
+            ).find((el) => el.dataset.messageId === messageId)
+          : null;
 
-      if (target) {
-        markUserScrolledUp();
-        target.scrollIntoView({ behavior: attempts > 1 ? "smooth" : "auto", block: "center" });
-        setHighlightedMessageId(messageId);
-        window.setTimeout(() => {
-          setHighlightedMessageId((current) => (current === messageId ? null : current));
-        }, 2400);
-        return;
-      }
+        if (target) {
+          markUserScrolledUp();
+          target.scrollIntoView({
+            behavior: attempts > 1 ? "smooth" : "auto",
+            block: "center",
+          });
+          setHighlightedMessageId(messageId);
+          window.setTimeout(() => {
+            setHighlightedMessageId((current) =>
+              current === messageId ? null : current,
+            );
+          }, 2400);
+          return;
+        }
 
-      attempts += 1;
-      if (attempts <= 24) {
-        window.requestAnimationFrame(findAndFocus);
-      }
-    };
+        attempts += 1;
+        if (attempts <= 24) {
+          window.requestAnimationFrame(findAndFocus);
+        }
+      };
 
-    window.requestAnimationFrame(findAndFocus);
-  }, [markUserScrolledUp]);
+      window.requestAnimationFrame(findAndFocus);
+    },
+    [markUserScrolledUp],
+  );
 
   useChatComposerDraftSync({
     conversationId,
-    input,
-    pastedImages,
-    attachedDocs,
-    pendingDocs,
+    input: authSafeInput,
+    pastedImages: authSafePastedImages,
+    attachedDocs: authSafeAttachedDocs,
+    pendingDocs: authSafePendingDocs,
     clearConnectionChip,
     refreshConnectionState,
   });
@@ -783,6 +1085,8 @@ export function StandaloneChat({
     renameConversation,
     startNewConversation,
     branchConversation,
+    conversationOperationPending,
+    conversationOperationPendingRef,
   } = useChatConversations({
     messages,
     setMessages,
@@ -809,15 +1113,20 @@ export function StandaloneChat({
     pastedImagesRef,
     attachedDocsRef,
     pendingDocsRef,
+    invalidatePendingAttachmentWork,
+    authIdentityRef,
+    onConversationOperationStart: resetForegroundPiOperationBoundary,
     settings,
     selectedPreset: activePreset ?? null,
     selectedPresetRef: activePresetRef,
     inlineHistoryEnabled: !hideInlineHistory,
   });
   const loadConversationRef = useRef(loadConversation);
-  const startNewConversationRef = useRef(startNewConversation);
+  const startNewConversationRef = useRef<() => Promise<void>>(async () => {});
   loadConversationRef.current = loadConversation;
-  startNewConversationRef.current = startNewConversation;
+  startNewConversationRef.current = async () => {
+    await startNewConversation();
+  };
 
   usePipeGenerationCompletion({ isLoading });
   useChatPrefillListener({
@@ -836,11 +1145,20 @@ export function StandaloneChat({
     piSessionIdRef,
     piSessionSyncedRef,
     autoSendBypassRef,
+    authIdentityRef,
     sendMessageRef,
     setIsLoading,
     setIsStreaming,
     setMessages,
     setConversationId,
+    pastedImagesRef,
+    attachedDocsRef,
+    pendingDocsRef,
+    setAttachedDocs,
+    setPendingDocs,
+    invalidatePendingAttachmentWork,
+    clearPendingAttachments,
+    onConversationOperationStart: resetForegroundPiOperationBoundary,
   });
   useChatConversationRoutingEvents({
     loadConversation,
@@ -966,18 +1284,20 @@ export function StandaloneChat({
     activePipeExecution,
     activePreset,
     activePresetRef,
-    attachedDocsRef,
+    authIdentityRef,
+    attachedDocsRef: authSafeAttachedDocsRef,
     autoSendBypassRef,
     setConversationId,
     buildProviderConfig,
-    canChat,
+    canChat: canChat && !conversationOperationPending,
+    conversationOperationPendingRef,
     cancelStreamingMessageRender,
-    consumePendingAttachments,
+    consumePendingAttachments: consumeAuthSafePendingAttachments,
     currentQueueSessionId,
     beginQueuedAction,
     finishQueuedAction,
     forceQueueModeRef,
-    input,
+    input: authSafeInput,
     inputRef,
     isLoading,
     isStreaming,
@@ -985,12 +1305,13 @@ export function StandaloneChat({
     lastUserMessageRef,
     messages,
     optimisticSteerRef,
-    pastedImages,
+    pastedImages: authSafePastedImages,
     pendingNextPiUserDisplayRef,
     pendingNextPiUserIntentRef,
     pendingSteerBatchRef,
     pendingSteerFlushInFlightRef,
     piActiveStopRequestedRef,
+    piAsyncOperationGenerationRef,
     piContentBlocksRef,
     piCrashCountRef,
     piInfo,
@@ -1002,10 +1323,10 @@ export function StandaloneChat({
     piSessionSyncedRef,
     piStartInFlightRef,
     piStreamingTextRef,
-    prefillContext,
-    prefillFrameId,
-    prefillSource,
-    queuedPrompts,
+    prefillContext: conversationAuthResetPending ? null : prefillContext,
+    prefillFrameId: conversationAuthResetPending ? null : prefillFrameId,
+    prefillSource: conversationAuthResetPending ? "search" : prefillSource,
+    queuedPrompts: authSafeQueuedPrompts,
     registerTurnIntent,
     markTurnIntentConsumed,
     removeQueuedPrompt,
@@ -1014,6 +1335,7 @@ export function StandaloneChat({
     restoreQueuedDisplay,
     saveConversation,
     sendDispatchInFlightRef,
+    sendDispatchOwnerRef,
     sendMessageRef,
     setAttachedDocs,
     setInput,
@@ -1041,97 +1363,188 @@ export function StandaloneChat({
     (window as any).__e2eStopChat = handleStop;
   }
 
+  type InlineConnectionBoundary = {
+    authIdentity: { token: string | null; generation: number };
+    sessionId: string;
+  };
+  const answerPiExtensionUiRequest = useCallback(
+    async (
+      requestId: string | undefined,
+      response: JsonValue,
+      boundary: InlineConnectionBoundary = {
+        authIdentity: { ...authIdentityRef.current },
+        sessionId: piSessionIdRef.current,
+      },
+    ) => {
+      if (!requestId) return;
+      if (
+        boundary.sessionId !== piSessionIdRef.current ||
+        !isSamePiAuthIdentity(boundary.authIdentity, authIdentityRef.current)
+      ) {
+        return;
+      }
+      const result = await commands.piExtensionUiResponse(
+        boundary.sessionId,
+        requestId,
+        response,
+      );
+      if (
+        boundary.sessionId !== piSessionIdRef.current ||
+        !isSamePiAuthIdentity(boundary.authIdentity, authIdentityRef.current)
+      ) {
+        return;
+      }
+      if (result.status === "error") {
+        toast({
+          title: "failed to answer connection request",
+          description: result.error,
+          variant: "destructive",
+        });
+      }
+    },
+    [piSessionIdRef],
+  );
 
-  const answerPiExtensionUiRequest = useCallback(async (
-    requestId: string | undefined,
-    response: JsonValue,
-  ) => {
-    if (!requestId) return;
-    const result = await commands.piExtensionUiResponse(
-      piSessionIdRef.current,
-      requestId,
-      response,
-    );
-    if (result.status === "error") {
-      toast({
-        title: "failed to answer connection request",
-        description: result.error,
-        variant: "destructive",
-      });
-    }
-  }, [piSessionIdRef]);
-
-  const removeConnectionActionByRequestId = useCallback((requestId: string | undefined) => {
-    if (!requestId) return;
-    setMessages((prev) =>
-      prev.flatMap((message) => {
-        const blocks = message.contentBlocks;
-        if (!blocks?.some((block) => block.type === "connection_action" && block.extensionRequestId === requestId)) {
-          return [message];
-        }
-        const nextBlocks = blocks.filter(
-          (block) => block.type !== "connection_action" || block.extensionRequestId !== requestId,
-        );
-        if (!message.content.trim() && nextBlocks.length === 0) return [];
-        return [{ ...message, contentBlocks: nextBlocks }];
-      }),
-    );
-  }, [setMessages]);
+  const removeConnectionActionByRequestId = useCallback(
+    (requestId: string | undefined) => {
+      if (!requestId) return;
+      setMessages((prev) =>
+        prev.flatMap((message) => {
+          const blocks = message.contentBlocks;
+          if (
+            !blocks?.some(
+              (block) =>
+                block.type === "connection_action" &&
+                block.extensionRequestId === requestId,
+            )
+          ) {
+            return [message];
+          }
+          const nextBlocks = blocks.filter(
+            (block) =>
+              block.type !== "connection_action" ||
+              block.extensionRequestId !== requestId,
+          );
+          if (!message.content.trim() && nextBlocks.length === 0) return [];
+          return [{ ...message, contentBlocks: nextBlocks }];
+        }),
+      );
+    },
+    [setMessages],
+  );
 
   useEffect(() => {
     return () => {
       inlineConnectAbortRef.current?.abort();
       inlineConnectAbortRef.current = null;
-      for (const timer of connectionCardCleanupTimersRef.current) clearTimeout(timer);
+      for (const timer of connectionCardCleanupTimersRef.current)
+        clearTimeout(timer);
       connectionCardCleanupTimersRef.current = [];
     };
   }, []);
 
-  const connectFromInlineCard = useCallback(async (
-    connectionId: string,
-    block?: Extract<ContentBlock, { type: "connection_action" }>,
-  ): Promise<InlineConnectStatus> => {
-    const connection = allConnectionItems.find((item) => item.id === connectionId);
-    if (!connection) {
-      openConnectionSetup(connectionId);
-      await answerPiExtensionUiRequest(block?.extensionRequestId, { cancelled: true });
-      return { status: "unsupported", reason: "opening setup for this connection" };
-    }
+  const connectFromInlineCard = useCallback(
+    async (
+      connectionId: string,
+      block?: Extract<ContentBlock, { type: "connection_action" }>,
+    ): Promise<InlineConnectStatus> => {
+      const boundary: InlineConnectionBoundary = {
+        authIdentity: { ...authIdentityRef.current },
+        sessionId: piSessionIdRef.current,
+      };
+      const boundaryIsCurrent = () =>
+        boundary.sessionId === piSessionIdRef.current &&
+        isSamePiAuthIdentity(boundary.authIdentity, authIdentityRef.current);
+      const connection = allConnectionItems.find(
+        (item) => item.id === connectionId,
+      );
+      if (!connection) {
+        openConnectionSetup(connectionId);
+        await answerPiExtensionUiRequest(
+          block?.extensionRequestId,
+          { cancelled: true },
+          boundary,
+        );
+        return {
+          status: "unsupported",
+          reason: "opening setup for this connection",
+        };
+      }
 
-    inlineConnectAbortRef.current?.abort();
-    const inlineConnectAbortController = new AbortController();
-    inlineConnectAbortRef.current = inlineConnectAbortController;
-    const result = await connectInlineConnection(connection, inlineConnectAbortController.signal)
-      .finally(() => {
+      inlineConnectAbortRef.current?.abort();
+      const inlineConnectAbortController = new AbortController();
+      inlineConnectAbortRef.current = inlineConnectAbortController;
+      const result = await connectInlineConnection(
+        connection,
+        inlineConnectAbortController.signal,
+      ).finally(() => {
         if (inlineConnectAbortRef.current === inlineConnectAbortController) {
           inlineConnectAbortRef.current = null;
         }
       });
-    if (result.status === "connected") {
-      await refreshConnectionState();
-      await answerPiExtensionUiRequest(block?.extensionRequestId, { confirmed: true });
-      if (block?.extensionRequestId) {
-        const timer = setTimeout(() => {
-          removeConnectionActionByRequestId(block.extensionRequestId);
-        }, 1400);
-        connectionCardCleanupTimersRef.current.push(timer);
+      if (!boundaryIsCurrent()) {
+        return {
+          status: "error",
+          reason: "account or chat changed during sign-in",
+        };
       }
+      if (result.status === "connected") {
+        await refreshConnectionState();
+        if (!boundaryIsCurrent()) {
+          return {
+            status: "error",
+            reason: "account or chat changed during sign-in",
+          };
+        }
+        await answerPiExtensionUiRequest(
+          block?.extensionRequestId,
+          { confirmed: true },
+          boundary,
+        );
+        if (block?.extensionRequestId) {
+          const timer = setTimeout(() => {
+            removeConnectionActionByRequestId(block.extensionRequestId);
+          }, 1400);
+          connectionCardCleanupTimersRef.current.push(timer);
+        }
+        return result;
+      }
+      if (result.status === "unsupported") {
+        openConnectionSetup(connectionId);
+        await answerPiExtensionUiRequest(
+          block?.extensionRequestId,
+          { cancelled: true },
+          boundary,
+        );
+        return {
+          status: "unsupported",
+          reason: `${result.reason}; opened setup`,
+        };
+      }
+      await answerPiExtensionUiRequest(
+        block?.extensionRequestId,
+        { cancelled: true },
+        boundary,
+      );
       return result;
-    }
-    if (result.status === "unsupported") {
-      openConnectionSetup(connectionId);
-      await answerPiExtensionUiRequest(block?.extensionRequestId, { cancelled: true });
-      return { status: "unsupported", reason: `${result.reason}; opened setup` };
-    }
-    await answerPiExtensionUiRequest(block?.extensionRequestId, { cancelled: true });
-    return result;
-  }, [allConnectionItems, answerPiExtensionUiRequest, openConnectionSetup, refreshConnectionState, removeConnectionActionByRequestId]);
+    },
+    [
+      allConnectionItems,
+      answerPiExtensionUiRequest,
+      openConnectionSetup,
+      refreshConnectionState,
+      removeConnectionActionByRequestId,
+    ],
+  );
 
-  const declineConnectionAction = useCallback((
-    block: Extract<ContentBlock, { type: "connection_action" }>,
-  ) => {
-    void answerPiExtensionUiRequest(block.extensionRequestId, { cancelled: true });
-  }, [answerPiExtensionUiRequest]);
+  const declineConnectionAction = useCallback(
+    (block: Extract<ContentBlock, { type: "connection_action" }>) => {
+      void answerPiExtensionUiRequest(block.extensionRequestId, {
+        cancelled: true,
+      });
+    },
+    [answerPiExtensionUiRequest],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -1148,12 +1561,16 @@ export function StandaloneChat({
 
       const [, , connectionId, ...nameParts] = title.split(":");
       if (!connectionId) return;
-      const connection = allConnectionItems.find((item) => item.id === connectionId);
-      const connectionName = nameParts.join(":") || connection?.name || connectionId;
+      const connection = allConnectionItems.find(
+        (item) => item.id === connectionId,
+      );
+      const connectionName =
+        nameParts.join(":") || connection?.name || connectionId;
       const requestId = typeof inner.id === "string" ? inner.id : "";
       if (!requestId) return;
       const requestMessage = (inner as Record<string, unknown>).message;
-      const messageText = typeof requestMessage === "string" ? requestMessage : undefined;
+      const messageText =
+        typeof requestMessage === "string" ? requestMessage : undefined;
       const message: Message = {
         id: `connection-action-${requestId}`,
         role: "assistant",
@@ -1192,6 +1609,7 @@ export function StandaloneChat({
   usePiForegroundEvents({
     activePreset,
     activePresetRef,
+    authIdentityRef,
     buildProviderConfig,
     cancelStreamingMessageRender,
     clearPipeExecution,
@@ -1212,6 +1630,7 @@ export function StandaloneChat({
     pendingNextPiUserIntentRef,
     pendingSteerBatchRef,
     piActiveStopRequestedRef,
+    piAsyncOperationGenerationRef,
     piContentBlocksRef,
     piCrashCountRef,
     piFirstCallRetried,
@@ -1236,7 +1655,6 @@ export function StandaloneChat({
     setIsStreaming,
     setMessages,
     setPiInfo,
-    settings,
     syncThinkingLevelAfterStart,
     turnIntentTextValuesMatch,
   });
@@ -1255,46 +1673,47 @@ export function StandaloneChat({
     [messages],
   );
 
-  const {
-    handleKeyDown,
-    handlePaste,
-    handleSubmit,
-  } = useChatComposerShellActions({
-    input,
-    setInput,
-    inputRef,
-    connectionChip,
-    setConnectionChip,
-    isMac,
-    isComposing,
-    mentions: {
-      isOpen: showMentionDropdown,
-      selectedIndex: selectedMentionIndex,
-      suggestions: filteredMentions,
-    },
-    mentionActions: {
-      close: () => setShowMentionDropdown(false),
-      selectNext: () => setSelectedMentionIndex((index) => Math.min(index + 1, filteredMentions.length - 1)),
-      selectPrevious: () => setSelectedMentionIndex((index) => Math.max(index - 1, 0)),
-      insert: insertMention,
-    },
-    pastedImages,
-    pendingDocsRef,
-    attachedDocsRef,
-    messageHistory,
-    queuedPrompts,
-    steerShortcutInFlightRef,
-    isKnownConnectionId: (id) => INTEGRATION_ICON_KEYS.has(id),
-    handlePastedFiles,
-    attachPastedText,
-    sendMessage,
-    steerMessage,
-    steerQueuedPrompt,
-  });
+  const { handleKeyDown, handlePaste, handleSubmit } =
+    useChatComposerShellActions({
+      input: authSafeInput,
+      setInput,
+      inputRef,
+      connectionChip: authSafeConnectionChip,
+      setConnectionChip,
+      isMac,
+      isComposing,
+      mentions: {
+        isOpen: showMentionDropdown,
+        selectedIndex: selectedMentionIndex,
+        suggestions: filteredMentions,
+      },
+      mentionActions: {
+        close: () => setShowMentionDropdown(false),
+        selectNext: () =>
+          setSelectedMentionIndex((index) =>
+            Math.min(index + 1, filteredMentions.length - 1),
+          ),
+        selectPrevious: () =>
+          setSelectedMentionIndex((index) => Math.max(index - 1, 0)),
+        insert: insertMention,
+      },
+      pastedImages: authSafePastedImages,
+      pendingDocsRef: authSafePendingDocsRef,
+      attachedDocsRef: authSafeAttachedDocsRef,
+      messageHistory,
+      queuedPrompts: authSafeQueuedPrompts,
+      steerShortcutInFlightRef,
+      isKnownConnectionId: (id) => INTEGRATION_ICON_KEYS.has(id),
+      handlePastedFiles,
+      attachPastedText,
+      sendMessage,
+      steerMessage,
+      steerQueuedPrompt,
+    });
 
   const activeSourceFooterMessageId =
     isLoading || isStreaming
-      ? piMessageIdRef.current ?? currentStreamingMessageId ?? null
+      ? (piMessageIdRef.current ?? currentStreamingMessageId ?? null)
       : null;
 
   // Per-turn aggregation plan. Pipe sessions (pipe-run, pipe-watch) and any
@@ -1312,37 +1731,39 @@ export function StandaloneChat({
     [isPipeSessionChat, messages],
   );
 
-  const {
-    messageListProps,
-    imageViewerProps,
-    scheduleDialogProps,
-  } = useChatMessageActions({
-    messages,
-    setMessages,
-    isLoading,
-    isStreaming,
-    activeSourceFooterMessageId,
-    highlightedMessageId,
-    citationPlan,
-    sendMessage,
-    openFilePreview,
-    branchConversation,
-    connectionItems: allConnectionItems,
-    onOpenConnectionSetup: openConnectionSetup,
-    onConnectConnectionAction: connectFromInlineCard,
-    onDeclineConnectionAction: declineConnectionAction,
-    scheduleMessage: (message, displayLabel) => {
-      piMessageIdRef.current = null;
-      sendMessage(message, displayLabel);
-    },
-  });
+  const { messageListProps, imageViewerProps, scheduleDialogProps } =
+    useChatMessageActions({
+      messages,
+      setMessages,
+      isLoading,
+      isStreaming,
+      activeSourceFooterMessageId,
+      highlightedMessageId,
+      citationPlan,
+      sendMessage,
+      openFilePreview,
+      branchConversation,
+      connectionItems: allConnectionItems,
+      onOpenConnectionSetup: openConnectionSetup,
+      onConnectConnectionAction: connectFromInlineCard,
+      onDeclineConnectionAction: declineConnectionAction,
+      transientBoundaryKey: `${currentConversationAuthIdentity.authenticated}:${currentConversationAuthIdentity.userId ?? currentConversationAuthIdentity.token ?? "signed-out"}:${conversationId ?? "new"}`,
+      scheduleMessage: (message, displayLabel) => {
+        piMessageIdRef.current = null;
+        sendMessage(message, displayLabel);
+      },
+    });
   const { handleChatContextMenu } = useChatExportMenu({
     messages,
     citationPlan,
   });
 
   return (
-    <div ref={dropRootRef} className={cn("flex flex-col bg-background", className ?? "h-screen")} data-testid="section-home">
+    <div
+      ref={dropRootRef}
+      className={cn("flex flex-col bg-background", className ?? "h-screen")}
+      data-testid="section-home"
+    >
       <StandaloneChatHeader
         className={className}
         conversationId={conversationId}
@@ -1357,13 +1778,28 @@ export function StandaloneChat({
         setShowHistory={setShowHistory}
         renameConversation={renameConversation}
         deleteConversation={deleteConversation}
-        startNewConversation={startNewConversation}
+        startNewConversation={async (id) => {
+          await startNewConversation(id);
+        }}
         onNewChat={async () => {
           piStoppedIntentionallyRef.current = true;
           await startNewConversation();
         }}
         rightActions={
           <div className="relative z-10 flex items-center gap-1">
+            {hostedPreviewUsage ? (
+              <div
+                className="hidden sm:inline-flex h-7 items-center rounded-md border border-border/60 bg-muted/30 px-2 text-[10px] font-medium text-muted-foreground"
+                data-testid="hosted-preview-usage"
+                title="Lifetime Screenpipe-hosted preview usage"
+              >
+                {hostedPreviewUsage.used} of {hostedPreviewUsage.limit} used
+                <span className="mx-1">·</span>
+                {hostedPreviewUsage.remaining > 0
+                  ? `${hostedPreviewUsage.remaining} hosted ${hostedPreviewUsage.remaining === 1 ? "turn" : "turns"} left`
+                  : "use your AI or upgrade"}
+              </div>
+            ) : null}
             {inspectorHasContent ? (
               <Button
                 variant="ghost"
@@ -1373,7 +1809,10 @@ export function StandaloneChat({
                   e.stopPropagation();
                   toggleInspector();
                 }}
-                className={cn("h-7 w-7", activeSideView === "inspector" && "bg-muted")}
+                className={cn(
+                  "h-7 w-7",
+                  activeSideView === "inspector" && "bg-muted",
+                )}
                 title="Inspector"
               >
                 <Settings2 size={14} />
@@ -1407,243 +1846,274 @@ export function StandaloneChat({
           </div>
         }
       />
-
       <div className="flex-1 flex min-h-0" data-browser-panel-host>
-      <div className="flex-1 flex flex-col min-w-0">
-      <ChatMainPane
-        hideInlineHistory={hideInlineHistory}
-        showHistory={showHistory}
-        onCloseHistory={() => setShowHistory(false)}
-        historySearch={historySearch}
-        onHistorySearchChange={setHistorySearch}
-        groupedConversations={groupedConversations}
-        conversationId={conversationId}
-        loadConversation={loadConversation}
-        deleteConversation={deleteConversation}
-        renameConversation={renameConversation}
-        scrollContainerRef={scrollContainerRef}
-        messagesEndRef={messagesEndRef}
-        onMessagesScroll={handleMessagesScroll}
-        onChatContextMenu={handleChatContextMenu}
-        messages={messages}
-        isPreparingPrefill={isPreparingPrefill}
-        activePipeExecution={activePipeExecution}
-        isLoading={isLoading}
-        isStreaming={isStreaming}
-        disabledReason={disabledReason}
-        hasPresets={Boolean(hasPresets)}
-        hasValidModel={hasValidModel}
-        needsLogin={needsLogin}
-        onOpenLogin={async () => {
-          await commands.openLoginWindow(null);
-        }}
-        onOpenSettings={async () => {
-          await commands.showWindow({ Home: { page: null } });
-        }}
-        summaryCardsProps={{
-          onSendMessage: sendMessage,
-          customTemplates,
-          onSaveCustomTemplate: saveCustomTemplate,
-          onDeleteCustomTemplate: deleteCustomTemplate,
-          userName: settings.userName,
-          templatePipes,
-          existingPipes: pipes
-            .filter((pipe) => pipe.config.config?.template !== true)
-            .map((pipe) => ({
-              name: pipe.config.name,
-              title:
-                typeof pipe.config.config?.title === "string"
-                  ? pipe.config.config.title
-                  : pipe.config.name,
-              description:
-                typeof pipe.config.config?.description === "string"
-                  ? pipe.config.config.description
-                  : "",
-              enabled: pipe.config.enabled,
-              schedule: pipe.config.schedule,
-            })),
-        }}
-        messageListProps={messageListProps}
-        isUserScrolledUp={isUserScrolledUp}
-        scrollToBottom={scrollToBottom}
-      />
+        <div className="flex-1 flex flex-col min-w-0">
+          <ChatMainPane
+            hideInlineHistory={hideInlineHistory}
+            showHistory={showHistory}
+            onCloseHistory={() => setShowHistory(false)}
+            historySearch={historySearch}
+            onHistorySearchChange={setHistorySearch}
+            groupedConversations={groupedConversations}
+            conversationId={conversationId}
+            loadConversation={loadConversation}
+            deleteConversation={deleteConversation}
+            renameConversation={renameConversation}
+            scrollContainerRef={scrollContainerRef}
+            messagesEndRef={messagesEndRef}
+            onMessagesScroll={handleMessagesScroll}
+            onChatContextMenu={handleChatContextMenu}
+            messages={messages}
+            isPreparingPrefill={isPreparingPrefill}
+            activePipeExecution={activePipeExecution}
+            isLoading={isLoading}
+            isStreaming={isStreaming}
+            disabledReason={disabledReason}
+            hasPresets={Boolean(hasPresets)}
+            hasValidModel={hasValidModel}
+            needsLogin={needsLogin}
+            onOpenLogin={async () => {
+              await commands.openLoginWindow(null);
+            }}
+            onOpenSettings={async () => {
+              await commands.showWindow({ Home: { page: null } });
+            }}
+            summaryCardsProps={{
+              onSendMessage: sendMessage,
+              customTemplates,
+              onSaveCustomTemplate: saveCustomTemplate,
+              onDeleteCustomTemplate: deleteCustomTemplate,
+              userName: settings.userName,
+              templatePipes,
+              existingPipes: pipes
+                .filter((pipe) => pipe.config.config?.template !== true)
+                .map((pipe) => ({
+                  name: pipe.config.name,
+                  title:
+                    typeof pipe.config.config?.title === "string"
+                      ? pipe.config.config.title
+                      : pipe.config.name,
+                  description:
+                    typeof pipe.config.config?.description === "string"
+                      ? pipe.config.config.description
+                      : "",
+                  enabled: pipe.config.enabled,
+                  schedule: pipe.config.schedule,
+                })),
+            }}
+            messageListProps={messageListProps}
+            isUserScrolledUp={isUserScrolledUp}
+            scrollToBottom={scrollToBottom}
+          />
 
-      <ChatComposer
-        prefill={{
-          context: prefillContext,
-          frameId: prefillFrameId,
-          source: prefillSource,
-          onClear: () => {
-            setPrefillContext(null);
-            setPrefillFrameId(null);
-          },
-          onClearFrame: () => setPrefillFrameId(null),
-        }}
-        suggestions={{
-          show: messages.length > 0 && !isLoading && settings?.showChatSuggestions !== false,
-          suggestions: connectionAwareSuggestions,
-          inputSectionWidth,
-          isRefreshing: suggestionsRefreshing,
-          onSendSuggestion: sendMessage,
-          onRefresh: refreshVisibleSuggestions,
-          onHide: () => updateSettings({ showChatSuggestions: false }),
-        }}
-        attachments={{
-          pendingDocs,
-          attachedDocs,
-          pastedImages,
-          onShowPastedTextInField: showPastedTextInField,
-          onRemoveDoc: (index: number) => setAttachedDocs((prev) => prev.filter((_, idx) => idx !== index)),
-          onOpenImageViewer: (images, index) => imageViewerProps.onChange({ images, index }),
-          onRemoveImage: (index: number) => setPastedImages((prev) => prev.filter((_, idx) => idx !== index)),
-        }}
-        queue={{
-          queuedPrompts,
-          queuedActionPromptId,
-          queuedDisplayById: getQueuedDisplayBySession(currentQueueSessionId),
-          queuedScrollRef,
-          isMac,
-          onSteerQueuedPrompt: steerQueuedPrompt,
-          onCancelQueuedPrompt: cancelQueuedPrompt,
-        }}
-        input={{
-          sectionRef: inputSectionRef,
-          inputRef,
-          value: input,
-          disabledReason,
-          canChat: Boolean(canChat),
-          isLoading,
-          isStreaming,
-          isEmbedded,
-          isDragging,
-          connectionChip,
-          chipPrefixRef,
-          chipPrefixWidth,
-          chipScrollTop,
-          onClearConnectionChip: () => setConnectionChip(null),
-          onChange: handleMentionInputChange,
-          onCompositionStart: () => setIsComposing(true),
-          onCompositionEnd: () => setIsComposing(false),
-          onTextareaScroll: (e: React.UIEvent<HTMLTextAreaElement>) => setChipScrollTop(e.currentTarget.scrollTop),
-          onKeyDown: handleKeyDown,
-          onSubmit: handleSubmit,
-          onPaste: handlePaste,
-        }}
-        mentions={{
-          show: showMentionDropdown,
-          suggestions: filteredMentions,
-          dropdownRef,
-          selectedIndex: selectedMentionIndex,
-          onInsertMention: insertMention,
-          isLoadingSpeakers,
-          isLoadingTagSearch,
-        }}
-        filters={{
-          appFilterOpen,
-          onFilterMenuOpenChange: handleFilterMenuOpenChange,
-          hasActiveFilters: Boolean(hasActiveFilters),
-          activeFilterCount,
-          activeFilters,
-          activeFilterLabels,
-          filterSearch,
-          onFilterSearchChange: updateFilterSearch,
-          onClearFilterSearch: clearFilterSearch,
-          filterSearchGroups,
-          filterSearchResults,
-          isLoadingFilterSearch,
-          selectedFilterResultIndex,
-          onSelectFilterResultIndex: selectFilterResultIndex,
-          onSelectNextFilterResult: selectNextFilterResult,
-          onSelectPreviousFilterResult: selectPreviousFilterResult,
-          onApplySelectedFilterResult: applySelectedFilterResult,
-          staticMentionSuggestions: STATIC_MENTION_SUGGESTIONS,
-          appMentionSuggestions,
-          allTagMentionSuggestions,
-          tagMentionSections,
-          recentSpeakers,
-          appsLoading,
-          tagsLoading,
-          connections,
-          isWindows,
-          onCloseFilterMenu: closeFilterMenu,
-          getFilterSuggestionState,
-          applyFilterSuggestion,
-          applyTimeFilterSuggestion,
-          applyContentFilterSuggestion,
-          applyAppFilterSuggestion,
-          applyTagFilterSuggestion,
-          applyConnectionFilterTag,
-          applySpeakerFilterSuggestion,
-          onPickFiles: handleFilePicker,
-        }}
-        modelControls={{
-          settings,
-          activePreset,
-          activePipeExecution,
-          currentQueueSessionId,
-          onPresetSaved: handlePiRestart,
-          onSelectPreset: handleSetActivePreset,
-        }}
-        connectBanner={{
-          show: showConnectBanner,
-          suggestedConnectionTiles,
-          onOpenConnectionSetup: openConnectionSetup,
-          onDismiss: () => {
-            setShowConnectBanner(false);
-            try { localStorage.setItem("screenpipe_connect_banner_dismissed", "true"); } catch {}
-          },
-        }}
-        onStop={handleStop}
-      />
-      </div> {/* End of chat column */}
-
-      {/* Agent-controlled embedded browser. Slides in from the right when
+          <ChatComposer
+            prefill={{
+              context: conversationAuthResetPending ? null : prefillContext,
+              frameId: conversationAuthResetPending ? null : prefillFrameId,
+              source: prefillSource,
+              onClear: () => {
+                setPrefillContext(null);
+                setPrefillFrameId(null);
+              },
+              onClearFrame: () => setPrefillFrameId(null),
+            }}
+            suggestions={{
+              show:
+                messages.length > 0 &&
+                !isLoading &&
+                settings?.showChatSuggestions !== false,
+              suggestions: connectionAwareSuggestions,
+              inputSectionWidth,
+              isRefreshing: suggestionsRefreshing,
+              onSendSuggestion: async (text) => {
+                await sendMessage(text);
+              },
+              onRefresh: refreshVisibleSuggestions,
+              onHide: () => updateSettings({ showChatSuggestions: false }),
+            }}
+            attachments={{
+              pendingDocs: authSafePendingDocs,
+              attachedDocs: authSafeAttachedDocs,
+              pastedImages: authSafePastedImages,
+              onShowPastedTextInField: showPastedTextInField,
+              onRemoveDoc: (index: number) =>
+                setAttachedDocs((prev) =>
+                  prev.filter((_, idx) => idx !== index),
+                ),
+              onOpenImageViewer: (images, index) =>
+                imageViewerProps.onChange({ images, index }),
+              onRemoveImage: (index: number) =>
+                setPastedImages((prev) =>
+                  prev.filter((_, idx) => idx !== index),
+                ),
+            }}
+            queue={{
+              queuedPrompts: authSafeQueuedPrompts,
+              queuedActionPromptId,
+              queuedDisplayById: getQueuedDisplayBySession(
+                currentQueueSessionId,
+              ),
+              queuedScrollRef,
+              isMac,
+              onSteerQueuedPrompt: steerQueuedPrompt,
+              onCancelQueuedPrompt: cancelQueuedPrompt,
+            }}
+            input={{
+              sectionRef: inputSectionRef,
+              inputRef,
+              value: authSafeInput,
+              disabledReason,
+              canChat: Boolean(canChat) && !conversationOperationPending,
+              isLoading,
+              isStreaming,
+              isEmbedded,
+              isDragging,
+              connectionChip: authSafeConnectionChip,
+              chipPrefixRef,
+              chipPrefixWidth,
+              chipScrollTop,
+              onClearConnectionChip: () => setConnectionChip(null),
+              onChange: handleMentionInputChange,
+              onCompositionStart: () => setIsComposing(true),
+              onCompositionEnd: () => setIsComposing(false),
+              onTextareaScroll: (e: React.UIEvent<HTMLTextAreaElement>) =>
+                setChipScrollTop(e.currentTarget.scrollTop),
+              onKeyDown: handleKeyDown,
+              onSubmit: handleSubmit,
+              onPaste: handlePaste,
+            }}
+            mentions={{
+              show: showMentionDropdown,
+              suggestions: filteredMentions,
+              dropdownRef,
+              selectedIndex: selectedMentionIndex,
+              onInsertMention: insertMention,
+              isLoadingSpeakers,
+              isLoadingTagSearch,
+            }}
+            filters={{
+              appFilterOpen,
+              onFilterMenuOpenChange: handleFilterMenuOpenChange,
+              hasActiveFilters: Boolean(hasActiveFilters),
+              activeFilterCount,
+              activeFilters,
+              activeFilterLabels,
+              filterSearch,
+              onFilterSearchChange: updateFilterSearch,
+              onClearFilterSearch: clearFilterSearch,
+              filterSearchGroups,
+              filterSearchResults,
+              isLoadingFilterSearch,
+              selectedFilterResultIndex,
+              onSelectFilterResultIndex: selectFilterResultIndex,
+              onSelectNextFilterResult: selectNextFilterResult,
+              onSelectPreviousFilterResult: selectPreviousFilterResult,
+              onApplySelectedFilterResult: applySelectedFilterResult,
+              staticMentionSuggestions: STATIC_MENTION_SUGGESTIONS,
+              appMentionSuggestions,
+              allTagMentionSuggestions,
+              tagMentionSections,
+              recentSpeakers,
+              appsLoading,
+              tagsLoading,
+              connections,
+              isWindows,
+              onCloseFilterMenu: closeFilterMenu,
+              getFilterSuggestionState,
+              applyFilterSuggestion,
+              applyTimeFilterSuggestion,
+              applyContentFilterSuggestion,
+              applyAppFilterSuggestion,
+              applyTagFilterSuggestion,
+              applyConnectionFilterTag,
+              applySpeakerFilterSuggestion,
+              onPickFiles: handleFilePicker,
+              imagesAllowed: !hostedPreviewTextOnly,
+            }}
+            modelControls={{
+              settings,
+              activePreset,
+              activePipeExecution,
+              currentQueueSessionId,
+              onPresetSaved: handlePiRestart,
+              onSelectPreset: handleSetActivePreset,
+            }}
+            connectBanner={{
+              show: showConnectBanner,
+              suggestedConnectionTiles,
+              onOpenConnectionSetup: openConnectionSetup,
+              onDismiss: () => {
+                setShowConnectBanner(false);
+                try {
+                  localStorage.setItem(
+                    "screenpipe_connect_banner_dismissed",
+                    "true",
+                  );
+                } catch {}
+              },
+            }}
+            onStop={handleStop}
+          />
+        </div>{" "}
+        {/* End of chat column */}
+        {/* Agent-controlled embedded browser. Slides in from the right when
           the agent navigates (or when restoring a chat that has saved
           state). The actual page is rendered by a Tauri WebviewWindow
           positioned over the placeholder div inside this component. */}
-      <BrowserSidebar
-        conversationId={conversationId}
-        // Session id the agent process runs under (the value tagged as the
-        // navigation `owner` via x-screenpipe-session). Lets the sidebar reveal
-        // this chat's own agent navigations even if `conversationId` state lags.
-        agentSessionId={piSessionIdRef.current}
-        filePreview={filePreview}
-        onReplaceFilePreviewPath={openFilePreview}
-        inspectorContent={inspectorOpen && activeSideView === "inspector" ? (
-          <ChatInspector
-            outputs={inspectorOutputs}
-            sources={inspectorSources}
-            onOpenFile={(path) => {
-              setBrowserHiddenBehindInspector(false);
-              setActiveSideView("side");
-              openFilePreview(path);
-            }}
-          />
-        ) : null}
-        onBecomeVisible={() => {
-          setBrowserHiddenBehindInspector(false);
-          setActiveSideView("side");
-        }}
-        onPanelStateChange={handlePanelStateChange}
+        <BrowserSidebar
+          conversationId={conversationId}
+          // Session id the agent process runs under (the value tagged as the
+          // navigation `owner` via x-screenpipe-session). Lets the sidebar reveal
+          // this chat's own agent navigations even if `conversationId` state lags.
+          agentSessionId={piSessionIdRef.current}
+          filePreview={filePreview}
+          onReplaceFilePreviewPath={openFilePreview}
+          inspectorContent={
+            inspectorOpen && activeSideView === "inspector" ? (
+              <ChatInspector
+                outputs={inspectorOutputs}
+                sources={inspectorSources}
+                onOpenFile={(path) => {
+                  setBrowserHiddenBehindInspector(false);
+                  setActiveSideView("side");
+                  openFilePreview(path);
+                }}
+              />
+            ) : null
+          }
+          onBecomeVisible={() => {
+            setBrowserHiddenBehindInspector(false);
+            setActiveSideView("side");
+          }}
+          onPanelStateChange={handlePanelStateChange}
+        />
+      </div>{" "}
+      {/* End of horizontal chat+browser split */}
+      {!conversationAuthResetPending &&
+        !conversationOperationPending &&
+        scheduleDialogProps && (
+          <SchedulePromptDialog {...scheduleDialogProps} />
+        )}
+      <ImageViewerDialog
+        {...imageViewerProps}
+        imageViewer={
+          conversationAuthResetPending || conversationOperationPending
+            ? null
+            : imageViewerProps.imageViewer
+        }
       />
-      </div> {/* End of horizontal chat+browser split */}
-
-
-      {scheduleDialogProps && (
-        <SchedulePromptDialog {...scheduleDialogProps} />
-      )}
-      <ImageViewerDialog {...imageViewerProps} />
       <FreeTierUpgradeDialog
-        open={freeTierDialogOpen}
+        open={!conversationAuthResetPending && freeTierDialogOpen}
         limit={freeTierLimit}
         plan={settings.user?.subscription_plan ?? null}
         userToken={settings.user?.token}
         onOpenChange={setFreeTierDialogOpen}
-        onChooseOwnAI={async () => {
-          await commands.showWindow({ Home: { page: "ai" } });
+        onChooseOwnAI={async (choice) => {
+          await commands.showWindow({
+            Home: { page: buildFreeTierAiSetupPage(choice) },
+          });
         }}
       />
-
     </div>
   );
 }

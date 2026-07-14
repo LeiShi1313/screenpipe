@@ -9,6 +9,7 @@
 use screenpipe_core::agents::pi::screenpipe_cloud_models;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use specta::Type;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -41,6 +42,57 @@ fn read_lines_lossy(reader: &mut BufReader<impl std::io::Read>) -> Option<String
 
 const TEXT_DELTA_EMIT_BATCH_MS: u128 = 50;
 const TEXT_DELTA_EMIT_BATCH_CHARS: usize = 1_200;
+
+/// Shared by every process incarnation of one Pi session while that manager
+/// remains in the pool. Emissions take a read lock across the generation check
+/// and `AppHandle::emit`; stop/replacement takes the write lock to advance it.
+/// This closes the check-then-emit race: once invalidation returns, no reader
+/// from the previous process can publish another session-scoped event.
+type PiEventGeneration = Arc<std::sync::RwLock<u64>>;
+
+fn new_pi_event_generation() -> PiEventGeneration {
+    Arc::new(std::sync::RwLock::new(0))
+}
+
+fn advance_pi_event_generation(generation: &PiEventGeneration) -> u64 {
+    let mut current = generation
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *current = current.wrapping_add(1);
+    *current
+}
+
+fn is_current_pi_event_generation(generation: &PiEventGeneration, expected: u64) -> bool {
+    let current = generation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *current == expected
+}
+
+fn current_pi_event_generation_guard(
+    generation: &PiEventGeneration,
+    expected: u64,
+) -> Option<std::sync::RwLockReadGuard<'_, u64>> {
+    let current = generation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *current == expected {
+        Some(current)
+    } else {
+        None
+    }
+}
+
+fn with_current_pi_event_generation<T>(
+    generation: &PiEventGeneration,
+    expected: u64,
+    action: impl FnOnce() -> T,
+) -> Option<T> {
+    let current = generation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (*current == expected).then(action)
+}
 
 /// Session-ID prefix for internal title-generation sessions.
 /// These sessions produce very short output (≤50 chars) and must bypass
@@ -311,9 +363,47 @@ impl PiPool {
     }
 }
 
+/// Stop every value in a session map and then forget every key. Keeping this
+/// generic makes the auth-boundary behavior directly testable with UUID keys
+/// without spawning real Pi subprocesses.
+fn stop_and_clear_session_map<T>(
+    sessions: &mut HashMap<String, T>,
+    mut stop: impl FnMut(&mut T),
+) -> Vec<String> {
+    let mut stopped_ids = sessions.keys().cloned().collect::<Vec<_>>();
+    stopped_ids.sort();
+    for session in sessions.values_mut() {
+        stop(session);
+    }
+    sessions.clear();
+    stopped_ids
+}
+
 /// State for managing multiple Pi sidecar processes
 #[derive(Clone)]
-pub struct PiState(pub Arc<Mutex<PiPool>>);
+pub struct PiState(
+    pub Arc<Mutex<PiPool>>,
+    Arc<arc_swap::ArcSwap<Option<String>>>,
+    Arc<Mutex<()>>,
+);
+
+impl PiState {
+    pub fn new(cloud_token: Arc<arc_swap::ArcSwap<Option<String>>>) -> Self {
+        Self(
+            Arc::new(Mutex::new(PiPool::new())),
+            cloud_token,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    pub(crate) fn cloud_token_snapshot(&self) -> Option<String> {
+        self.1.load_full().as_ref().clone()
+    }
+
+    pub(crate) async fn lock_auth_update(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.2.lock().await
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -458,10 +548,146 @@ pub struct PiManager {
     queue_state: Option<Arc<crate::pi_command_queue::PiQueueState>>,
     /// Join handle for the queue drain task (for cleanup).
     queue_task: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic process/event generation shared across replacements of the
+    /// same session manager. Readers capture the value for their Bun process.
+    event_generation: PiEventGeneration,
+    /// Spawn-time provider identity. Provider changes require a new process:
+    /// the child environment may contain that provider's credential, which
+    /// must never remain readable after crossing to another provider.
+    provider_name: Option<String>,
+    /// Non-secret fingerprint of the provider endpoint + credential domain.
+    /// Concurrent Pi tools can inspect sibling process environments on some
+    /// platforms, so only sessions with this exact boundary may coexist.
+    provider_boundary: Option<PiProviderBoundary>,
+}
+
+/// Put every foreground Pi process in a tree boundary that can be terminated
+/// as one unit. Pi's tools can spawn shells and other helpers, all of which
+/// can inherit the selected provider's key or the scoped cloud-proxy
+/// capability from the Bun parent. Killing only Bun during an account or
+/// provider switch therefore leaves a payer/privacy boundary open.
+#[cfg(unix)]
+fn isolate_foreground_process_tree(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // `0` makes the child its own process-group leader (PGID == PID). This is
+    // applied in the child before exec; a successful spawn therefore guarantees
+    // that signalling `-PID` cannot target screenpipe's own process group.
+    cmd.process_group(0);
+}
+
+#[cfg(windows)]
+fn isolate_foreground_process_tree(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Windows process groups are not job objects. `taskkill /T` below closes
+    // the normal descendant tree while Bun is addressable, but a descendant
+    // that deliberately breaks away or outlives an already-reaped root is a
+    // platform limitation of this fallback.
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn isolate_foreground_process_tree(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_foreground_process_group(pid: u32) -> Result<(), String> {
+    // Use an absolute system utility rather than PATH: a Pi tool can influence
+    // its own environment and must not be able to substitute the executable
+    // used for the credential-boundary kill. SIGKILL is intentional — the old
+    // account must be unable to run another tool/provider request after this
+    // function returns.
+    let kill_bin = ["/bin/kill", "/usr/bin/kill"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).exists())
+        .ok_or_else(|| "system kill utility not found".to_string())?;
+    let target = format!("-{pid}");
+    let output = Command::new(kill_bin)
+        .args(["-KILL", "--", target.as_str()])
+        .output()
+        .map_err(|e| format!("failed to execute process-group kill for {pid}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "process-group kill for {pid} failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn terminate_foreground_process_group(pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let taskkill = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("taskkill.exe"))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+    let pid_arg = pid.to_string();
+    let output = Command::new(taskkill)
+        .args(["/F", "/T", "/PID", pid_arg.as_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("failed to execute taskkill for Pi tree {pid}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "taskkill for Pi tree {pid} failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_foreground_process_group(_pid: u32) -> Result<(), String> {
+    Err("foreground process-tree termination is unsupported on this platform".to_string())
+}
+
+/// Synchronously terminate the credential-bearing foreground Pi process tree.
+/// The direct-child kill is only a fallback: if the platform tree primitive
+/// fails, callers get a loud log because descendants may not be contained.
+fn terminate_foreground_process_tree(child: &mut Child) -> Result<(), String> {
+    let pid = child.id();
+    let tree_result = terminate_foreground_process_group(pid);
+    if let Err(ref tree_error) = tree_result {
+        error!(
+            "Failed to terminate full Pi process tree {}: {}; falling back to parent kill",
+            pid, tree_error
+        );
+        if let Err(parent_error) = child.kill() {
+            warn!(
+                "Failed to kill Pi parent {} after tree termination failure: {}",
+                pid, parent_error
+            );
+        }
+    }
+
+    let wait_result = child
+        .wait()
+        .map(|_| ())
+        .map_err(|e| format!("failed waiting for Pi parent {pid}: {e}"));
+    match (tree_result, wait_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(tree_error), Ok(())) => Err(tree_error),
+        (Ok(()), Err(wait_error)) => Err(wait_error),
+        (Err(tree_error), Err(wait_error)) => Err(format!("{tree_error}; {wait_error}")),
+    }
 }
 
 impl PiManager {
     pub fn new(app_handle: AppHandle) -> Self {
+        Self::with_event_generation(app_handle, new_pi_event_generation())
+    }
+
+    fn with_event_generation(app_handle: AppHandle, event_generation: PiEventGeneration) -> Self {
         Self {
             child: None,
             stdin: None,
@@ -473,6 +699,9 @@ impl PiManager {
             queue_handle: None,
             queue_state: None,
             queue_task: None,
+            event_generation,
+            provider_name: None,
+            provider_boundary: None,
         }
     }
 
@@ -489,6 +718,16 @@ impl PiManager {
                         "Pi process (pid {}) has exited with status: {}",
                         pid, status
                     );
+                    // Bun can exit while a shell/tool descendant remains alive.
+                    // On Unix the isolated PGID remains addressable; on Windows
+                    // taskkill can still close the ordinary parent/child tree
+                    // while the root process object is retained by `Child`.
+                    if let Err(e) = terminate_foreground_process_group(pid) {
+                        debug!(
+                            "Pi process tree {} was already gone after parent exit: {}",
+                            pid, e
+                        );
+                    }
                     self.child = None;
                     self.stdin = None;
                     false
@@ -517,6 +756,11 @@ impl PiManager {
     }
 
     pub fn stop(&mut self) {
+        // Fence UI/session events before touching the child or queue. The
+        // write lock waits for an already-admitted emit to finish; after this
+        // returns, every old reader/watcher observes a stale generation.
+        advance_pi_event_generation(&self.event_generation);
+
         // Signal queue to stop accepting commands
         if let Some(state) = self.queue_state.take() {
             state.signal_terminated();
@@ -533,11 +777,9 @@ impl PiManager {
                 let _ = writeln!(stdin, r#"{{"type":"abort"}}"#);
             }
 
-            // Kill the process
-            if let Err(e) = child.kill() {
-                error!("Failed to kill pi child process: {}", e);
+            if let Err(e) = terminate_foreground_process_tree(&mut child) {
+                error!("Pi process-tree termination was incomplete: {}", e);
             }
-            let _ = child.wait();
         }
         self.stdin = None;
         self.project_dir = None;
@@ -552,6 +794,69 @@ impl PiManager {
     fn has_in_flight_work(&self) -> bool {
         pi_session_has_in_flight_work(self.queue_state.as_ref(), &self.pending_responses)
     }
+}
+
+/// Account credentials are spawn-time Pi state. Stop every legacy and UUID
+/// session when that identity changes so no child can retain an old token or
+/// queued work across logout/account switching.
+pub(crate) async fn stop_all_pi_sessions_and_then<T, F>(
+    state: &PiState,
+    reason: &str,
+    after_stop: F,
+) -> (Vec<String>, T)
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    let (stopped_ids, result) = {
+        let mut pool = state.0.lock().await;
+        let stopped_ids = stop_and_clear_session_map(&mut pool.sessions, PiManager::stop);
+        // Keep the Pi pool locked while the caller rotates its credential or
+        // scrubs auth files. A concurrent pi_start/pi_send therefore cannot
+        // reuse an old child or spawn from stale auth between those operations.
+        let result = after_stop();
+        (stopped_ids, result)
+    };
+    info!(
+        "Stopped {} Pi session(s) for {}: {:?}",
+        stopped_ids.len(),
+        reason,
+        stopped_ids
+    );
+    (stopped_ids, result)
+}
+
+/// Async variant used by account rotation so SecretStore persistence can
+/// complete while the Pi pool remains locked. That prevents a concurrent
+/// `pi_start` from recreating the previous identity between disk scrub,
+/// durable commit, and the runtime ArcSwap update.
+pub(crate) async fn stop_all_pi_sessions_and_then_async<T, F, Fut>(
+    state: &PiState,
+    reason: &str,
+    after_stop: F,
+) -> (Vec<String>, T)
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    let (stopped_ids, result) = {
+        let mut pool = state.0.lock().await;
+        let stopped_ids = stop_and_clear_session_map(&mut pool.sessions, PiManager::stop);
+        let result = after_stop().await;
+        (stopped_ids, result)
+    };
+    info!(
+        "Stopped {} Pi session(s) for {}: {:?}",
+        stopped_ids.len(),
+        reason,
+        stopped_ids
+    );
+    (stopped_ids, result)
+}
+
+pub(crate) async fn stop_all_pi_sessions(state: &PiState, reason: &str) -> Vec<String> {
+    stop_all_pi_sessions_and_then(state, reason, || ()).await.0
 }
 
 /// Get the Pi config directory — screenpipe's isolated agent dir
@@ -571,7 +876,9 @@ fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<(), String> {
 
     let content =
         std::fs::read_to_string(auth_path).map_err(|e| format!("Failed to read pi auth: {}", e))?;
-    let mut auth: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+    let mut auth: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        format!("Pi auth.json is malformed; preserved without rewriting: {error}")
+    })?;
 
     let removed = auth
         .as_object_mut()
@@ -584,26 +891,91 @@ fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<(), String> {
 
     let auth_str = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("Failed to serialize pi auth: {}", e))?;
-    std::fs::write(auth_path, auth_str).map_err(|e| format!("Failed to write pi auth: {}", e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(auth_path, perms);
-    }
-
-    Ok(())
+    write_pi_secret_file_atomically(auth_path, auth_str.as_bytes(), "auth")
 }
 
 pub(crate) fn clear_screenpipe_auth_token_files() -> Result<(), String> {
-    let auth_path = get_pi_config_dir()?.join("auth.json");
-    remove_screenpipe_auth_from_path(&auth_path)
+    let isolated_config_dir = get_pi_config_dir()?;
+    let mut errors = Vec::new();
+    // Never mutate ~/.pi/agent. Screenpipe seeds its private directory once,
+    // then every managed spawn is scoped with PI_CODING_AGENT_DIR. Global Pi
+    // credentials belong to the user and may be edited concurrently by their
+    // standalone CLI.
+    if let Err(error) = remove_screenpipe_auth_from_path(&isolated_config_dir.join("auth.json")) {
+        errors.push(error);
+    }
+    if let Err(error) =
+        reset_screenpipe_model_token_from_path(&isolated_config_dir.join("models.json"))
+    {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
-/// chmod 600 (unix): pi's `auth.json` / `models.json` embed the user's raw
-/// cloud JWT while signed in (#3943) — keep them out of reach of other local
-/// users. No-op on Windows (per-user ACLs already apply under %USERPROFILE%).
+fn reset_screenpipe_model_token_from_path(models_path: &Path) -> Result<(), String> {
+    if !models_path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(models_path)
+        .map_err(|e| format!("Failed to read pi models: {e}"))?;
+    let mut models: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        format!("Pi models.json is malformed; preserved without rewriting: {error}")
+    })?;
+    let Some(api_key) = models.pointer_mut("/providers/screenpipe/apiKey") else {
+        return Ok(());
+    };
+    if api_key.as_str() == Some("SCREENPIPE_LOCAL_API_KEY") {
+        return Ok(());
+    }
+    *api_key = json!("SCREENPIPE_LOCAL_API_KEY");
+    let models_str = serde_json::to_string_pretty(&models)
+        .map_err(|e| format!("Failed to serialize pi models: {e}"))?;
+    write_pi_secret_file_atomically(models_path, models_str.as_bytes(), "models")
+}
+
+fn write_pi_secret_file_atomically(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let tmp_path = path.with_extension(format!("{label}.logout.tmp"));
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create temporary pi {label}: {e}"))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("Failed to write temporary pi {label}: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temporary pi {label}: {e}"))?;
+        harden_secret_file(&tmp_path);
+        if let Err(first_error) = std::fs::rename(&tmp_path, path) {
+            #[cfg(windows)]
+            {
+                // Windows does not replace an existing destination with
+                // `rename`. Removing it first has a safe crash mode here: a
+                // missing Pi config is regenerated, while the old JWT is gone.
+                let _ = std::fs::remove_file(path);
+                std::fs::rename(&tmp_path, path).map_err(|retry_error| {
+                    format!("Failed to replace pi {label}: {first_error}; retry: {retry_error}")
+                })?;
+            }
+            #[cfg(not(windows))]
+            return Err(format!("Failed to replace pi {label}: {first_error}"));
+        }
+        harden_secret_file(path);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// chmod 600 (unix): pi's `auth.json` / `models.json` can contain user-owned
+/// provider credentials. The managed Screenpipe entry no longer persists a
+/// Clerk JWT, but these files still stay private to the OS user. No-op on
+/// Windows (per-user ACLs already apply under %USERPROFILE%).
 fn harden_secret_file(path: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -1296,28 +1668,34 @@ fn model_supports_reasoning(provider: &str, model: &str) -> bool {
     }
 }
 
-/// Build the providers to add/update in models.json for pi-coding-agent.
-///
-/// Returns a map of provider entries to merge into the existing models.json.
-/// We merge instead of rebuilding from scratch to avoid a race condition where
-/// concurrent pipes overwrite each other's providers.
+/// Build the single selected provider for one conversation runtime.
+/// The caller rewrites that runtime's models.json rather than merging entries
+/// from other conversations or credential domains.
 async fn build_models_json(
     user_token: Option<&str>,
     provider_config: Option<&PiProviderConfig>,
+    screenpipe_proxy_base_url: &str,
 ) -> serde_json::Value {
     let mut providers_map = serde_json::Map::new();
 
-    // Always add screenpipe cloud provider
-    let api_key_value = user_token.unwrap_or("SCREENPIPE_API_KEY");
-    let models = screenpipe_cloud_models(SCREENPIPE_API_URL, user_token).await;
-    let screenpipe_provider = json!({
-        "baseUrl": SCREENPIPE_API_URL,
-        "api": "openai-completions",
-        "apiKey": api_key_value,
-        "authHeader": true,
-        "models": models
-    });
-    providers_map.insert("screenpipe".to_string(), screenpipe_provider);
+    // Fetch the account-filtered catalog in trusted Rust, but send inference
+    // through the localhost proxy. The Pi child receives only the ordinary
+    // local API key and a one-way, account-rotating proxy capability; the raw
+    // Clerk JWT never enters its environment or shared config files.
+    if pi_provider_uses_screenpipe_cloud(provider_config).unwrap_or(false) {
+        let models = screenpipe_cloud_models(SCREENPIPE_API_URL, user_token).await;
+        let screenpipe_provider = json!({
+            "baseUrl": screenpipe_proxy_base_url,
+            "api": "openai-completions",
+            "apiKey": "SCREENPIPE_LOCAL_API_KEY",
+            "authHeader": true,
+            "headers": {
+                "x-screenpipe-cloud-proxy-capability": "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY"
+            },
+            "models": models
+        });
+        providers_map.insert("screenpipe".to_string(), screenpipe_provider);
+    }
 
     // Add the user's selected provider (if not screenpipe-cloud)
     if let Some(config) = provider_config {
@@ -1417,73 +1795,31 @@ async fn build_models_json(
 
 /// Write pi's provider config (models.json + auth.json).
 async fn ensure_pi_config(
+    config_dir: &Path,
     user_token: Option<&str>,
     provider_config: Option<&PiProviderConfig>,
+    screenpipe_proxy_base_url: &str,
 ) -> Result<(), String> {
-    let config_dir = get_pi_config_dir()?;
-    std::fs::create_dir_all(&config_dir)
+    std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("Failed to create pi config dir: {}", e))?;
 
-    let new_providers = build_models_json(user_token, provider_config).await;
+    let models_config =
+        build_models_json(user_token, provider_config, screenpipe_proxy_base_url).await;
 
-    // Merge into existing models.json to avoid race conditions with concurrent pipes
+    // One conversation owns this process-local runtime directory. Rebuild it
+    // with exactly the selected provider so a prior account/BYOK endpoint can
+    // never remain selectable by this credential-bearing child.
     let models_path = config_dir.join("models.json");
-    let mut models_config: serde_json::Value = if models_path.exists() {
-        let content = std::fs::read_to_string(&models_path).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or_else(|_| json!({"providers": {}}))
-    } else {
-        json!({"providers": {}})
-    };
-    if !models_config
-        .get("providers")
-        .and_then(|p| p.as_object())
-        .is_some()
-    {
-        models_config = json!({"providers": {}});
-    }
-
-    // Merge new providers into existing ones (add/update, don't remove others)
-    if let (Some(existing), Some(new)) = (
-        models_config
-            .get_mut("providers")
-            .and_then(|p| p.as_object_mut()),
-        new_providers.get("providers").and_then(|p| p.as_object()),
-    ) {
-        for (k, v) in new {
-            existing.insert(k.clone(), v.clone());
-        }
-    }
-
     let models_str = serde_json::to_string_pretty(&models_config)
         .map_err(|e| format!("Failed to serialize models config: {}", e))?;
-    std::fs::write(&models_path, models_str)
-        .map_err(|e| format!("Failed to write pi models config: {}", e))?;
-    harden_secret_file(&models_path);
+    write_pi_secret_file_atomically(&models_path, models_str.as_bytes(), "models")?;
 
-    // -- auth.json: merge screenpipe token, preserve other providers --
+    // Every provider resolves its credential from this child's environment.
+    // Do not preserve unrelated OAuth/API tokens in the runtime auth store.
     let auth_path = config_dir.join("auth.json");
-    if let Some(token) = user_token.filter(|token| !token.is_empty()) {
-        let mut auth: serde_json::Value = if auth_path.exists() {
-            let content = std::fs::read_to_string(&auth_path).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
+    write_pi_secret_file_atomically(&auth_path, b"{}\n", "auth")?;
 
-        if let Some(obj) = auth.as_object_mut() {
-            obj.insert("screenpipe".to_string(), json!(token));
-        }
-
-        let auth_str = serde_json::to_string_pretty(&auth)
-            .map_err(|e| format!("Failed to serialize auth: {}", e))?;
-        std::fs::write(&auth_path, auth_str)
-            .map_err(|e| format!("Failed to write pi auth: {}", e))?;
-        harden_secret_file(&auth_path);
-    } else {
-        remove_screenpipe_auth_from_path(&auth_path)?;
-    }
-
-    info!("Pi config merged at {:?}", models_path);
+    info!("Pi runtime config written at {:?}", models_path);
     Ok(())
 }
 
@@ -1654,6 +1990,169 @@ fn resolve_pi_model(requested: &str, provider: &str) -> String {
     }
 }
 
+fn pi_provider_name(provider_config: &PiProviderConfig) -> Result<&'static str, String> {
+    match provider_config.provider.as_str() {
+        "openai" => Ok("openai-byok"),
+        "openai-chatgpt" => Ok("openai-chatgpt"),
+        "native-ollama" => Ok("ollama"),
+        "anthropic" => Ok("anthropic-byok"),
+        "custom" if !provider_config.url.trim().is_empty() => Ok("custom"),
+        "custom" => Err("invalid_custom_provider_url".to_string()),
+        "screenpipe-cloud" | "pi" => Ok("screenpipe"),
+        other => Err(format!("unsupported_pi_provider:{other}")),
+    }
+}
+
+/// A one-way identifier for the credential-bearing process domain. The raw
+/// endpoint and API key are never stored on `PiManager` or included in logs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PiProviderBoundary(String);
+
+fn effective_pi_provider_url(provider_config: &PiProviderConfig) -> String {
+    if !provider_config.url.trim().is_empty() {
+        return provider_config.url.trim().to_string();
+    }
+
+    match provider_config.provider.as_str() {
+        "openai" => "https://api.openai.com/v1".to_string(),
+        "openai-chatgpt" => "https://chatgpt.com/backend-api".to_string(),
+        "native-ollama" => "http://localhost:11434/v1".to_string(),
+        "anthropic" => "https://api.anthropic.com".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn normalize_pi_provider_url(raw_url: &str) -> String {
+    let raw_url = raw_url.trim();
+    if raw_url.is_empty() {
+        return String::new();
+    }
+
+    match url::Url::parse(raw_url) {
+        Ok(mut parsed) => {
+            // Fragments never reach the provider. Canonical URL formatting
+            // normalizes scheme/host casing and default ports; a trailing slash
+            // on the base path is also not a distinct credential domain.
+            parsed.set_fragment(None);
+            let normalized_path = parsed.path().trim_end_matches('/').to_string();
+            parsed.set_path(if normalized_path.is_empty() {
+                "/"
+            } else {
+                &normalized_path
+            });
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => raw_url.trim_end_matches('/').to_string(),
+    }
+}
+
+fn pi_provider_boundary(provider_config: &PiProviderConfig) -> Result<PiProviderBoundary, String> {
+    let provider = pi_provider_name(provider_config)?;
+
+    // Screenpipe Cloud sessions all receive capabilities for the one native
+    // account token, whose rotation already synchronously drains the pool.
+    // ChatGPT OAuth likewise has one secret-store identity. Neither boundary
+    // may be influenced by stale URL/apiKey values from a saved preset.
+    let (url, api_key) = match provider {
+        "screenpipe" | "openai-chatgpt" => (String::new(), ""),
+        _ => (
+            normalize_pi_provider_url(&effective_pi_provider_url(provider_config)),
+            provider_config.api_key.as_deref().unwrap_or("").trim(),
+        ),
+    };
+
+    let mut hasher = Sha256::new();
+    for component in [provider.as_bytes(), url.as_bytes(), api_key.as_bytes()] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    let digest = hasher.finalize();
+    Ok(PiProviderBoundary(format!("v1:{digest:x}")))
+}
+
+/// Pure selection helper: unknown boundaries fail closed, while dead managers
+/// cannot expose a sibling environment and therefore do not force eviction.
+fn select_pi_provider_boundary_conflicts(
+    sessions: impl IntoIterator<Item = (String, Option<PiProviderBoundary>, bool)>,
+    requested_boundary: &PiProviderBoundary,
+) -> Vec<String> {
+    let mut conflicts = sessions
+        .into_iter()
+        .filter_map(|(session_id, boundary, is_running)| {
+            (is_running && boundary.as_ref() != Some(requested_boundary)).then_some(session_id)
+        })
+        .collect::<Vec<_>>();
+    conflicts.sort();
+    conflicts
+}
+
+fn pi_provider_uses_screenpipe_cloud(
+    provider_config: Option<&PiProviderConfig>,
+) -> Result<bool, String> {
+    match provider_config {
+        Some(config) => Ok(pi_provider_name(config)? == "screenpipe"),
+        None => Ok(true),
+    }
+}
+
+fn authoritative_pi_user_token(
+    caller_token: Option<&str>,
+    native_token: Option<String>,
+    provider_config: Option<&PiProviderConfig>,
+    allow_signed_out_hosted: bool,
+) -> Result<Option<String>, String> {
+    let caller_token = caller_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let native_token = native_token.filter(|token| !token.trim().is_empty());
+
+    if caller_token != native_token.as_deref() {
+        return Err("pi_auth_identity_changed".to_string());
+    }
+    if pi_provider_uses_screenpipe_cloud(provider_config)?
+        && native_token.is_none()
+        && !allow_signed_out_hosted
+    {
+        return Err("hosted_ai_sign_in_required".to_string());
+    }
+    Ok(native_token)
+}
+
+fn pi_cloud_catalog_token(
+    authoritative_user_token: Option<String>,
+    provider_config: Option<&PiProviderConfig>,
+) -> Result<Option<String>, String> {
+    if pi_provider_uses_screenpipe_cloud(provider_config)? {
+        Ok(authoritative_user_token)
+    } else {
+        Ok(None)
+    }
+}
+
+fn configure_foreground_cloud_proxy_env(cmd: &mut Command, cloud_token: Option<&str>) {
+    cmd.env_remove("SCREENPIPE_API_KEY");
+    cmd.env_remove("SCREENPIPE_CLOUD_PROXY_CAPABILITY");
+    cmd.env_remove("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY");
+    cmd.env_remove("SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY");
+
+    if let Some(token) = cloud_token.filter(|token| !token.is_empty()) {
+        cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            screenpipe_core::agents::pi::derive_cloud_proxy_capability(
+                token,
+                screenpipe_core::agents::pi::CLOUD_PROXY_SCOPE_BACKGROUND,
+            ),
+        );
+        cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+            screenpipe_core::agents::pi::derive_cloud_proxy_capability(
+                token,
+                screenpipe_core::agents::pi::CLOUD_PROXY_SCOPE_INTERACTIVE,
+            ),
+        );
+    }
+}
+
 /// Soft cap on concurrent Pi sessions. Each session is its own bun + node
 /// subprocess holding ~150–300 MB RSS plus a live LLM connection, so we
 /// guard against accidental fork-bombs (a misbehaving caller spawning
@@ -1673,6 +2172,12 @@ pub async fn pi_start_inner(
     user_token: Option<String>,
     provider_config: Option<PiProviderConfig>,
 ) -> Result<PiInfo, String> {
+    // Every interactive start must name its payer/privacy provider explicitly.
+    // Historically None meant Screenpipe Cloud, so a nullable frontend build
+    // failure could silently upload local context or spend hosted credits.
+    let provider_config = provider_config.ok_or("pi_provider_config_required")?;
+    pi_provider_name(&provider_config)?;
+    let provider_config = Some(provider_config);
     let project_dir = project_dir.trim().to_string();
     if project_dir.is_empty() {
         return Err("Project directory is required".to_string());
@@ -1688,6 +2193,12 @@ pub async fn pi_start_inner(
     // Install web-search extension only for screenpipe-cloud presets
     ensure_web_search_extension(&project_dir, provider_config.as_ref())?;
 
+    // The managed provider talks to the local credential-injecting proxy.
+    // Resolve this once so models.json and the child environment use the same
+    // running engine port/key even when the user configured a non-default port.
+    let local_api = crate::recording::local_api_context_from_app(&app);
+    let screenpipe_proxy_base_url = local_api.url("/v1/interactive");
+
     // MCP bridge: lets the agent reach user-registered MCP servers.
     ensure_mcp_bridge_extension(&project_dir)?;
 
@@ -1698,29 +2209,96 @@ pub async fn pi_start_inner(
     // continuing app-dependent tasks.
     ensure_connection_gate_extension(&project_dir)?;
 
-    // Ensure Pi is configured with the user's provider
-    ensure_pi_config(user_token.as_deref(), provider_config.as_ref()).await?;
+    // Serialize config/auth writes and process spawn against account rotation
+    // and background Pi runs. Lock order is shared config/spawn guard, then
+    // foreground Pi pool — the same order used by set_cloud_token.
+    // The frontend token is only an identity assertion; the shared native
+    // token is authoritative. Holding both through registration means
+    // logout-first rejects this start, while start-first can only rotate after
+    // the spawned child is visible and synchronously stoppable in the pool.
+    let pi_config_spawn_guard = screenpipe_core::agents::pi::lock_pi_config_spawn().await;
+    let mut pool = state.0.lock().await;
+    let authoritative_user_token = authoritative_pi_user_token(
+        user_token.as_deref(),
+        state.cloud_token_snapshot(),
+        provider_config.as_ref(),
+        crate::config::is_e2e_mode(),
+    )?;
+    // A signed-in identity is still checked above for every provider so an old
+    // webview cannot start work after an account rotation. The raw Screenpipe
+    // JWT, however, belongs only to the Screenpipe Cloud provider. Keeping it
+    // in the shared Pi config or child environment while Ollama/BYOK/custom is
+    // active would let that provider read and exfiltrate an unrelated cloud
+    // credential through a normal tool call.
+    let cloud_catalog_token =
+        pi_cloud_catalog_token(authoritative_user_token.clone(), provider_config.as_ref())?;
 
     // Determine which Pi provider and model to use
     let (pi_provider, pi_model) = match &provider_config {
         Some(config) => {
-            let provider_name = match config.provider.as_str() {
-                "openai" => "openai-byok",
-                "openai-chatgpt" => "openai-chatgpt",
-                "native-ollama" => "ollama",
-                "anthropic" => "anthropic-byok",
-                // "custom" requires a valid URL; fall back to screenpipe cloud if missing
-                "custom" if !config.url.is_empty() => "custom",
-                "screenpipe-cloud" | "pi" | _ => "screenpipe",
-            };
+            let provider_name = pi_provider_name(config)?;
             let model = resolve_pi_model(&config.model, provider_name);
             (provider_name.to_string(), model)
         }
         None => ("screenpipe".to_string(), "auto".to_string()),
     };
+    let provider_boundary = pi_provider_boundary(
+        provider_config
+            .as_ref()
+            .expect("provider config was made mandatory above"),
+    )?;
 
     let sid = session_id.to_string();
-    let mut pool = state.0.lock().await;
+    let runtime_config_dir =
+        screenpipe_core::agents::pi::pi_runtime_config_dir("chat", &sid)
+            .map_err(|e| format!("Failed to initialize Pi conversation runtime: {e}"))?;
+
+    // Provider keys live in a child environment. On macOS/Linux a tool can
+    // inspect a sibling process with the same user (`ps eww` or /proc), so
+    // unlike the normal LRU path this is a hard privacy boundary: even busy
+    // sessions using another endpoint/key must be terminated before the new
+    // key is written to shared Pi config or exposed to a child process.
+    let boundary_snapshots = pool
+        .sessions
+        .iter_mut()
+        .map(|(session_id, manager)| {
+            let is_running = manager.is_running();
+            (
+                session_id.clone(),
+                manager.provider_boundary.clone(),
+                is_running,
+            )
+        })
+        .collect::<Vec<_>>();
+    let boundary_conflicts =
+        select_pi_provider_boundary_conflicts(boundary_snapshots, &provider_boundary);
+    for conflicting_sid in boundary_conflicts {
+        info!(
+            "Evicting Pi session '{}' across provider credential boundary",
+            conflicting_sid
+        );
+        if let Some(mut manager) = pool.sessions.remove(&conflicting_sid) {
+            manager.stop();
+        }
+        if let Err(e) = app.emit(
+            "agent_session_evicted",
+            serde_json::json!({
+                "sessionId": conflicting_sid,
+                "source": "pi",
+                "reason": "provider_boundary",
+            }),
+        ) {
+            warn!("Failed to emit provider-boundary eviction: {}", e);
+        }
+    }
+
+    ensure_pi_config(
+        &runtime_config_dir,
+        cloud_catalog_token.as_deref(),
+        provider_config.as_ref(),
+        &screenpipe_proxy_base_url,
+    )
+    .await?;
 
     // Stop existing instance for this session if running
     let mut any_alive = false;
@@ -1809,9 +2387,19 @@ pub async fn pi_start_inner(
         }
     }
 
-    // Insert a fresh PiManager for this session
-    pool.sessions
-        .insert(sid.clone(), PiManager::new(app.clone()));
+    // Reuse the generation Arc when replacing a manager. Advancing it before
+    // insertion invalidates an old reader even when Bun had already exited and
+    // `is_running()` therefore did not call stop().
+    let event_generation = pool
+        .sessions
+        .get(&sid)
+        .map(|manager| manager.event_generation.clone())
+        .unwrap_or_else(new_pi_event_generation);
+    let process_generation = advance_pi_event_generation(&event_generation);
+    let mut manager = PiManager::with_event_generation(app.clone(), event_generation.clone());
+    manager.provider_name = Some(pi_provider.clone());
+    manager.provider_boundary = Some(provider_boundary);
+    pool.sessions.insert(sid.clone(), manager);
 
     // Find pi executable — if not found, wait for background install (up to 60s)
     let pi_path = match find_pi_executable() {
@@ -1900,7 +2488,8 @@ pub async fn pi_start_inner(
                         // Git for Windows).
                         let bash_exe = Path::new(&bash_dir).join("bash.exe");
                         if bash_exe.exists() {
-                            if let Ok(config_dir) = get_pi_config_dir() {
+                            {
+                                let config_dir = runtime_config_dir.clone();
                                 let settings_path = config_dir.join("settings.json");
                                 let mut settings: serde_json::Value = if settings_path.exists() {
                                     std::fs::read_to_string(&settings_path)
@@ -1974,30 +2563,30 @@ pub async fn pi_start_inner(
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    // On Windows, prevent console window from appearing
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    // Keep Bun and every tool/shell it spawns in one killable tree. Account
+    // rotation stops that tree synchronously before publishing the new token.
+    isolate_foreground_process_tree(&mut cmd);
 
     // Scope pi to screenpipe's isolated agent dir (never ~/.pi/agent).
-    screenpipe_core::agents::pi::apply_pi_isolation_env(&mut |k, v| {
+    screenpipe_core::agents::pi::apply_pi_isolation_env_for_dir(
+        &runtime_config_dir,
+        &mut |k, v| {
         cmd.env(k, v);
-    });
+        },
+    );
 
-    if let Some(ref token) = user_token {
-        cmd.env("SCREENPIPE_API_KEY", token);
-    }
+    // Never expose the Clerk JWT to Pi. Even a scrubbed bash child can inspect
+    // its Bun parent's environment on macOS. Foreground sessions get two
+    // one-way, route-scoped capabilities instead: the model registry uses the
+    // interactive capability, while media-analysis curl calls use background.
+    // A BYOK/local main model still needs the latter for paid media analysis.
+    configure_foreground_cloud_proxy_env(&mut cmd, authoritative_user_token.as_deref());
 
     // Pass local API config so the Pi agent can authenticate to the runtime local API.
     {
-        use crate::recording::local_api_context_from_app;
-        let api = local_api_context_from_app(&app);
-        cmd.env("SCREENPIPE_LOCAL_API_PORT", api.port.to_string());
-        cmd.env("SCREENPIPE_LOCAL_API_URL", api.url(""));
-        if let Some(ref key) = api.api_key {
+        cmd.env("SCREENPIPE_LOCAL_API_PORT", local_api.port.to_string());
+        cmd.env("SCREENPIPE_LOCAL_API_URL", local_api.url(""));
+        if let Some(ref key) = local_api.api_key {
             cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
         }
     }
@@ -2038,6 +2627,7 @@ pub async fn pi_start_inner(
         }
 
         if let Some(ref api_key) = config.api_key {
+            let api_key = api_key.trim();
             if !api_key.is_empty() {
                 // Pi resolves apiKey from env vars, so set it
                 match config.provider.as_str() {
@@ -2075,16 +2665,22 @@ pub async fn pi_start_inner(
     info!("Pi started with PID: {}", pid);
 
     // Take stdin for writing commands
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Failed to get pi stdin".to_string())?;
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = terminate_foreground_process_tree(&mut child);
+            return Err("Failed to get pi stdin".to_string());
+        }
+    };
 
     // Take stdout for reading events
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to get pi stdout".to_string())?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = terminate_foreground_process_tree(&mut child);
+            return Err("Failed to get pi stdout".to_string());
+        }
+    };
 
     // Take stderr for logging
     let stderr = child.stderr.take();
@@ -2110,7 +2706,8 @@ pub async fn pi_start_inner(
         m.terminated_emitted = terminated_emitted.clone();
         pending_responses = m.pending_responses.clone();
     } else {
-        pending_responses = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let _ = terminate_foreground_process_tree(&mut child);
+        return Err("Pi session disappeared before process registration".to_string());
     }
 
     // Grab queue_state for the stdout reader before dropping the lock
@@ -2123,27 +2720,48 @@ pub async fn pi_start_inner(
     if let Some(qs) = queue_state_for_reader.clone() {
         let app_handle_for_queue = app.clone();
         let sid_for_queue = sid.clone();
+        let event_generation_for_queue = event_generation.clone();
         tokio::spawn(async move {
             let mut rx = qs.subscribe_queued();
             // Emit current state immediately so any UI that subscribes after
             // the watcher boot still gets a fresh value without polling.
             let snap = rx.borrow().clone();
-            let _ = app_handle_for_queue.emit(
-                "pi-queue-changed",
-                serde_json::json!({
-                    "sessionId": sid_for_queue,
-                    "queued": snap,
-                }),
-            );
+            match with_current_pi_event_generation(
+                &event_generation_for_queue,
+                process_generation,
+                || {
+                    app_handle_for_queue.emit(
+                        "pi-queue-changed",
+                        serde_json::json!({
+                            "sessionId": sid_for_queue,
+                            "queued": snap,
+                        }),
+                    )
+                },
+            ) {
+                Some(Err(e)) => error!("Failed to emit initial pi queue state: {}", e),
+                None => return,
+                Some(Ok(())) => {}
+            }
             while rx.changed().await.is_ok() {
                 let snap = rx.borrow().clone();
-                let _ = app_handle_for_queue.emit(
-                    "pi-queue-changed",
-                    serde_json::json!({
-                        "sessionId": sid_for_queue,
-                        "queued": snap,
-                    }),
-                );
+                match with_current_pi_event_generation(
+                    &event_generation_for_queue,
+                    process_generation,
+                    || {
+                        app_handle_for_queue.emit(
+                            "pi-queue-changed",
+                            serde_json::json!({
+                                "sessionId": sid_for_queue,
+                                "queued": snap,
+                            }),
+                        )
+                    },
+                ) {
+                    Some(Err(e)) => error!("Failed to emit pi queue state: {}", e),
+                    None => return,
+                    Some(Ok(())) => {}
+                }
             }
         });
     }
@@ -2157,6 +2775,9 @@ pub async fn pi_start_inner(
     // Drop the lock before spawning reader threads — this is critical to prevent
     // queued pi_start calls from stacking behind a 500ms sleep while holding the lock
     drop(pool);
+    // The child is now registered under the pool lock. Release in reverse lock
+    // order so auth rotation/background config work can proceed.
+    drop(pi_config_spawn_guard);
 
     // Readiness signal — stdout reader notifies when first JSON line arrives,
     // so pi_start_inner can return without a blind 1500ms sleep.
@@ -2169,6 +2790,7 @@ pub async fn pi_start_inner(
     let terminated_guard = terminated_emitted.clone();
     let sid_clone = sid.clone();
     let pending_for_reader = pending_responses.clone();
+    let event_generation_for_stdout = event_generation.clone();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         info!(
@@ -2179,6 +2801,18 @@ pub async fn pi_start_inner(
         let mut ready_signalled = false;
         let mut pending_text_delta: Option<PendingAgentTextDelta> = None;
         while let Some(line) = read_lines_lossy(&mut reader) {
+            let Some(event_guard) =
+                current_pi_event_generation_guard(&event_generation_for_stdout, process_generation)
+            else {
+                // Never flush text buffered by the replaced process into its
+                // same-session successor.
+                pending_text_delta = None;
+                debug!(
+                    "Pi stdout reader generation {} is stale (pid {}, session {}), stopping",
+                    process_generation, pid, sid_clone
+                );
+                break;
+            };
             line_count += 1;
             let parsed = serde_json::from_str::<Value>(&line).ok();
             let is_stdout_text_delta = parsed.as_ref().and_then(assistant_text_delta).is_some();
@@ -2379,8 +3013,13 @@ pub async fn pi_start_inner(
                     error!("Failed to emit pi_output: {}", e);
                 }
             }
+            drop(event_guard);
         }
-        flush_pending_text_delta(&app_handle, &sid_clone, &mut pending_text_delta);
+        let _ = with_current_pi_event_generation(
+            &event_generation_for_stdout,
+            process_generation,
+            || flush_pending_text_delta(&app_handle, &sid_clone, &mut pending_text_delta),
+        );
         info!(
             "Pi stdout reader ended (pid: {}, session: {}), processed {} lines",
             pid, sid_clone, line_count
@@ -2389,23 +3028,37 @@ pub async fn pi_start_inner(
         if let Some(ref qs) = queue_state_for_reader {
             qs.signal_terminated();
         }
-        // Only emit once per session — overlapping sessions could race
-        if terminated_guard
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // Stage 5 cleanup: legacy `pi_terminated` topic removed.
-            // Consumers read from `agent_terminated` via the bus.
-            let _ = app_handle.emit(
-                "agent_terminated",
-                json!({
-                    "sessionId": sid_clone,
-                    "source": "pi",
-                    "pid": pid,
-                }),
-            );
-        } else {
-            debug!("Pi stdout reader: pi_terminated already emitted for this session, skipping");
+        // Only a reader from the current process generation may terminate the
+        // session in the UI. Keep the read fence through compare + emit.
+        if let Some(emitted) = with_current_pi_event_generation(
+            &event_generation_for_stdout,
+            process_generation,
+            || {
+                if terminated_guard
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Stage 5 cleanup: legacy `pi_terminated` topic removed.
+                    // Consumers read from `agent_terminated` via the bus.
+                    let _ = app_handle.emit(
+                        "agent_terminated",
+                        json!({
+                            "sessionId": sid_clone,
+                            "source": "pi",
+                            "pid": pid,
+                        }),
+                    );
+                    true
+                } else {
+                    false
+                }
+            },
+        ) {
+            if !emitted {
+                debug!(
+                    "Pi stdout reader: pi_terminated already emitted for this session, skipping"
+                );
+            }
         }
     });
 
@@ -2415,10 +3068,21 @@ pub async fn pi_start_inner(
         let app_handle = app.clone();
         let sid_stderr = sid.clone();
         let first_stderr_for_error = first_stderr_line.clone();
+        let event_generation_for_stderr = event_generation.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             info!("Pi stderr reader started (session: {})", sid_stderr);
             while let Some(line) = read_lines_lossy(&mut reader) {
+                let Some(event_guard) = current_pi_event_generation_guard(
+                    &event_generation_for_stderr,
+                    process_generation,
+                ) else {
+                    debug!(
+                        "Pi stderr reader generation {} is stale (session {}), stopping",
+                        process_generation, sid_stderr
+                    );
+                    break;
+                };
                 if !line.trim().is_empty() {
                     if let Ok(mut first) = first_stderr_for_error.lock() {
                         if first.is_none() {
@@ -2452,6 +3116,7 @@ pub async fn pi_start_inner(
                     warn!("Pi stderr: {}", &line[..line.len().min(500)]);
                 }
                 let _ = app_handle.emit("pi_log", &line);
+                drop(event_guard);
             }
             info!("Pi stderr reader ended (session: {})", sid_stderr);
         });
@@ -2469,36 +3134,52 @@ pub async fn pi_start_inner(
     }
     {
         let mut pool = state.0.lock().await;
-        if let Some(m) = pool.sessions.get_mut(&sid) {
-            if let Some(ref mut child) = m.child {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let code = status.code().unwrap_or(-1);
-                        error!("Pi process exited immediately with code {} — check 'Pi stderr:' warnings above for details (bun path: {})", code, bun_path);
-                        m.child = None;
-                        m.stdin = None;
-                        let install_hint = take_pi_install_error()
-                            .map(|e| format!(" The Pi install previously failed: {} Restart screenpipe to retry the install automatically.", e))
-                            .unwrap_or_default();
-                        let stderr_hint = first_stderr_line
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.clone())
-                            .map(|line| format!(" First Pi stderr: {}", truncate_stderr(&line)))
-                            .unwrap_or_else(|| {
-                                " Check app logs for 'Pi stderr:' lines.".to_string()
-                            });
-                        return Err(format!(
-                            "Pi exited immediately with code {} (bun: {}).{}{}",
-                            code, bun_path, install_hint, stderr_hint
-                        ));
+        let Some(m) = pool.sessions.get_mut(&sid) else {
+            // This start was explicitly stopped and removed while it waited
+            // for readiness. Never return its stale pre-stop snapshot.
+            return Ok(PiInfo::default());
+        };
+        if !Arc::ptr_eq(&m.event_generation, &event_generation)
+            || !is_current_pi_event_generation(&event_generation, process_generation)
+        {
+            // A newer same-session start replaced this process during the
+            // readiness window. Inspecting `m.child` here would target the
+            // replacement (and could clear it if it exited), so return the
+            // authoritative current snapshot without applying old PID state.
+            return Ok(m.snapshot(&sid));
+        }
+        if let Some(ref mut child) = m.child {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = status.code().unwrap_or(-1);
+                    error!("Pi process exited immediately with code {} — check 'Pi stderr:' warnings above for details (bun path: {})", code, bun_path);
+                    if let Err(e) = terminate_foreground_process_group(pid) {
+                        debug!(
+                            "Pi process tree {} was already gone after immediate exit: {}",
+                            pid, e
+                        );
                     }
-                    Ok(None) => {
-                        // Still running — good
-                    }
-                    Err(e) => {
-                        warn!("Failed to check pi process status: {}", e);
-                    }
+                    m.child = None;
+                    m.stdin = None;
+                    let install_hint = take_pi_install_error()
+                        .map(|e| format!(" The Pi install previously failed: {} Restart screenpipe to retry the install automatically.", e))
+                        .unwrap_or_default();
+                    let stderr_hint = first_stderr_line
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .map(|line| format!(" First Pi stderr: {}", truncate_stderr(&line)))
+                        .unwrap_or_else(|| " Check app logs for 'Pi stderr:' lines.".to_string());
+                    return Err(format!(
+                        "Pi exited immediately with code {} (bun: {}).{}{}",
+                        code, bun_path, install_hint, stderr_hint
+                    ));
+                }
+                Ok(None) => {
+                    // Still running — good
+                }
+                Err(e) => {
+                    warn!("Failed to check pi process status: {}", e);
                 }
             }
         }
@@ -2557,6 +3238,29 @@ async fn foreground_connections_context(app: &AppHandle) -> String {
     screenpipe_connect::connections::render_context(&data_dir, api.port, store.as_ref()).await
 }
 
+const CONNECTIONS_CONTEXT_PREFIX: &str = "<connections_context>\nCurrent Screenpipe connected integrations context, refreshed for this turn:\n";
+const CONNECTIONS_CONTEXT_SUFFIX: &str = "\n</connections_context>\n\n";
+
+fn has_leading_connections_context_wrapper(message: &str) -> bool {
+    let Some(after_prefix) = message.strip_prefix(CONNECTIONS_CONTEXT_PREFIX) else {
+        return false;
+    };
+    let Some((context, _user_message)) = after_prefix.split_once(CONNECTIONS_CONTEXT_SUFFIX) else {
+        return false;
+    };
+    !context.trim().is_empty()
+}
+
+fn attach_connections_context_message(message: String, context: &str) -> String {
+    if has_leading_connections_context_wrapper(&message) || context.trim().is_empty() {
+        return message;
+    }
+    format!(
+        "{}{}{}{}",
+        CONNECTIONS_CONTEXT_PREFIX, context, CONNECTIONS_CONTEXT_SUFFIX, message
+    )
+}
+
 async fn attach_foreground_connections_context(
     app: &AppHandle,
     sid: &str,
@@ -2568,10 +3272,13 @@ async fn attach_foreground_connections_context(
     if sid.starts_with("__title:") {
         return message;
     }
-    let ctx = foreground_connections_context(app).await;
-    if ctx.trim().is_empty() {
+    // Exact retries persist Pi's native `message_start` payload, including the
+    // original per-turn context. Preserve a valid leading wrapper byte-for-byte
+    // instead of fetching and prepending a newer dynamic context snapshot.
+    if has_leading_connections_context_wrapper(&message) {
         return message;
     }
+    let ctx = foreground_connections_context(app).await;
     // Wrap the per-turn context in a tag so the frontend can strip it back
     // out before persisting/titling the user turn (mirrors the
     // `<conversation_history>` plumbing). A free-text prefix here leaked into
@@ -2580,10 +3287,7 @@ async fn attach_foreground_connections_context(
     // wrapper unambiguously removable end-to-end. Keep the tag name in sync
     // with `stripPromptPlumbing` / `extractConnectionsContextUserText` on the
     // TypeScript side.
-    format!(
-        "<connections_context>\nCurrent Screenpipe connected integrations context, refreshed for this turn:\n{}\n</connections_context>\n\n{}",
-        ctx, message
-    )
+    attach_connections_context_message(message, &ctx)
 }
 
 fn queued_payload_to_steer_command(payload: Value) -> Result<Value, String> {
@@ -2709,6 +3413,7 @@ pub async fn pi_steer(
             .clone()
             .ok_or("Pi command queue not initialized")?
     };
+    let provider_epoch = queue.provider_epoch_snapshot();
 
     let message = attach_foreground_connections_context(&app, &sid, message).await;
     let mut cmd = json!({
@@ -2721,7 +3426,9 @@ pub async fn pi_steer(
         }
     }
 
-    queue.send_immediate(cmd).await
+    queue
+        .send_immediate_for_provider_epoch(cmd, provider_epoch)
+        .await
 }
 
 /// Promote a queued follow-up into Pi's native steer path. The prompt is
@@ -2746,12 +3453,15 @@ pub async fn pi_steer_queued(
             .clone()
             .ok_or("Pi command queue not initialized")?
     };
+    let provider_epoch = queue.provider_epoch_snapshot();
 
     let Some(payload) = queue.take_queued_payload(prompt_id).await? else {
         return Ok(false);
     };
     let cmd = queued_payload_to_steer_command(payload)?;
-    queue.send_immediate(cmd).await?;
+    queue
+        .send_immediate_for_provider_epoch(cmd, provider_epoch)
+        .await?;
     Ok(true)
 }
 
@@ -2777,6 +3487,30 @@ pub async fn pi_cancel_queued(
             .ok_or("queue not initialized".to_string())?
     };
     queue.cancel_one(prompt_id).await
+}
+
+/// Establish a provider boundary immediately while the current answer may
+/// still be streaming. Every follow-up that has not crossed Pi's stdin write
+/// boundary is invalidated, so it cannot later run under a different payer or
+/// privacy provider when the deferred model switch executes.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_invalidate_queued_prompts(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+) -> Result<usize, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let queue = {
+        let pool = state.0.lock().await;
+        let m = pool
+            .sessions
+            .get(&sid)
+            .ok_or("session not found".to_string())?;
+        m.queue_handle
+            .clone()
+            .ok_or("queue not initialized".to_string())?
+    };
+    queue.invalidate_pending_prompts().await
 }
 
 /// Read the current queued-prompt list for a session. Useful for an initial
@@ -2941,10 +3675,10 @@ pub async fn bun_check() -> Result<PiCheckResult, String> {
 /// mid-session and the new model sees the real threaded history, not a
 /// glued-transcript workaround.
 ///
-/// Pi's RPC `set_model` is the right path for provider+model changes only. If
-/// other preset fields change (url, apiKey, maxTokens, systemPrompt) the
-/// caller should fall back to `pi_update_config` which does a full restart
-/// because those are spawn-time args baked into models.json / CLI flags.
+/// Pi's RPC `set_model` is the right path only when the provider credential
+/// boundary is unchanged. Provider, endpoint, API-key, maxTokens, or
+/// systemPrompt changes must fall back to `pi_update_config`, which does a full
+/// restart because those are spawn-time args baked into models.json / CLI flags.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_set_model(
@@ -2957,21 +3691,26 @@ pub async fn pi_set_model(
     // Map frontend provider name → Pi's internal registry name. Must stay in
     // sync with the mapping in `pi_start_inner` (line ~1045) — a mismatch
     // means Pi can't find the model and returns "Model not found".
-    let pi_provider = match provider_config.provider.as_str() {
-        "openai" => "openai-byok",
-        "openai-chatgpt" => "openai-chatgpt",
-        "native-ollama" => "ollama",
-        "anthropic" => "anthropic-byok",
-        "custom" if !provider_config.url.is_empty() => "custom",
-        "screenpipe-cloud" | "pi" | _ => "screenpipe",
-    };
+    let pi_provider = pi_provider_name(&provider_config)?;
+    let requested_boundary = pi_provider_boundary(&provider_config)?;
     let pi_model = resolve_pi_model(&provider_config.model, pi_provider);
+    if pi_provider_uses_screenpipe_cloud(Some(&provider_config))?
+        && state.cloud_token_snapshot().is_none()
+        && !crate::config::is_e2e_mode()
+    {
+        return Err("hosted_ai_sign_in_required".to_string());
+    }
 
     let queue = {
         let mut pool = state.0.lock().await;
         let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
         if !m.is_running() {
             return Err("Pi is not running".to_string());
+        }
+        if m.provider_name.as_deref() != Some(pi_provider)
+            || m.provider_boundary.as_ref() != Some(&requested_boundary)
+        {
+            return Err("pi_provider_boundary_requires_restart".to_string());
         }
         m.last_activity = std::time::Instant::now();
         m.queue_handle
@@ -2990,9 +3729,15 @@ pub async fn pi_set_model(
         "modelId": pi_model,
     });
 
-    let rx = queue
-        .send(cmd, crate::pi_command_queue::WaitMode::WaitDone)
+    let (invalidated, rx) = queue
+        .send_after_invalidating_prompts(cmd, crate::pi_command_queue::WaitMode::WaitDone)
         .await?;
+    if invalidated > 0 {
+        info!(
+            "Pi set_model invalidated {} queued prompt(s) for session '{}'",
+            invalidated, sid
+        );
+    }
     rx.await
         .map_err(|_| "Pi command queue dropped".to_string())?
 }
@@ -3513,11 +4258,18 @@ pub async fn pi_get_thinking_level() -> Result<String, String> {
     Ok(level.to_string())
 }
 
-/// Update Pi config and restart the chat session so the new model takes effect.
-/// Without restart, Pi keeps using the provider/model from its original CLI args.
+/// Update Pi config and restart the legacy chat session so the new model takes
+/// effect. Passing no token and no provider is the account-auth reset: every
+/// session is stopped because real foreground sessions use UUID keys and each
+/// subprocess retains spawn-time provider state and, for managed cloud, an
+/// account-rotating loopback capability.
 ///
 /// Prefer `pi_set_model` when only provider+model changed — it preserves the
 /// conversation state instead of killing the subprocess.
+fn is_pi_auth_reset(user_token: Option<&str>, provider_config: Option<&PiProviderConfig>) -> bool {
+    user_token.is_none_or(|token| token.trim().is_empty()) && provider_config.is_none()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_update_config(
@@ -3526,6 +4278,29 @@ pub async fn pi_update_config(
     user_token: Option<String>,
     provider_config: Option<PiProviderConfig>,
 ) -> Result<(), String> {
+    if is_pi_auth_reset(user_token.as_deref(), provider_config.as_ref()) {
+        let _auth_update_guard = state.lock_auth_update().await;
+        if state.cloud_token_snapshot().is_some() {
+            return Err("pi_auth_reset_superseded_by_active_login".to_string());
+        }
+        // Close the spend/privacy window before touching disk. This includes
+        // busy and queued UUID sessions: a logout must not let an already
+        // spawned child retain the previous account's proxy capability or
+        // queued work. The raw Clerk JWT is never placed in the child.
+        let (_, scrub_result) = stop_all_pi_sessions_and_then(
+            &state,
+            "explicit auth reset",
+            // set_cloud_token also performs this scrub. Repeat it here so
+            // every current auth-reset caller remains safe even if the earlier
+            // durable token write failed or a future caller invokes this
+            // command directly. The pool stays locked through the scrub.
+            clear_screenpipe_auth_token_files,
+        )
+        .await;
+        scrub_result?;
+        return Ok(());
+    }
+
     info!(
         "Pi preset changed (provider: {:?}, model: {:?}) — restarting chat session",
         provider_config.as_ref().map(|c| &c.provider),
@@ -3823,6 +4598,151 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn foreground_proxy_env_has_both_route_scopes_without_raw_token() {
+        use std::ffi::OsStr;
+
+        let mut command = Command::new("pi");
+        command.env("SCREENPIPE_API_KEY", "inherited-raw-token");
+        command.env("SCREENPIPE_CLOUD_PROXY_CAPABILITY", "legacy-capability");
+        command.env(
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            "stale-background",
+        );
+        command.env(
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+            "stale-interactive",
+        );
+        super::configure_foreground_cloud_proxy_env(&mut command, Some("current-account-token"));
+
+        let envs = command.get_envs().collect::<Vec<_>>();
+        let env = |name: &str| {
+            envs.iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(env("SCREENPIPE_API_KEY"), Some(None));
+        assert_eq!(env("SCREENPIPE_CLOUD_PROXY_CAPABILITY"), Some(None));
+        assert_eq!(
+            env("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY"),
+            Some(Some(OsStr::new(
+                &screenpipe_core::agents::pi::derive_cloud_proxy_capability(
+                    "current-account-token",
+                    screenpipe_core::agents::pi::CLOUD_PROXY_SCOPE_BACKGROUND,
+                )
+            )))
+        );
+        assert_eq!(
+            env("SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY"),
+            Some(Some(OsStr::new(
+                &screenpipe_core::agents::pi::derive_cloud_proxy_capability(
+                    "current-account-token",
+                    screenpipe_core::agents::pi::CLOUD_PROXY_SCOPE_INTERACTIVE,
+                )
+            )))
+        );
+        assert_ne!(
+            env("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY"),
+            env("SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY")
+        );
+        assert!(envs.iter().all(|(_, value)| {
+            value
+                .map(|value| !value.to_string_lossy().contains("current-account-token"))
+                .unwrap_or(true)
+        }));
+
+        let mut signed_out = Command::new("pi");
+        signed_out.env(
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            "inherited-background",
+        );
+        signed_out.env(
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+            "inherited-interactive",
+        );
+        super::configure_foreground_cloud_proxy_env(&mut signed_out, None);
+        let signed_out_envs = signed_out.get_envs().collect::<Vec<_>>();
+        for name in [
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+        ] {
+            assert_eq!(
+                signed_out_envs
+                    .iter()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .map(|(_, value)| *value),
+                Some(None),
+                "signed-out foreground must remove inherited {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_connections_context_wrapper_is_preserved_byte_for_byte() {
+        let original = format!(
+            "{}{}{}{}",
+            super::CONNECTIONS_CONTEXT_PREFIX,
+            "original dynamic context",
+            super::CONNECTIONS_CONTEXT_SUFFIX,
+            "user retry payload"
+        );
+        assert!(super::has_leading_connections_context_wrapper(&original));
+        assert_eq!(
+            super::attach_connections_context_message(
+                original.clone(),
+                "new context that must not replace the accepted payload",
+            ),
+            original
+        );
+    }
+
+    #[test]
+    fn malformed_or_lookalike_connections_context_is_wrapped_normally() {
+        let malformed = [
+            "<connections_contextual>lookalike</connections_contextual>\n\nuser",
+            "prefix before <connections_context>\nnot leading</connections_context>\n\nuser",
+            "<connections_context>\nwrong generated header\nctx\n</connections_context>\n\nuser",
+            "<connections_context>\nCurrent Screenpipe connected integrations context, refreshed for this turn:\nmissing close",
+            "<connections_context>\nCurrent Screenpipe connected integrations context, refreshed for this turn:\n  \n</connections_context>\n\nuser",
+        ];
+
+        for input in malformed {
+            assert!(
+                !super::has_leading_connections_context_wrapper(input),
+                "malformed/lookalike input must not be accepted: {input:?}"
+            );
+            let wrapped =
+                super::attach_connections_context_message(input.to_string(), "fresh context");
+            assert_eq!(
+                wrapped,
+                format!(
+                    "{}{}{}{}",
+                    super::CONNECTIONS_CONTEXT_PREFIX,
+                    "fresh context",
+                    super::CONNECTIONS_CONTEXT_SUFFIX,
+                    input
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_first_send_gets_current_connections_context() {
+        assert_eq!(
+            super::attach_connections_context_message(
+                "ordinary user message".to_string(),
+                "current integrations",
+            ),
+            format!(
+                "{}{}{}{}",
+                super::CONNECTIONS_CONTEXT_PREFIX,
+                "current integrations",
+                super::CONNECTIONS_CONTEXT_SUFFIX,
+                "ordinary user message"
+            )
+        );
+    }
+
+    #[test]
     fn parses_tool_call_ids_from_pi_events() {
         let assistant_tool_call = json!({
             "type": "message_end",
@@ -4030,6 +4950,157 @@ mod tests {
         assert!(super::pi_session_has_in_flight_work(None, &pending));
     }
 
+    #[cfg(unix)]
+    fn unix_process_field(pid: u32, field: &str) -> Option<String> {
+        let output = Command::new("ps")
+            .args(["-o", field, "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!value.is_empty()).then_some(value)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_pi_tree_stop_kills_shell_descendants() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "/bin/sleep 30 & echo $!; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        super::isolate_foreground_process_tree(&mut command);
+
+        let mut child = command.spawn().expect("spawn isolated foreground tree");
+        let parent_pid = child.id();
+        let mut stdout = BufReader::new(child.stdout.take().expect("shell stdout"));
+        let mut descendant_line = String::new();
+        stdout
+            .read_line(&mut descendant_line)
+            .expect("read descendant pid");
+        let descendant_pid = descendant_line
+            .trim()
+            .parse::<u32>()
+            .expect("parse descendant pid");
+
+        let parent_pgid = unix_process_field(parent_pid, "pgid=");
+        let descendant_pgid = unix_process_field(descendant_pid, "pgid=");
+        let stop_result = super::terminate_foreground_process_tree(&mut child);
+
+        // SIGKILL may leave a short-lived zombie until init reaps it. A zombie
+        // is already non-executable and cannot issue another provider request.
+        let mut descendant_runnable = true;
+        for _ in 0..50 {
+            match unix_process_field(descendant_pid, "stat=") {
+                None => {
+                    descendant_runnable = false;
+                    break;
+                }
+                Some(stat) if stat.starts_with('Z') => {
+                    descendant_runnable = false;
+                    break;
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        if descendant_runnable {
+            // Keep a failed regression test from leaking a 30-second helper.
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &descendant_pid.to_string()])
+                .status();
+        }
+
+        let expected_pgid = parent_pid.to_string();
+        assert_eq!(parent_pgid.as_deref(), Some(expected_pgid.as_str()));
+        assert_eq!(descendant_pgid.as_deref(), Some(expected_pgid.as_str()));
+        stop_result.expect("terminate foreground Pi process tree");
+        assert!(!descendant_runnable, "shell descendant survived Pi stop");
+    }
+
+    #[test]
+    fn replacement_generation_rejects_prior_pi_reader() {
+        let generation = super::new_pi_event_generation();
+        let first = super::advance_pi_event_generation(&generation);
+        assert!(super::is_current_pi_event_generation(&generation, first));
+        assert_eq!(
+            super::with_current_pi_event_generation(&generation, first, || "first"),
+            Some("first")
+        );
+
+        let replacement = super::advance_pi_event_generation(&generation);
+        assert_ne!(replacement, first);
+        assert!(!super::is_current_pi_event_generation(&generation, first));
+        assert!(super::is_current_pi_event_generation(
+            &generation,
+            replacement
+        ));
+        assert_eq!(
+            super::with_current_pi_event_generation(&generation, first, || "stale"),
+            None
+        );
+    }
+
+    #[test]
+    fn generation_invalidation_waits_for_admitted_emit() {
+        let generation = super::new_pi_event_generation();
+        let first = super::advance_pi_event_generation(&generation);
+        let admitted = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader_generation = generation.clone();
+        let reader_admitted = admitted.clone();
+        let reader_release = release.clone();
+        let reader_completed = completed.clone();
+        let reader = std::thread::spawn(move || {
+            super::with_current_pi_event_generation(&reader_generation, first, || {
+                reader_admitted.wait();
+                reader_release.wait();
+                reader_completed.store(true, std::sync::atomic::Ordering::Release);
+            })
+        });
+        admitted.wait();
+
+        let invalidator_generation = generation.clone();
+        let (invalidated_tx, invalidated_rx) = std::sync::mpsc::channel();
+        let invalidator = std::thread::spawn(move || {
+            let next = super::advance_pi_event_generation(&invalidator_generation);
+            invalidated_tx.send(next).expect("report invalidation");
+        });
+
+        // The writer cannot advance while a previously admitted event holds
+        // the read fence. Therefore invalidation's return is the hard point
+        // after which the old process can no longer emit.
+        let early_invalidation = invalidated_rx.recv_timeout(Duration::from_millis(30));
+        release.wait();
+        let (invalidation_was_blocked, replacement) = match early_invalidation {
+            Ok(replacement) => (false, replacement),
+            Err(_) => (
+                true,
+                invalidated_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("invalidation completes after admitted emit"),
+            ),
+        };
+        reader
+            .join()
+            .expect("join reader")
+            .expect("reader generation was admitted");
+        invalidator.join().expect("join invalidator");
+
+        assert!(invalidation_was_blocked);
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!super::is_current_pi_event_generation(&generation, first));
+        assert!(super::is_current_pi_event_generation(
+            &generation,
+            replacement
+        ));
+        assert!(super::with_current_pi_event_generation(&generation, first, || ()).is_none());
+    }
+
     fn write_package_json(package_dir: &std::path::Path, name: &str, version: &str) {
         std::fs::create_dir_all(package_dir).expect("create package dir");
         std::fs::write(
@@ -4114,6 +5185,69 @@ mod tests {
     }
 
     #[test]
+    fn clear_screenpipe_model_token_preserves_other_provider_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            serde_json::to_string_pretty(&json!({
+                "providers": {
+                    "screenpipe": {"apiKey": "stale-account-jwt", "baseUrl": "https://api.screenpipe.com"},
+                    "openai": {"apiKey": "sk-keep"},
+                    "anthropic": {"apiKey": "anthropic-keep"}
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write models");
+
+        super::reset_screenpipe_model_token_from_path(&models_path)
+            .expect("clear screenpipe model token");
+
+        let models: Value =
+            serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        assert_eq!(
+            models["providers"]["screenpipe"]["apiKey"],
+            json!("SCREENPIPE_LOCAL_API_KEY")
+        );
+        assert_eq!(models["providers"]["openai"]["apiKey"], json!("sk-keep"));
+        assert_eq!(
+            models["providers"]["anthropic"]["apiKey"],
+            json!("anthropic-keep")
+        );
+        assert!(!std::fs::read_to_string(&models_path)
+            .unwrap()
+            .contains("stale-account-jwt"));
+    }
+
+    #[test]
+    fn malformed_pi_secret_files_are_preserved_and_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(&auth_path, r#"{"screenpipe":"stale-auth-jwt""#)
+            .expect("write malformed auth");
+        std::fs::write(&models_path, r#"{"apiKey":"stale-model-jwt""#)
+            .expect("write malformed models");
+
+        let auth_error = super::remove_screenpipe_auth_from_path(&auth_path)
+            .expect_err("malformed auth must fail closed");
+        let models_error = super::reset_screenpipe_model_token_from_path(&models_path)
+            .expect_err("malformed models must fail closed");
+
+        assert!(auth_error.contains("preserved without rewriting"));
+        assert!(models_error.contains("preserved without rewriting"));
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("read preserved auth"),
+            r#"{"screenpipe":"stale-auth-jwt""#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&models_path).expect("read preserved models"),
+            r#"{"apiKey":"stale-model-jwt""#
+        );
+    }
+
+    #[test]
     fn clear_screenpipe_auth_missing_file_is_noop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("missing-auth.json");
@@ -4121,6 +5255,231 @@ mod tests {
         super::remove_screenpipe_auth_from_path(&auth_path).expect("missing auth is ok");
 
         assert!(!auth_path.exists());
+    }
+
+    #[test]
+    fn provider_boundary_normalizes_urls_and_separates_credentials() {
+        let custom = super::PiProviderConfig {
+            provider: "custom".to_string(),
+            url: " https://EXAMPLE.com:443/v1/ ".to_string(),
+            model: "model-a".to_string(),
+            api_key: Some(" key-a ".to_string()),
+            max_tokens: 4096,
+            system_prompt: None,
+        };
+        let normalized = super::PiProviderConfig {
+            url: "https://example.com/v1".to_string(),
+            api_key: Some("key-a".to_string()),
+            model: "model-b".to_string(),
+            ..custom.clone()
+        };
+        assert_eq!(
+            super::pi_provider_boundary(&custom).unwrap(),
+            super::pi_provider_boundary(&normalized).unwrap(),
+            "model changes stay inside one credential domain"
+        );
+
+        let another_key = super::PiProviderConfig {
+            api_key: Some("key-b".to_string()),
+            ..normalized.clone()
+        };
+        let another_url = super::PiProviderConfig {
+            url: "https://other.example/v1".to_string(),
+            ..normalized.clone()
+        };
+        assert_ne!(
+            super::pi_provider_boundary(&normalized).unwrap(),
+            super::pi_provider_boundary(&another_key).unwrap()
+        );
+        assert_ne!(
+            super::pi_provider_boundary(&normalized).unwrap(),
+            super::pi_provider_boundary(&another_url).unwrap()
+        );
+
+        let openai_default = super::PiProviderConfig {
+            provider: "openai".to_string(),
+            url: String::new(),
+            ..normalized.clone()
+        };
+        let openai_explicit = super::PiProviderConfig {
+            url: "https://api.openai.com/v1/".to_string(),
+            ..openai_default.clone()
+        };
+        assert_eq!(
+            super::pi_provider_boundary(&openai_default).unwrap(),
+            super::pi_provider_boundary(&openai_explicit).unwrap()
+        );
+    }
+
+    #[test]
+    fn managed_and_chatgpt_providers_each_have_one_credential_domain() {
+        let base = super::PiProviderConfig {
+            provider: "screenpipe-cloud".to_string(),
+            url: "https://stale.example".to_string(),
+            model: "auto".to_string(),
+            api_key: Some("stale-a".to_string()),
+            max_tokens: 4096,
+            system_prompt: None,
+        };
+        let changed = super::PiProviderConfig {
+            provider: "pi".to_string(),
+            url: "https://other.example".to_string(),
+            api_key: Some("stale-b".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            super::pi_provider_boundary(&base).unwrap(),
+            super::pi_provider_boundary(&changed).unwrap()
+        );
+
+        let chatgpt_a = super::PiProviderConfig {
+            provider: "openai-chatgpt".to_string(),
+            ..base.clone()
+        };
+        let chatgpt_b = super::PiProviderConfig {
+            url: "https://ignored.example".to_string(),
+            api_key: Some("ignored".to_string()),
+            ..chatgpt_a.clone()
+        };
+        assert_eq!(
+            super::pi_provider_boundary(&chatgpt_a).unwrap(),
+            super::pi_provider_boundary(&chatgpt_b).unwrap()
+        );
+        assert_ne!(
+            super::pi_provider_boundary(&base).unwrap(),
+            super::pi_provider_boundary(&chatgpt_a).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_boundary_conflicts_select_only_live_different_domains() {
+        let requested = super::PiProviderBoundary("requested".to_string());
+        let conflicts = super::select_pi_provider_boundary_conflicts(
+            vec![
+                (
+                    "same".to_string(),
+                    Some(super::PiProviderBoundary("requested".to_string())),
+                    true,
+                ),
+                (
+                    "different".to_string(),
+                    Some(super::PiProviderBoundary("other".to_string())),
+                    true,
+                ),
+                ("unknown".to_string(), None, true),
+                (
+                    "dead".to_string(),
+                    Some(super::PiProviderBoundary("other".to_string())),
+                    false,
+                ),
+            ],
+            &requested,
+        );
+
+        assert_eq!(conflicts, vec!["different", "unknown"]);
+    }
+
+    #[test]
+    fn auth_reset_drains_uuid_and_legacy_pi_sessions() {
+        let uuid = "33333333-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string();
+        let mut sessions =
+            std::collections::HashMap::from([("chat".to_string(), true), (uuid.clone(), true)]);
+        let mut stopped = 0;
+
+        let stopped_ids = super::stop_and_clear_session_map(&mut sessions, |running| {
+            assert!(*running);
+            *running = false;
+            stopped += 1;
+        });
+
+        assert_eq!(stopped, 2);
+        assert!(sessions.is_empty());
+        assert_eq!(stopped_ids, vec![uuid, "chat".to_string()]);
+        assert!(super::is_pi_auth_reset(None, None));
+        assert!(super::is_pi_auth_reset(Some("  "), None));
+        assert!(!super::is_pi_auth_reset(Some("jwt"), None));
+        let provider = super::PiProviderConfig {
+            provider: "native-ollama".to_string(),
+            url: String::new(),
+            model: "qwen".to_string(),
+            api_key: None,
+            max_tokens: 4096,
+            system_prompt: None,
+        };
+        assert!(!super::is_pi_auth_reset(None, Some(&provider)));
+
+        let hosted = super::PiProviderConfig {
+            provider: "screenpipe-cloud".to_string(),
+            ..provider.clone()
+        };
+        assert_eq!(super::pi_provider_name(&provider).unwrap(), "ollama");
+        assert_eq!(super::pi_provider_name(&hosted).unwrap(), "screenpipe");
+        let invalid_custom = super::PiProviderConfig {
+            provider: "custom".to_string(),
+            url: "   ".to_string(),
+            ..provider.clone()
+        };
+        assert_eq!(
+            super::pi_provider_name(&invalid_custom).unwrap_err(),
+            "invalid_custom_provider_url"
+        );
+        let unknown = super::PiProviderConfig {
+            provider: "mystery".to_string(),
+            ..provider.clone()
+        };
+        assert_eq!(
+            super::pi_provider_name(&unknown).unwrap_err(),
+            "unsupported_pi_provider:mystery"
+        );
+        assert_eq!(
+            super::authoritative_pi_user_token(
+                Some("account-a"),
+                Some("account-a".to_string()),
+                Some(&hosted),
+                false,
+            )
+            .expect("matching hosted identity"),
+            Some("account-a".to_string()),
+        );
+        assert_eq!(
+            super::authoritative_pi_user_token(
+                Some("account-a"),
+                Some("account-b".to_string()),
+                Some(&hosted),
+                false,
+            )
+            .unwrap_err(),
+            "pi_auth_identity_changed",
+        );
+        assert_eq!(
+            super::authoritative_pi_user_token(None, None, Some(&hosted), false).unwrap_err(),
+            "hosted_ai_sign_in_required",
+        );
+        assert_eq!(
+            super::authoritative_pi_user_token(None, None, Some(&provider), false)
+                .expect("signed-out local provider"),
+            None,
+        );
+        assert_eq!(
+            super::authoritative_pi_user_token(None, None, Some(&hosted), true)
+                .expect("explicit E2E hosted bypass"),
+            None,
+        );
+        assert_eq!(
+            super::pi_cloud_catalog_token(Some("account-a".to_string()), Some(&hosted),)
+                .expect("hosted provider keeps its own credential"),
+            Some("account-a".to_string()),
+        );
+        assert_eq!(
+            super::pi_cloud_catalog_token(Some("account-a".to_string()), Some(&provider),)
+                .expect("local provider strips unrelated cloud credential"),
+            None,
+        );
+        assert_eq!(
+            super::pi_cloud_catalog_token(Some("account-a".to_string()), Some(&unknown),)
+                .unwrap_err(),
+            "unsupported_pi_provider:mystery",
+        );
     }
 
     #[test]
@@ -4665,7 +6024,16 @@ error: InstallFailed extracting tarball"#;
 
     // -- build_models_json tests --
 
-    use super::{build_models_json, resolve_pi_model, PiProviderConfig};
+    use super::{build_models_json as build_models_json_impl, resolve_pi_model, PiProviderConfig};
+
+    const TEST_CLOUD_PROXY_URL: &str = "http://127.0.0.1:3030/v1/interactive";
+
+    async fn build_models_json(
+        user_token: Option<&str>,
+        provider_config: Option<&PiProviderConfig>,
+    ) -> Value {
+        build_models_json_impl(user_token, provider_config, TEST_CLOUD_PROXY_URL).await
+    }
 
     fn make_provider_config(provider: &str, model: &str) -> PiProviderConfig {
         PiProviderConfig {
@@ -4676,6 +6044,46 @@ error: InstallFailed extracting tarball"#;
             max_tokens: 4096,
             system_prompt: None,
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_runtime_config_removes_unrelated_providers_and_auth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("models.json"),
+            serde_json::to_string_pretty(&json!({
+                "providers": {
+                    "screenpipe": {"apiKey": "stale-cloud-jwt"},
+                    "anthropic-byok": {"apiKey": "stale-anthropic-key"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"screenpipe":"stale-cloud-jwt","anthropic":"stale-anthropic-key"}"#,
+        )
+        .unwrap();
+
+        let openai = make_provider_config("openai", "gpt-5");
+        super::ensure_pi_config(dir.path(), None, Some(&openai), TEST_CLOUD_PROXY_URL)
+            .await
+            .expect("selected runtime config");
+
+        let models_text = std::fs::read_to_string(dir.path().join("models.json")).unwrap();
+        let models: Value = serde_json::from_str(&models_text).unwrap();
+        let providers = models["providers"].as_object().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert!(providers.contains_key("openai-byok"));
+        assert!(!models_text.contains("stale-cloud-jwt"));
+        assert!(!models_text.contains("stale-anthropic-key"));
+
+        let auth: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(auth.as_object().unwrap().is_empty());
     }
 
     #[test]
@@ -4703,10 +6111,14 @@ error: InstallFailed extracting tarball"#;
         assert_eq!(providers.len(), 1);
 
         let sp = &providers["screenpipe"];
-        assert_eq!(sp["baseUrl"], "https://api.screenpipe.com/v1");
+        assert_eq!(sp["baseUrl"], TEST_CLOUD_PROXY_URL);
         assert_eq!(sp["api"], "openai-completions");
-        assert_eq!(sp["apiKey"], "SCREENPIPE_API_KEY");
+        assert_eq!(sp["apiKey"], "SCREENPIPE_LOCAL_API_KEY");
         assert_eq!(sp["authHeader"], true);
+        assert_eq!(
+            sp["headers"]["x-screenpipe-cloud-proxy-capability"],
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY"
+        );
         assert!(sp["models"].as_array().unwrap().len() > 0);
     }
 
@@ -4714,7 +6126,8 @@ error: InstallFailed extracting tarball"#;
     async fn test_build_models_json_with_user_token() {
         let config = build_models_json(Some("tok_abc123"), None).await;
         let sp = &config["providers"]["screenpipe"];
-        assert_eq!(sp["apiKey"], "tok_abc123");
+        assert_eq!(sp["apiKey"], "SCREENPIPE_LOCAL_API_KEY");
+        assert!(!config.to_string().contains("tok_abc123"));
     }
 
     #[tokio::test]
@@ -4732,8 +6145,8 @@ error: InstallFailed extracting tarball"#;
         let pc = make_provider_config("openai", "gpt-4o");
         let config = build_models_json(None, Some(&pc)).await;
         let providers = config["providers"].as_object().unwrap();
-        assert_eq!(providers.len(), 2);
-        assert!(providers.contains_key("screenpipe"));
+        assert_eq!(providers.len(), 1);
+        assert!(!providers.contains_key("screenpipe"));
         assert!(providers.contains_key("openai-byok"));
 
         let openai = &providers["openai-byok"];
@@ -4781,6 +6194,7 @@ error: InstallFailed extracting tarball"#;
         let config = build_models_json(None, Some(&pc)).await;
         let providers = config["providers"].as_object().unwrap();
         assert!(providers.contains_key("ollama"));
+        assert!(!providers.contains_key("screenpipe"));
         assert_eq!(providers["ollama"]["baseUrl"], "http://localhost:11434/v1");
     }
 
@@ -4803,7 +6217,7 @@ error: InstallFailed extracting tarball"#;
         let pc = make_provider_config("custom", "my-model");
         let config = build_models_json(None, Some(&pc)).await;
         let providers = config["providers"].as_object().unwrap();
-        assert_eq!(providers.len(), 1); // only screenpipe
+        assert_eq!(providers.len(), 0);
         assert!(!providers.contains_key("custom"));
     }
 
@@ -4813,7 +6227,7 @@ error: InstallFailed extracting tarball"#;
         pc.url = "http://my-server:8080/v1".to_string();
         let config = build_models_json(None, Some(&pc)).await;
         let providers = config["providers"].as_object().unwrap();
-        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.len(), 1);
         assert!(providers.contains_key("custom"));
         assert_eq!(providers["custom"]["baseUrl"], "http://my-server:8080/v1");
     }

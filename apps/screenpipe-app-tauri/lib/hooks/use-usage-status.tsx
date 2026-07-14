@@ -26,23 +26,42 @@ export interface UsageStatus {
    *  server (via MODEL_GATING_ENABLED) turn the banner off without an app
    *  release. Absent on older gateways → treated as false. */
   upsell_banner?: boolean;
+  /** Authoritative lifetime Screenpipe-hosted preview counter. Absent for
+   * Business, signed-out, disabled rollout, or an older gateway. */
+  free_chat?: {
+    used: number;
+    limit: number;
+    remaining: number;
+  };
 }
 
 const USAGE_URL = "https://api.screenpipe.com/v1/usage";
 /** Poll interval — 30s is frequent enough that a user who sends a burst
  *  sees the chip appear promptly, rare enough not to hammer the worker. */
 const POLL_INTERVAL_MS = 30_000;
+export const USAGE_STATUS_REFRESH_EVENT = "screenpipe:usage-status-refresh";
+
+export function requestUsageStatusRefresh() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(USAGE_STATUS_REFRESH_EVENT));
+  }
+}
 
 export function useUsageStatus(): UsageStatus | null {
   const { settings } = useSettings();
   const token = settings.user?.token;
   const [status, setStatus] = useState<UsageStatus | null>(null);
+  const [statusToken, setStatusToken] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let latestRequest = 0;
+    setStatus(null);
+    setStatusToken(null);
 
     const fetchOnce = async () => {
+      const requestId = ++latestRequest;
       try {
         const res = await fetch(USAGE_URL, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -51,6 +70,7 @@ export function useUsageStatus(): UsageStatus | null {
         const json = (await res.json()) as Partial<UsageStatus>;
         if (
           alive &&
+          requestId === latestRequest &&
           typeof json.limit_today === "number" &&
           typeof json.remaining === "number"
         ) {
@@ -61,7 +81,14 @@ export function useUsageStatus(): UsageStatus | null {
             remaining: json.remaining,
             resets_at: json.resets_at ?? "",
             upsell_banner: json.upsell_banner === true,
+            ...(json.free_chat &&
+            typeof json.free_chat.used === "number" &&
+            typeof json.free_chat.limit === "number" &&
+            typeof json.free_chat.remaining === "number"
+              ? { free_chat: { ...json.free_chat } }
+              : {}),
           });
+          setStatusToken(token ?? null);
         }
       } catch {
         // Network blip — try again on next tick. Don't surface an error
@@ -70,6 +97,7 @@ export function useUsageStatus(): UsageStatus | null {
     };
 
     fetchOnce();
+    window.addEventListener(USAGE_STATUS_REFRESH_EVENT, fetchOnce);
     const schedule = () => {
       timer = setTimeout(async () => {
         await fetchOnce();
@@ -80,11 +108,12 @@ export function useUsageStatus(): UsageStatus | null {
 
     return () => {
       alive = false;
+      window.removeEventListener(USAGE_STATUS_REFRESH_EVENT, fetchOnce);
       if (timer) clearTimeout(timer);
     };
   }, [token]);
 
-  return status;
+  return statusToken === (token ?? null) ? status : null;
 }
 
 /**

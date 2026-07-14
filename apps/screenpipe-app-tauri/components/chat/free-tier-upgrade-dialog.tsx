@@ -17,6 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import type { FreeTierOwnAiChoice } from "@/lib/chat/free-tier-provider-setup";
 
 export function buildFreeTierUpgradeUrl(userToken?: string | null): string {
   if (!userToken) return PRICING_URL;
@@ -34,7 +35,7 @@ export function FreeTierUpgradeDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onChooseOwnAI: (choice?: "provider" | "local") => void | Promise<void>;
+  onChooseOwnAI: (choice: FreeTierOwnAiChoice) => void | Promise<void>;
   userToken?: string | null;
   limit?: number;
   plan?: string | null;
@@ -85,7 +86,7 @@ export function FreeTierUpgradeDialog({
     closeAfterAction();
   };
 
-  const chooseOwnAI = async (choice: "provider" | "local") => {
+  const chooseOwnAI = async (choice: FreeTierOwnAiChoice) => {
     posthog.capture(
       choice === "local" ? "free_chat_local_clicked" : "free_chat_byok_clicked",
       { provider: "screenpipe-cloud", plan, limit },
@@ -136,7 +137,7 @@ export function FreeTierUpgradeDialog({
             <span className="min-w-0 flex-1">
               <span className="font-medium">continue free with your AI</span>
               <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                Connect ChatGPT/Codex, an Anthropic or OpenAI API key, or any compatible endpoint.
+                Connect ChatGPT Plus (including Codex), an Anthropic or OpenAI API key, or any compatible endpoint.
               </span>
             </span>
           </button>

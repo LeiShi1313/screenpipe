@@ -78,6 +78,7 @@ vi.mock("@/lib/chat-storage", () => ({
   searchConversations: vi.fn(async () => []),
   migrateFromStoreBin: vi.fn(async () => undefined),
   conversationDedupKey: vi.fn(() => null),
+  updateConversationFlags: vi.fn(async () => undefined),
   CHAT_HISTORY_INITIAL_LIMIT: 50,
 }));
 
@@ -112,6 +113,8 @@ function useHarness(args: {
   initialPiSessionId: string;
   selectedPreset?: any;
   selectedPresetRef?: any;
+  settings?: any;
+  authIdentity?: { token: string | null; generation: number };
 }) {
   const messagesRef = useRef(args.initialMessages);
   const conversationIdRef = useRef<string | null>(args.initialConversationId);
@@ -121,6 +124,10 @@ function useHarness(args: {
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<any[]>([]);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const authIdentityRef = useRef(
+    args.authIdentity ?? { token: null, generation: 0 },
+  );
+  authIdentityRef.current = args.authIdentity ?? authIdentityRef.current;
 
   const hook = useChatConversations({
     messages: messagesRef.current as any,
@@ -143,13 +150,24 @@ function useHarness(args: {
     setIsLoading: vi.fn() as any,
     setIsStreaming: vi.fn() as any,
     setPastedImages: vi.fn() as any,
-    settings: { chatHistory: { historyEnabled: true } },
+    authIdentityRef,
+    settings: args.settings ?? { chatHistory: { historyEnabled: true } },
     inlineHistoryEnabled: false,
     selectedPreset: args.selectedPreset ?? null,
     selectedPresetRef: args.selectedPresetRef,
   });
 
   return { hook, messagesRef, conversationIdRef, piSessionIdRef };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 beforeEach(() => {
@@ -164,6 +182,83 @@ afterEach(() => {
 });
 
 describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
+  it("finishes a conversation switch across a same-account JWT refresh", async () => {
+    const pendingLoad = deferred<any>();
+    vi.mocked(loadConversationFile).mockImplementationOnce(
+      async () => pendingLoad.promise,
+    );
+    const incomingMessages = [
+      {
+        id: "b-user",
+        role: "user" as const,
+        content: "conversation B",
+        timestamp: 10,
+      },
+      {
+        id: "b-assistant",
+        role: "assistant" as const,
+        content: "loaded",
+        timestamp: 11,
+      },
+    ];
+    const incoming = {
+      id: "chat-B",
+      title: "chat B",
+      titleSource: "fallback",
+      createdAt: 10,
+      updatedAt: 11,
+      messages: incomingMessages,
+    };
+
+    const { result, rerender } = renderHook(
+      ({ token, generation }) =>
+        useHarness({
+          initialMessages: [
+            {
+              id: "a-user",
+              role: "user" as const,
+              content: "conversation A",
+              timestamp: 1,
+            },
+          ],
+          initialConversationId: "chat-A",
+          initialPiSessionId: "chat-A",
+          settings: {
+            user: { id: "stable-user", token },
+            chatHistory: { historyEnabled: true },
+          },
+          authIdentity: { token, generation },
+        }),
+      { initialProps: { token: "jwt-old", generation: 1 } },
+    );
+
+    let switchPromise!: Promise<void>;
+    act(() => {
+      switchPromise = result.current.hook.loadConversation(incoming as any);
+    });
+    await vi.waitFor(() => {
+      expect(loadConversationFile).toHaveBeenCalledWith("chat-B");
+    });
+
+    // loadConversation deliberately pairs the native/session ref and store
+    // before the async disk read. This used to become a permanent split when a
+    // refreshed JWT incremented the raw Pi auth generation at this exact point.
+    expect(result.current.piSessionIdRef.current).toBe("chat-B");
+    expect(useChatStore.getState().currentId).toBe("chat-B");
+    expect(result.current.conversationIdRef.current).toBe("chat-A");
+
+    rerender({ token: "jwt-refreshed", generation: 2 });
+    pendingLoad.resolve(incoming);
+    await act(async () => {
+      await switchPromise;
+    });
+
+    expect(result.current.piSessionIdRef.current).toBe("chat-B");
+    expect(useChatStore.getState().currentId).toBe("chat-B");
+    expect(result.current.conversationIdRef.current).toBe("chat-B");
+    expect(result.current.messagesRef.current).toEqual(incomingMessages);
+  });
+
   it("writes A's messages under A's id during chat switch (PR #3600 fix)", async () => {
     // Set up the race condition state that exists for a single render
     // tick after `loadConversation(B)` has run:
@@ -444,5 +539,61 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
     expect(saveCalls).toHaveLength(1);
     expect(saveCalls[0].id).toBe("turn-1");
     expect(new Set(saveCalls.map((c) => c.id)).size).toBe(1);
+  });
+
+  it("persists and cold-rehydrates exact free hosted retry payload metadata", async () => {
+    const hostedTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const hostedTurnPrompt = `immutable queued snapshot\n\n<!-- screenpipe-cloud-turn:${hostedTurnId} -->`;
+    const messages = [
+      {
+        id: "u1",
+        role: "user" as const,
+        content: "clean visible prompt",
+        hostedTurnId,
+        hostedTurnPrompt,
+        timestamp: 1,
+      },
+      {
+        id: "a1",
+        role: "assistant" as const,
+        content: "answer",
+        timestamp: 2,
+      },
+    ];
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: "chat-A",
+        initialPiSessionId: "chat-A",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls[0].messages[0]).toMatchObject({
+      content: "clean visible prompt",
+      hostedTurnId,
+      hostedTurnPrompt,
+    });
+
+    const persisted = {
+      id: "chat-B",
+      title: "hosted retry",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: saveCalls[0].messages,
+    };
+    vi.mocked(loadConversationFile).mockResolvedValueOnce(persisted as any);
+    await act(async () => {
+      await result.current.hook.loadConversation(persisted as any);
+    });
+
+    expect(result.current.messagesRef.current[0]).toMatchObject({
+      content: "clean visible prompt",
+      hostedTurnId,
+      hostedTurnPrompt,
+    });
   });
 });

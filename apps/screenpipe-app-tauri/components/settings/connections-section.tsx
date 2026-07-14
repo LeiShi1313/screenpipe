@@ -47,6 +47,11 @@ import { CustomMcpCard } from "./custom-mcp-card";
 import { SkillsCard } from "./skills-card";
 import { PiExtensionsCard } from "./pi-extensions-card";
 import posthog from "posthog-js";
+import {
+  buildCodexMcpToml,
+  removeCodexMcpConfig,
+  upsertCodexMcpConfig,
+} from "@/lib/utils/codex-mcp-config";
 
 // ---------------------------------------------------------------------------
 // Utility functions (unchanged)
@@ -435,51 +440,13 @@ async function installCursorMcp(): Promise<void> {
   await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
 }
 
-const CODEX_SCREENPIPE_TABLE = /(?:^|\n)\[mcp_servers\.screenpipe\][\s\S]*?(?=\n\[(?!mcp_servers\.screenpipe(?:\.|\]))[^\]]+\]|\s*$)/;
-
-function tomlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function tomlKey(value: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(value) ? value : tomlString(value);
-}
-
-function removeCodexMcpConfig(content: string): string {
-  return content
-    .replace(CODEX_SCREENPIPE_TABLE, "")
-    .replace(/^\n+/, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trimEnd();
-}
-
-function buildCodexMcpToml(config: McpCommand): string {
-  const lines = [
-    "[mcp_servers.screenpipe]",
-    `command = ${tomlString(config.command)}`,
-    `args = [${config.args.map(tomlString).join(", ")}]`,
-    "enabled = true",
-  ];
-
-  const envEntries = Object.entries(config.env ?? {});
-  if (envEntries.length > 0) {
-    lines.push("", "[mcp_servers.screenpipe.env]");
-    for (const [key, value] of envEntries) {
-      lines.push(`${tomlKey(key)} = ${tomlString(value)}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
 async function installCodexMcp(): Promise<void> {
   const configPath = await getCodexConfigPath();
   let existing = "";
   try { existing = await readTextFile(configPath); } catch { /* fresh */ }
 
   const config = await buildMcpConfig();
-  const withoutScreenpipe = removeCodexMcpConfig(existing);
-  const next = `${withoutScreenpipe}${withoutScreenpipe ? "\n\n" : ""}${buildCodexMcpToml(config)}\n`;
+  const next = upsertCodexMcpConfig(existing, config);
 
   await mkdir(await dirname(configPath), { recursive: true });
   await writeFile(configPath, new TextEncoder().encode(next));

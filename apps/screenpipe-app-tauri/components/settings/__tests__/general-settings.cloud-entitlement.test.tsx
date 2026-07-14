@@ -22,6 +22,11 @@ vi.mock("@/lib/hooks/use-settings", () => ({
 
 vi.mock("@/lib/hooks/use-is-enterprise-build", () => ({
   useIsEnterpriseBuild: () => false,
+  useEnterpriseBuildStatus: () => ({
+    isEnterprise: false,
+    resolved: true,
+    error: false,
+  }),
 }));
 
 vi.mock("@/lib/utils/tauri", () => ({

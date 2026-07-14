@@ -153,6 +153,20 @@ export async function validateAuth(request: Request, env: Env): Promise<AuthResu
     };
   }
 
+  // A legacy Screenpipe JWT can only be verified by the canonical `/api/user`
+  // endpoint. A 5xx/network failure is therefore an indeterminate identity and
+  // entitlement result, not proof that the caller signed out. Preserve the
+  // anonymous tier until identity is verified, but surface the outage so every
+  // enforced hosted route returns the retryable 503 before its anonymous 401.
+  if (screenpipeUser.unavailable) {
+    return {
+      isValid: true,
+      tier: 'anonymous',
+      deviceId: headerDeviceId,
+      error: 'subscription_lookup_unavailable',
+    };
+  }
+
   // Invalid token provided = still allow as anonymous
   // This is a design choice: we don't want to block users with expired tokens
   console.log('Token validation failed, falling back to anonymous tier');

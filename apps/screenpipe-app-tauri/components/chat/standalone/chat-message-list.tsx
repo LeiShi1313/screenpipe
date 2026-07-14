@@ -372,7 +372,7 @@ export function ChatMessageList({
                               : false
                           }
                           onImageClick={onOpenImageViewer}
-                          onRetry={(prompt) => sendMessage(prompt)}
+                          onRetry={() => onRetryAssistantMessage(message.id)}
                           onOpenViewerPath={openFilePreview}
                           connectionItems={connectionItems}
                           onOpenConnectionSetup={onOpenConnectionSetup}

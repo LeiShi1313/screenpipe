@@ -7,7 +7,15 @@ import { Env, RequestBody, AuthResult } from './types';
 import { handleOptions, createSuccessResponse, createErrorResponse, addCorsHeaders } from './utils/cors';
 import { validateAuth } from './utils/auth';
 import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
-import { trackUsage, getUsageStatus, isModelAllowed, isFreeModel, resolveModelGate, getTierConfig, getCreditBalance } from './services/usage-tracker';
+import {
+	trackUsage,
+	getUsageStatus,
+	isModelAllowed,
+	isFreeModel,
+	resolveModelGate,
+	getTierConfig,
+	getCreditBalance,
+} from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
@@ -16,13 +24,24 @@ import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleV
 import { handleVertexProxy, handleVertexModels } from './handlers/vertex-proxy';
 import { handleWebSearch } from './handlers/web-search';
 import { handleTinfoilAttestation, handleTinfoilProxy } from './handlers/tinfoil-proxy';
-import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost, getMaxDailyCostPerUser, getTierDailyCostCap, resolveServedModel } from './services/cost-tracker';
+import {
+	logCost,
+	getModelCost,
+	inferProvider,
+	getSpendSummary,
+	getDailyUserCost,
+	getMaxDailyCostPerUser,
+	getTierDailyCostCap,
+	resolveServedModel,
+} from './services/cost-tracker';
 import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { pruneModelHealth } from './services/model-health';
 import { resolveLatencyClass, isBackgroundRequest } from './utils/latency';
 import { enforceDailyCostCap } from './services/cost-cap';
 import {
-	acceptFreeChatTurn,
+	commitFreeChatDispatchGuard,
+	getFreeChatMaxInputBytes,
+	getFreeChatUsageStatus,
 	hashFreeChatNetwork,
 	isFreeChatPreviewEnabled,
 	isFreeLocalTierEnforcementEnabled,
@@ -32,7 +51,6 @@ import {
 	releaseFreeChatTurn,
 	reserveFreeChatShadowBudget,
 	reserveFreeChatTurn,
-	settleFreeChatShadowBudget,
 	settleFreeChatTurnResponse,
 } from './services/free-chat-turns';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
@@ -41,42 +59,107 @@ export { RateLimiter };
 
 function freeTierRolloutConfigurationError(env: Env): Response | null {
 	if (isFreeChatPreviewEnabled(env) && !isFreeLocalTierEnforcementEnabled(env)) {
-		return addCorsHeaders(createErrorResponse(503, JSON.stringify({
-			error: 'free_tier_rollout_misconfigured',
-			message: 'Hosted inference is temporarily unavailable because its free-tier safety controls are misconfigured. Local and user-provided AI remain available.',
-		})));
+		return addCorsHeaders(
+			createErrorResponse(
+				503,
+				JSON.stringify({
+					error: 'free_tier_rollout_misconfigured',
+					message:
+						'Hosted inference is temporarily unavailable because its free-tier safety controls are misconfigured. Local and user-provided AI remain available.',
+				}),
+			),
+		);
 	}
 	return null;
 }
 
-function hostedBusinessGate(env: Env, auth: AuthResult, capability: 'hosted_ai' | 'cloud_transcription'): Response | null {
+function subscriptionStatusUnavailableResponse(env: Env, auth: AuthResult): Response | null {
+	if (!isFreeLocalTierEnforcementEnabled(env) || auth.error !== 'subscription_lookup_unavailable') {
+		return null;
+	}
+	return addCorsHeaders(
+		createErrorResponse(
+			503,
+			JSON.stringify({
+				error: 'subscription_status_unavailable',
+				message: 'We could not verify your Business access right now. Please retry; your account was not downgraded.',
+			}),
+		),
+	);
+}
+
+type BoundedRequestBody = { ok: true; text: string; byteLength: number } | { ok: false; limit: number };
+
+async function readBoundedRequestBody(request: Request, limit: number): Promise<BoundedRequestBody> {
+	if (!request.body) return { ok: true, text: '', byteLength: 0 };
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let byteLength = 0;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		byteLength += value.byteLength;
+		if (byteLength > limit) {
+			await reader.cancel().catch(() => undefined);
+			return { ok: false, limit };
+		}
+		chunks.push(value);
+	}
+	const bytes = new Uint8Array(byteLength);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return { ok: true, text: new TextDecoder().decode(bytes), byteLength };
+}
+
+function freeChatInputTooLargeResponse(limit: number): Response {
+	return addCorsHeaders(
+		createErrorResponse(
+			413,
+			JSON.stringify({
+				error: 'free_chat_input_too_large',
+				message: `The included hosted preview accepts at most ${limit} UTF-8 bytes per request. Use a smaller context, upgrade, or use your own AI provider.`,
+				limit,
+			}),
+		),
+	);
+}
+
+export function hostedBusinessGate(env: Env, auth: AuthResult, capability: 'hosted_ai' | 'cloud_transcription'): Response | null {
 	const configurationError = freeTierRolloutConfigurationError(env);
 	if (configurationError) return configurationError;
 	if (!isFreeLocalTierEnforcementEnabled(env)) return null;
-	if (auth.error === 'subscription_lookup_unavailable') {
-		return addCorsHeaders(createErrorResponse(503, JSON.stringify({
-			error: 'subscription_status_unavailable',
-			message: 'We could not verify your Business access right now. Please retry; your account was not downgraded.',
-		})));
-	}
+	const subscriptionError = subscriptionStatusUnavailableResponse(env, auth);
+	if (subscriptionError) return subscriptionError;
 	if (auth.tier === 'anonymous' || !auth.userId) {
-		return addCorsHeaders(createErrorResponse(401, JSON.stringify({
-			error: 'hosted_ai_sign_in_required',
-			message: 'Sign in to a screenpipe account to use hosted AI. Local and user-provided AI remain free.',
-			free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-		})));
+		return addCorsHeaders(
+			createErrorResponse(
+				401,
+				JSON.stringify({
+					error: 'hosted_ai_sign_in_required',
+					message: 'Sign in to a screenpipe account to use hosted AI. Local and user-provided AI remain free.',
+					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				}),
+			),
+		);
 	}
 	if (auth.tier === 'subscribed') return null;
-	return addCorsHeaders(createErrorResponse(402, JSON.stringify({
-		error: capability === 'cloud_transcription'
-			? 'cloud_transcription_subscription_required'
-			: 'hosted_ai_subscription_required',
-		message: capability === 'cloud_transcription'
-			? 'Screenpipe Cloud transcription requires Business. Local transcription remains free.'
-			: 'This hosted AI feature requires Business. Local and user-provided AI remain free.',
-		upgrade_url: 'https://screenpi.pe/onboarding',
-		free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-	})));
+	return addCorsHeaders(
+		createErrorResponse(
+			402,
+			JSON.stringify({
+				error: capability === 'cloud_transcription' ? 'cloud_transcription_subscription_required' : 'hosted_ai_subscription_required',
+				message:
+					capability === 'cloud_transcription'
+						? 'Screenpipe Cloud transcription requires Business. Local transcription remains free.'
+						: 'This hosted AI feature requires Business. Local and user-provided AI remain free.',
+				upgrade_url: 'https://screenpi.pe/onboarding',
+				free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+			}),
+		),
+	);
 }
 
 // Handler function for the worker
@@ -120,6 +203,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 		// Usage status endpoint - returns current usage without incrementing
 		if (path === '/v1/usage' && request.method === 'GET') {
+			const subscriptionError = subscriptionStatusUnavailableResponse(env, authResult);
+			if (subscriptionError) return subscriptionError;
 			const status = await getUsageStatus(env, authResult.deviceId, authResult.tier, authResult.userId);
 			// Enrich with cost-based limit flag (NOT the raw $ numbers — those
 			// are our internal margin and shouldn't leak to any client/user).
@@ -128,9 +213,25 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			const dailyCost = await getDailyUserCost(env, authResult.deviceId);
 			const maxCost = getTierDailyCostCap(authResult.tier, env);
 			const credits = authResult.userId ? await getCreditBalance(env, authResult.userId) : 0;
+			let freeChat = null;
+			try {
+				freeChat = await getFreeChatUsageStatus(env, authResult);
+			} catch (error) {
+				captureException(error);
+				return addCorsHeaders(
+					createErrorResponse(
+						503,
+						JSON.stringify({
+							error: 'free_chat_ledger_unavailable',
+							message: 'Hosted preview usage is temporarily unavailable. No turn was used.',
+						}),
+					),
+				);
+			}
 			const enriched = {
 				...status,
 				cost_limit_reached: dailyCost >= maxCost + credits,
+				...(freeChat ? { free_chat: freeChat } : {}),
 			};
 			return addCorsHeaders(createSuccessResponse(enriched));
 		}
@@ -161,71 +262,116 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		if (path === '/v1/chat/completions' && request.method === 'POST') {
 			const configurationError = freeTierRolloutConfigurationError(env);
 			if (configurationError) return configurationError;
+			const enforcementEnabled = isFreeLocalTierEnforcementEnabled(env);
+			const previewEnabled = enforcementEnabled && isFreeChatPreviewEnabled(env);
+			const backgroundRequest = isBackgroundRequest(request);
+
+			if (enforcementEnabled && authResult.error === 'subscription_lookup_unavailable') {
+				return addCorsHeaders(
+					createErrorResponse(
+						503,
+						JSON.stringify({
+							error: 'subscription_status_unavailable',
+							message:
+								'We could not verify your Business access right now. Please retry; your account was not downgraded and no preview turn was used.',
+						}),
+					),
+				);
+			}
+			if (enforcementEnabled && (authResult.tier === 'anonymous' || !authResult.userId)) {
+				return addCorsHeaders(
+					createErrorResponse(
+						401,
+						JSON.stringify({
+							error: 'hosted_ai_sign_in_required',
+							message: 'Sign in to a screenpipe account to use the included hosted AI preview. Local and user-provided AI remain free.',
+							free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+						}),
+					),
+				);
+			}
+			if (enforcementEnabled && authResult.tier === 'logged_in' && backgroundRequest) {
+				return addCorsHeaders(
+					createErrorResponse(
+						402,
+						JSON.stringify({
+							error: 'hosted_automation_subscription_required',
+							message: 'Hosted AI automations require Business. Local and user-provided pipes remain free.',
+							upgrade_url: 'https://screenpi.pe/onboarding',
+							free_options: ['anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+						}),
+					),
+				);
+			}
+			if (enforcementEnabled && !previewEnabled && authResult.tier === 'logged_in') {
+				return addCorsHeaders(
+					createErrorResponse(
+						402,
+						JSON.stringify({
+							error: 'hosted_ai_subscription_required',
+							message: 'Screenpipe Cloud AI requires Business. Local and user-provided AI remain free.',
+							upgrade_url: 'https://screenpi.pe/onboarding',
+							free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+						}),
+					),
+				);
+			}
 
 			let body: RequestBody;
+			let rawPreviewInputBytes: number | undefined;
 			try {
-				body = (await request.json()) as RequestBody;
+				if (previewEnabled && authResult.tier === 'logged_in') {
+					const boundedBody = await readBoundedRequestBody(request, getFreeChatMaxInputBytes(env));
+					if (!boundedBody.ok) return freeChatInputTooLargeResponse(boundedBody.limit);
+					rawPreviewInputBytes = boundedBody.byteLength;
+					body = JSON.parse(boundedBody.text) as RequestBody;
+				} else {
+					body = (await request.json()) as RequestBody;
+				}
 			} catch {
-				return addCorsHeaders(createErrorResponse(400, JSON.stringify({
-					error: 'invalid_json',
-					message: 'Request body must be valid JSON.',
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						400,
+						JSON.stringify({
+							error: 'invalid_json',
+							message: 'Request body must be valid JSON.',
+						}),
+					),
+				);
 			}
 
 			// Reject requests with no usable model up-front — every downstream
 			// model.toLowerCase() (createProvider, isModelAllowed, cost tracking)
 			// assumes a non-empty string. SCREENPIPE-AI-PROXY-1J.
 			if (!body || typeof body !== 'object' || typeof body.model !== 'string' || body.model.length === 0) {
-				return addCorsHeaders(createErrorResponse(400, JSON.stringify({
-					error: 'missing_model',
-					message: 'Request body must include a non-empty "model" string.',
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						400,
+						JSON.stringify({
+							error: 'missing_model',
+							message: 'Request body must include a non-empty "model" string.',
+						}),
+					),
+				);
 			}
 			// Never trust the internal preview-routing marker from an HTTP client.
 			// It is re-added below only after verified auth and preview validation.
 			delete (body as Partial<RequestBody>).freePreview;
 
-			const enforcementEnabled = isFreeLocalTierEnforcementEnabled(env);
-			const previewEnabled = enforcementEnabled && isFreeChatPreviewEnabled(env);
 			let freePreviewNetworkHash: string | null = null;
-			const backgroundRequest = isBackgroundRequest(request);
-			if (enforcementEnabled && authResult.error === 'subscription_lookup_unavailable') {
-				return addCorsHeaders(createErrorResponse(503, JSON.stringify({
-					error: 'subscription_status_unavailable',
-					message: 'We could not verify your Business access right now. Please retry; your account was not downgraded and no preview turn was used.',
-				})));
-			}
-			if (enforcementEnabled && (authResult.tier === 'anonymous' || !authResult.userId)) {
-				return addCorsHeaders(createErrorResponse(401, JSON.stringify({
-					error: 'hosted_ai_sign_in_required',
-					message: 'Sign in to a screenpipe account to use the included hosted AI preview. Local and user-provided AI remain free.',
-					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-				})));
-			}
-			if (enforcementEnabled && authResult.tier === 'logged_in' && backgroundRequest) {
-				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
-					error: 'hosted_automation_subscription_required',
-					message: 'Hosted AI automations require Business. Local and user-provided pipes remain free.',
-					upgrade_url: 'https://screenpi.pe/onboarding',
-					free_options: ['anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-				})));
-			}
-			if (enforcementEnabled && !previewEnabled && authResult.tier === 'logged_in') {
-				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
-					error: 'hosted_ai_subscription_required',
-					message: 'Screenpipe Cloud AI requires Business. Local and user-provided AI remain free.',
-					upgrade_url: 'https://screenpi.pe/onboarding',
-					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-				})));
-			}
 			if (previewEnabled && authResult.tier === 'logged_in') {
-				const validation = prepareFreeChatRequest(env, body);
+				const validation = prepareFreeChatRequest(env, body, rawPreviewInputBytes);
 				if (!validation.ok) {
-					return addCorsHeaders(createErrorResponse(validation.status, JSON.stringify({
-						error: validation.error,
-						message: validation.message,
-						...(validation.limit === undefined ? {} : { limit: validation.limit }),
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							validation.status,
+							JSON.stringify({
+								error: validation.error,
+								message: validation.message,
+								...(validation.limit === undefined ? {} : { limit: validation.limit }),
+							}),
+						),
+					);
 				}
 				body.freePreview = true;
 				freePreviewNetworkHash = await hashFreeChatNetwork(env, request);
@@ -242,12 +388,17 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				body.model = 'auto';
 			} else if (gate === 'reject') {
 				const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
-				return addCorsHeaders(createErrorResponse(403, JSON.stringify({
-					error: 'model_not_allowed',
-					message: `Model "${body.model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
-					tier: authResult.tier,
-					allowed_models: allowedModels,
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						403,
+						JSON.stringify({
+							error: 'model_not_allowed',
+							message: `Model "${body.model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
+							tier: authResult.tier,
+							allowed_models: allowedModels,
+						}),
+					),
+				);
 			}
 
 			// Per-minute rate limit. Now that the model is resolved (a 'downgrade'
@@ -276,77 +427,121 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// D1 is the authoritative lifetime/concurrency/request-budget guard.
 			let freeTurn;
 			try {
-				freeTurn = await reserveFreeChatTurn(
-					env,
-					authResult,
-					body.messages ?? [],
-					backgroundRequest,
-					freePreviewNetworkHash,
-				);
+				freeTurn = await reserveFreeChatTurn(env, authResult, body.messages ?? [], backgroundRequest, freePreviewNetworkHash);
 			} catch (error) {
 				captureException(error);
-				return addCorsHeaders(createErrorResponse(503, JSON.stringify({
-					error: 'free_chat_ledger_unavailable',
-					message: 'The hosted preview is temporarily unavailable. No turn was used. Local and user-provided AI are still available.',
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						503,
+						JSON.stringify({
+							error: 'free_chat_ledger_unavailable',
+							message: 'The hosted preview is temporarily unavailable. No turn was used. Local and user-provided AI are still available.',
+						}),
+					),
+				);
 			}
 			if (freeTurn.applies && !freeTurn.allowed) {
 				if (freeTurn.reason === 'client_update_required') {
-					return addCorsHeaders(createErrorResponse(426, JSON.stringify({
-						error: 'free_chat_client_update_required',
-						message: 'Update screenpipe to use the included hosted preview safely. Local and user-provided AI remain available on older versions.',
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							426,
+							JSON.stringify({
+								error: 'free_chat_client_update_required',
+								message:
+									'Update screenpipe to use the included hosted preview safely. Local and user-provided AI remain available on older versions.',
+							}),
+						),
+					);
 				}
 				if (freeTurn.reason === 'invalid_turn') {
-					return addCorsHeaders(createErrorResponse(400, JSON.stringify({
-						error: 'free_chat_user_turn_required',
-						message: 'The hosted preview request must include a user message.',
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							400,
+							JSON.stringify({
+								error: 'free_chat_user_turn_required',
+								message: 'The hosted preview request must include a user message.',
+							}),
+						),
+					);
 				}
 				if (freeTurn.reason === 'in_flight') {
-					const response = addCorsHeaders(createErrorResponse(409, JSON.stringify({
-						error: 'free_chat_turn_in_flight',
-						message: 'This hosted turn already has a request in progress. Retry shortly.',
-					})));
+					const response = addCorsHeaders(
+						createErrorResponse(
+							409,
+							JSON.stringify({
+								error: 'free_chat_turn_in_flight',
+								message: 'This hosted turn already has a request in progress. Retry shortly.',
+							}),
+						),
+					);
 					response.headers.set('Retry-After', '3');
 					return response;
 				}
 				if (freeTurn.reason === 'request_budget' || freeTurn.reason === 'followup_expired') {
-					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-						error: 'free_chat_turn_request_limit',
-						message: 'This included hosted turn reached its bounded tool-loop limit. Start a new message, upgrade, or use your own AI provider.',
-						reason: freeTurn.reason,
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							429,
+							JSON.stringify({
+								error: 'free_chat_turn_request_limit',
+								message:
+									'This included hosted turn reached its bounded tool-loop limit. Start a new message, upgrade, or use your own AI provider.',
+								reason: freeTurn.reason,
+							}),
+						),
+					);
 				}
 				if (freeTurn.reason === 'global_limit') {
-					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-						error: 'free_chat_global_daily_limit',
-						message: 'The included hosted preview has reached its global safety limit for today. Upgrade, retry tomorrow, or use local/user-provided AI.',
-						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							429,
+							JSON.stringify({
+								error: 'free_chat_global_daily_limit',
+								message:
+									'The included hosted preview has reached its global safety limit for today. Upgrade, retry tomorrow, or use local/user-provided AI.',
+								free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+							}),
+						),
+					);
 				}
 				if (freeTurn.reason === 'network_limit') {
-					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-						error: 'free_chat_network_daily_limit',
-						message: 'The included hosted preview has reached its abuse-protection limit for this network today. Upgrade, retry tomorrow, or use local/user-provided AI.',
-						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							429,
+							JSON.stringify({
+								error: 'free_chat_network_daily_limit',
+								message:
+									'The included hosted preview has reached its abuse-protection limit for this network today. Upgrade, retry tomorrow, or use local/user-provided AI.',
+								free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+							}),
+						),
+					);
 				}
 				if (freeTurn.reason === 'network_identity') {
-					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-						error: 'free_chat_network_identity_unavailable',
-						message: 'The included hosted preview cannot verify its network abuse-protection key. Retry, upgrade, or use local/user-provided AI.',
-						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							429,
+							JSON.stringify({
+								error: 'free_chat_network_identity_unavailable',
+								message:
+									'The included hosted preview cannot verify its network abuse-protection key. Retry, upgrade, or use local/user-provided AI.',
+								free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+							}),
+						),
+					);
 				}
-				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
-					error: 'free_chat_limit_exhausted',
-					message: `You've used your ${freeTurn.limit} included Screenpipe Cloud AI turns. Upgrade, or keep using local/user-provided AI at no charge.`,
-					used: freeTurn.used,
-					limit: freeTurn.limit,
-					upgrade_url: 'https://screenpi.pe/onboarding',
-					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						402,
+						JSON.stringify({
+							error: 'free_chat_limit_exhausted',
+							message: `You've used your ${freeTurn.limit} included Screenpipe Cloud AI turns. Upgrade, or keep using local/user-provided AI at no charge.`,
+							used: freeTurn.used,
+							limit: freeTurn.limit,
+							upgrade_url: 'https://screenpi.pe/onboarding',
+							free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+						}),
+					),
+				);
 			}
 			if (freeTurn.applies && freeTurn.allowed && freeTurn.isNew) {
 				// Retention cleanup is deliberately off the response path. Network
@@ -363,37 +558,34 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
 				let shadowBudget;
 				try {
-					shadowBudget = await reserveFreeChatShadowBudget(
-						env,
-						authResult.userId,
-						freeTurn.turnHash,
-						freeTurn.leaseToken,
-					);
+					shadowBudget = await reserveFreeChatShadowBudget(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken);
 				} catch (error) {
 					captureException(error);
-					await releaseFreeChatTurn(
-						env,
-						authResult.userId,
-						freeTurn.turnHash,
-						freeTurn.leaseToken,
-					).catch(captureException);
-					return addCorsHeaders(createErrorResponse(503, JSON.stringify({
-						error: 'free_chat_shadow_ledger_unavailable',
-						message: 'The hosted preview cost guard is temporarily unavailable. No inference was started. Local and user-provided AI are still available.',
-					})));
+					await releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken).catch(captureException);
+					return addCorsHeaders(
+						createErrorResponse(
+							503,
+							JSON.stringify({
+								error: 'free_chat_shadow_ledger_unavailable',
+								message:
+									'The hosted preview cost guard is temporarily unavailable. No inference was started. Local and user-provided AI are still available.',
+							}),
+						),
+					);
 				}
 				if (!shadowBudget.allowed) {
-					await releaseFreeChatTurn(
-						env,
-						authResult.userId,
-						freeTurn.turnHash,
-						freeTurn.leaseToken,
-					).catch(captureException);
-					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-						error: 'free_chat_shadow_budget_exhausted',
-						message: 'The included hosted preview reached its independent retail-cost safety budget for today. Upgrade, retry tomorrow, or use local/user-provided AI.',
-						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-					})));
+					await releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken).catch(captureException);
+					return addCorsHeaders(
+						createErrorResponse(
+							429,
+							JSON.stringify({
+								error: 'free_chat_shadow_budget_exhausted',
+								message:
+									'The included hosted preview reached its independent retail-cost safety budget for today. Upgrade, retry tomorrow, or use local/user-provided AI.',
+								free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+							}),
+						),
+					);
 				}
 				freeShadowReserved = true;
 			}
@@ -403,47 +595,62 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// third turn from deducting a prepaid credit before the preview gate.
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = freeTurn.applies
-				? { used: freeTurn.used, limit: freeTurn.limit, remaining: freeTurn.remaining, allowed: true, resetsAt: '', paidVia: 'free' as const }
+				? {
+						used: freeTurn.used,
+						limit: freeTurn.limit,
+						remaining: freeTurn.remaining,
+						allowed: true,
+						resetsAt: '',
+						paidVia: 'free' as const,
+					}
 				: await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, body.model);
 			if (!usage.allowed) {
 				const creditsExhausted = (usage.creditsRemaining ?? 0) <= 0;
-				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-					error: creditsExhausted ? 'credits_exhausted' : 'daily_limit_exceeded',
-					message: creditsExhausted
-						? `You've used all free queries and have no credits remaining. Buy more at screenpi.pe`
-						: `You've used all ${usage.limit} free AI queries for today. Resets at ${usage.resetsAt}`,
-					used_today: usage.used,
-					limit_today: usage.limit,
-					resets_at: usage.resetsAt,
-					tier: authResult.tier,
-					credits_remaining: usage.creditsRemaining ?? 0,
-					upgrade_options: {
-						...(authResult.tier === 'anonymous'
-							? { login: { benefit: '+25 daily queries, more models' } }
-							: {}),
-						buy_credits: {
-							url: 'https://screenpi.pe/onboarding',
-							benefit: 'Credits extend your daily limit — use anytime',
-						},
-						subscribe: {
-							url: 'https://screenpi.pe/onboarding',
-							benefit: `${getTierConfig(env).subscribed.dailyQueries} queries/day + 500 credits/mo + encrypted sync`,
-							price: '$29/mo',
-						},
-					},
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						429,
+						JSON.stringify({
+							error: creditsExhausted ? 'credits_exhausted' : 'daily_limit_exceeded',
+							message: creditsExhausted
+								? `You've used all free queries and have no credits remaining. Buy more at screenpi.pe`
+								: `You've used all ${usage.limit} free AI queries for today. Resets at ${usage.resetsAt}`,
+							used_today: usage.used,
+							limit_today: usage.limit,
+							resets_at: usage.resetsAt,
+							tier: authResult.tier,
+							credits_remaining: usage.creditsRemaining ?? 0,
+							upgrade_options: {
+								...(authResult.tier === 'anonymous' ? { login: { benefit: '+25 daily queries, more models' } } : {}),
+								buy_credits: {
+									url: 'https://screenpi.pe/onboarding',
+									benefit: 'Credits extend your daily limit — use anytime',
+								},
+								subscribe: {
+									url: 'https://screenpi.pe/onboarding',
+									benefit: `${getTierConfig(env).subscribed.dailyQueries} queries/day + 500 credits/mo + encrypted sync`,
+									price: '$29/mo',
+								},
+							},
+						}),
+					),
+				);
 			}
 
 			// Preserve the pre-launch behavior while the staged flag is off. Once
 			// enabled, the earlier Business-only check handles background traffic.
 			const hasPaidCredits = (usage.creditsRemaining ?? 0) > 0;
 			if (!enforcementEnabled && authResult.tier === 'logged_in' && backgroundRequest && !hasPaidCredits) {
-				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
-					error: 'hosted_automation_subscription_required',
-					message: 'Hosted AI automations require Business or prepaid credits. Local and BYOK pipes remain free.',
-					upgrade_url: 'https://screenpi.pe/onboarding',
-					free_options: ['anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						402,
+						JSON.stringify({
+							error: 'hosted_automation_subscription_required',
+							message: 'Hosted AI automations require Business or prepaid credits. Local and BYOK pipes remain free.',
+							upgrade_url: 'https://screenpi.pe/onboarding',
+							free_options: ['anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+						}),
+					),
+				);
 			}
 
 			// Route latency-tolerant (background) traffic to the cheaper flex tier.
@@ -456,43 +663,30 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// turn, global/network counters, and retail dollar are non-refundable.
 			if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
 				try {
-					await acceptFreeChatTurn(
-						env,
-						authResult.userId,
-						freeTurn.turnHash,
-						freeTurn.leaseToken,
-					);
-					if (freeShadowReserved) {
-						await settleFreeChatShadowBudget(
-							env,
-							authResult.userId,
-							freeTurn.turnHash,
-							freeTurn.leaseToken,
-						);
+					if (!freeShadowReserved) {
+						throw new Error('free chat shadow reservation missing at dispatch boundary');
 					}
+					await commitFreeChatDispatchGuard(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken);
 				} catch (error) {
 					captureException(error);
-					// No provider dispatch happened. Refund only an exact shadow row
-					// that is provably still reserved; a successfully settled row will
-					// reject this delete and remain conservatively consumed.
+					// No provider dispatch happened. D1 rolls back a thrown batch, and
+					// the mutual exact-lease guards make a stale lease a two-sided no-op.
+					// Keep conservative exact-row cleanup for mocks or an unexpected
+					// partially observable datastore failure; settled rows reject refund.
 					if (freeShadowReserved) {
-						await refundFreeChatShadowBudget(
-							env,
-							authResult.userId,
-							freeTurn.turnHash,
-							freeTurn.leaseToken,
-						).catch(captureException);
+						await refundFreeChatShadowBudget(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken).catch(captureException);
 					}
-					await releaseFreeChatTurn(
-						env,
-						authResult.userId,
-						freeTurn.turnHash,
-						freeTurn.leaseToken,
-					).catch(captureException);
-					return addCorsHeaders(createErrorResponse(503, JSON.stringify({
-						error: 'free_chat_dispatch_guard_unavailable',
-						message: 'The hosted preview safety ledger could not be committed, so no inference was started. Retry, upgrade, or use local/user-provided AI.',
-					})));
+					await releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken).catch(captureException);
+					return addCorsHeaders(
+						createErrorResponse(
+							503,
+							JSON.stringify({
+								error: 'free_chat_dispatch_guard_unavailable',
+								message:
+									'The hosted preview safety ledger could not be committed, so no inference was started. Retry, upgrade, or use local/user-provided AI.',
+							}),
+						),
+					);
 				}
 			}
 
@@ -510,14 +704,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				throw error;
 			}
 			if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
-				await settleFreeChatTurnResponse(
-					env,
-					authResult.userId,
-					freeTurn,
-					response,
-					ctx,
-					captureException,
-				);
+				await settleFreeChatTurnResponse(env, authResult.userId, freeTurn, response, ctx, captureException);
 			}
 			const latencyMs = Date.now() - reqStart;
 			// Difficulty-router decision (null unless the router ran) for A/B measurement.
@@ -533,67 +720,71 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// Flex-served Gemini bills at half rate. tryModel tags the response
 			// with x-screenpipe-served-tier=flex; price (and log) under the
 			// ':flex' MODEL_PRICING key so the dashboard reflects the discount.
-			const pricedModel = response.headers.get('x-screenpipe-served-tier') === 'flex'
-				? `${servedModel}:flex`
-				: servedModel;
+			const pricedModel = response.headers.get('x-screenpipe-served-tier') === 'flex' ? `${servedModel}:flex` : servedModel;
 
 			// Log cost — for streaming, intercept SSE events to get real token counts
 			if (body.stream) {
 				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(response, 'openai');
 				response = trackedResponse;
-				ctx.waitUntil(usagePromise.then(u => logCost(env, {
-					device_id: authResult.deviceId,
-					user_id: authResult.userId,
-					tier: authResult.tier,
-					provider: inferProvider(servedModel),
-					model: pricedModel,
-					input_tokens: u.input_tokens ?? null,
-					output_tokens: u.output_tokens ?? null,
-					cache_read_tokens: u.cache_read_input_tokens ?? null,
-					cache_creation_tokens: u.cache_creation_input_tokens ?? null,
-					estimated_cost_usd: getModelCost(pricedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
-						cache_read_tokens: u.cache_read_input_tokens,
-						cache_creation_tokens: u.cache_creation_input_tokens,
-					}),
-					endpoint: '/v1/chat/completions',
-					stream: true,
-					latency_ms: latencyMs,
-					router_tier: routerTier,
-				})));
-			} else {
-				ctx.waitUntil((async () => {
-					try {
-						const cloned = response.clone();
-						const json = await cloned.json() as any;
-						const inputTokens = json?.usage?.prompt_tokens ?? null;
-						const outputTokens = json?.usage?.completion_tokens ?? null;
-						// OpenAI-format usage: prompt_tokens already includes the
-						// cached subset reported in prompt_tokens_details
-						const cacheRead = json?.usage?.prompt_tokens_details?.cached_tokens ?? null;
-						const cacheCreation = json?.usage?.cache_creation_input_tokens ?? null;
-						await logCost(env, {
+				ctx.waitUntil(
+					usagePromise.then((u) =>
+						logCost(env, {
 							device_id: authResult.deviceId,
 							user_id: authResult.userId,
 							tier: authResult.tier,
 							provider: inferProvider(servedModel),
 							model: pricedModel,
-							input_tokens: inputTokens,
-							output_tokens: outputTokens,
-							cache_read_tokens: cacheRead,
-							cache_creation_tokens: cacheCreation,
-							estimated_cost_usd: getModelCost(pricedModel, inputTokens, outputTokens, {
-								cache_read_tokens: cacheRead,
-								cache_creation_tokens: cacheCreation,
+							input_tokens: u.input_tokens ?? null,
+							output_tokens: u.output_tokens ?? null,
+							cache_read_tokens: u.cache_read_input_tokens ?? null,
+							cache_creation_tokens: u.cache_creation_input_tokens ?? null,
+							estimated_cost_usd: getModelCost(pricedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
+								cache_read_tokens: u.cache_read_input_tokens,
+								cache_creation_tokens: u.cache_creation_input_tokens,
 							}),
 							endpoint: '/v1/chat/completions',
-							stream: false,
+							stream: true,
 							latency_ms: latencyMs,
 							router_tier: routerTier,
-						});
-					} catch (e) {
-						console.error('cost log extraction failed:', e);
-					}
-				})());
+						}),
+					),
+				);
+			} else {
+				ctx.waitUntil(
+					(async () => {
+						try {
+							const cloned = response.clone();
+							const json = (await cloned.json()) as any;
+							const inputTokens = json?.usage?.prompt_tokens ?? null;
+							const outputTokens = json?.usage?.completion_tokens ?? null;
+							// OpenAI-format usage: prompt_tokens already includes the
+							// cached subset reported in prompt_tokens_details
+							const cacheRead = json?.usage?.prompt_tokens_details?.cached_tokens ?? null;
+							const cacheCreation = json?.usage?.cache_creation_input_tokens ?? null;
+							await logCost(env, {
+								device_id: authResult.deviceId,
+								user_id: authResult.userId,
+								tier: authResult.tier,
+								provider: inferProvider(servedModel),
+								model: pricedModel,
+								input_tokens: inputTokens,
+								output_tokens: outputTokens,
+								cache_read_tokens: cacheRead,
+								cache_creation_tokens: cacheCreation,
+								estimated_cost_usd: getModelCost(pricedModel, inputTokens, outputTokens, {
+									cache_read_tokens: cacheRead,
+									cache_creation_tokens: cacheCreation,
+								}),
+								endpoint: '/v1/chat/completions',
+								stream: false,
+								latency_ms: latencyMs,
+								router_tier: routerTier,
+							});
+						} catch (e) {
+							console.error('cost log extraction failed:', e);
+						}
+					})(),
+				);
 			}
 
 			if (usage.paidVia === 'credits' && usage.creditsRemaining !== undefined) {
@@ -613,29 +804,36 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, 'gemini-2.5-flash');
 			if (!usage.allowed) {
-				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-					error: (usage.creditsRemaining ?? 0) <= 0 ? 'credits_exhausted' : 'daily_limit_exceeded',
-					message: `You've used all ${usage.limit} free queries for today. Resets at ${usage.resetsAt}`,
-					used_today: usage.used,
-					limit_today: usage.limit,
-					resets_at: usage.resetsAt,
-					tier: authResult.tier,
-					credits_remaining: usage.creditsRemaining ?? 0,
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						429,
+						JSON.stringify({
+							error: (usage.creditsRemaining ?? 0) <= 0 ? 'credits_exhausted' : 'daily_limit_exceeded',
+							message: `You've used all ${usage.limit} free queries for today. Resets at ${usage.resetsAt}`,
+							used_today: usage.used,
+							limit_today: usage.limit,
+							resets_at: usage.resetsAt,
+							tier: authResult.tier,
+							credits_remaining: usage.creditsRemaining ?? 0,
+						}),
+					),
+				);
 			}
 			const webSearchResponse = await handleWebSearch(request, env);
-			ctx.waitUntil(logCost(env, {
-				device_id: authResult.deviceId,
-				user_id: authResult.userId,
-				tier: authResult.tier,
-				provider: 'google',
-				model: 'gemini-2.5-flash',
-				input_tokens: null,
-				output_tokens: null,
-				estimated_cost_usd: getModelCost('gemini-2.5-flash', null, null),
-				endpoint: '/v1/web-search',
-				stream: false,
-			}));
+			ctx.waitUntil(
+				logCost(env, {
+					device_id: authResult.deviceId,
+					user_id: authResult.userId,
+					tier: authResult.tier,
+					provider: 'google',
+					model: 'gemini-2.5-flash',
+					input_tokens: null,
+					output_tokens: null,
+					estimated_cost_usd: getModelCost('gemini-2.5-flash', null, null),
+					endpoint: '/v1/web-search',
+					stream: false,
+				}),
+			);
 			return webSearchResponse;
 		}
 
@@ -648,12 +846,17 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			const baseCap = getMaxDailyCostPerUser(env);
 			const maxCost = authResult.tier === 'subscribed' ? baseCap * 100 : baseCap * 2;
 			if (dailyCost >= maxCost) {
-				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-					error: 'daily_cost_limit_exceeded',
-					message: `You've reached your daily transcription limit ($${maxCost}/day). Audio will be transcribed locally until tomorrow.`,
-					daily_cost: dailyCost,
-					limit: maxCost,
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						429,
+						JSON.stringify({
+							error: 'daily_cost_limit_exceeded',
+							message: `You've reached your daily transcription limit ($${maxCost}/day). Audio will be transcribed locally until tomorrow.`,
+							daily_cost: dailyCost,
+							limit: maxCost,
+						}),
+					),
+				);
 			}
 
 			// Estimate cost from audio size: ~30s chunks at $0.26/hr = $0.0022/chunk
@@ -666,19 +869,21 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 			// Log cost after successful transcription
 			if (response.ok) {
-				ctx.waitUntil(logCost(env, {
-					device_id: authResult.deviceId,
-					user_id: authResult.userId,
-					tier: authResult.tier,
-					provider: 'deepgram',
-					model: 'nova-3',
-					input_tokens: Math.round(estimatedSeconds),
-					output_tokens: null,
-					estimated_cost_usd: estimatedCost,
-					endpoint: '/v1/listen',
-					stream: false,
-					}));
-				}
+				ctx.waitUntil(
+					logCost(env, {
+						device_id: authResult.deviceId,
+						user_id: authResult.userId,
+						tier: authResult.tier,
+						provider: 'deepgram',
+						model: 'nova-3',
+						input_tokens: Math.round(estimatedSeconds),
+						output_tokens: null,
+						estimated_cost_usd: estimatedCost,
+						endpoint: '/v1/listen',
+						stream: false,
+					}),
+				);
+			}
 			return response;
 		}
 
@@ -689,6 +894,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		}
 
 		if (path === '/v1/models' && request.method === 'GET') {
+			const subscriptionError = subscriptionStatusUnavailableResponse(env, authResult);
+			if (subscriptionError) return subscriptionError;
 			// Prune old health records opportunistically (fire-and-forget)
 			ctx.waitUntil(pruneModelHealth(env));
 			// Return tier-filtered models with live health status
@@ -754,10 +961,15 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 			// Require authentication for Agent SDK
 			if (authResult.tier === 'anonymous') {
-				return addCorsHeaders(createErrorResponse(401, JSON.stringify({
-					error: 'authentication_required',
-					message: 'Vertex AI proxy requires authentication. Please log in to screenpipe.',
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						401,
+						JSON.stringify({
+							error: 'authentication_required',
+							message: 'Vertex AI proxy requires authentication. Please log in to screenpipe.',
+						}),
+					),
+				);
 			}
 
 			// Check model from body (clone request so proxy can still read it)
@@ -770,12 +982,17 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				parsedStream = body.stream === true;
 				if (!isModelAllowed(parsedModel, authResult.tier, env)) {
 					const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
-					return addCorsHeaders(createErrorResponse(403, JSON.stringify({
-						error: 'model_not_allowed',
-						message: `Model "${parsedModel}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
-						tier: authResult.tier,
-						allowed_models: allowedModels,
-					})));
+					return addCorsHeaders(
+						createErrorResponse(
+							403,
+							JSON.stringify({
+								error: 'model_not_allowed',
+								message: `Model "${parsedModel}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
+								tier: authResult.tier,
+								allowed_models: allowedModels,
+							}),
+						),
+					);
 				}
 			} catch (e) {
 				// If body parse fails, let the proxy handle the error downstream
@@ -789,15 +1006,20 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, parsedModel);
 			if (!usage.allowed) {
-				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-					error: (usage.creditsRemaining ?? 0) <= 0 ? 'credits_exhausted' : 'daily_limit_exceeded',
-					message: `You've used all ${usage.limit} AI queries for today. Resets at ${usage.resetsAt}`,
-					used_today: usage.used,
-					limit_today: usage.limit,
-					resets_at: usage.resetsAt,
-					tier: authResult.tier,
-					credits_remaining: usage.creditsRemaining ?? 0,
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						429,
+						JSON.stringify({
+							error: (usage.creditsRemaining ?? 0) <= 0 ? 'credits_exhausted' : 'daily_limit_exceeded',
+							message: `You've used all ${usage.limit} AI queries for today. Resets at ${usage.resetsAt}`,
+							used_today: usage.used,
+							limit_today: usage.limit,
+							resets_at: usage.resetsAt,
+							tier: authResult.tier,
+							credits_remaining: usage.creditsRemaining ?? 0,
+						}),
+					),
+				);
 			}
 
 			let vertexResponse = await handleVertexProxy(request, env);
@@ -805,56 +1027,62 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			if (parsedStream) {
 				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(vertexResponse, 'anthropic');
 				vertexResponse = trackedResponse;
-				ctx.waitUntil(usagePromise.then(u => logCost(env, {
-					device_id: authResult.deviceId,
-					user_id: authResult.userId,
-					tier: authResult.tier,
-					provider: inferProvider(parsedModel),
-					model: parsedModel,
-					input_tokens: u.input_tokens ?? null,
-					output_tokens: u.output_tokens ?? null,
-					cache_read_tokens: u.cache_read_input_tokens ?? null,
-					cache_creation_tokens: u.cache_creation_input_tokens ?? null,
-					estimated_cost_usd: getModelCost(parsedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
-						cache_read_tokens: u.cache_read_input_tokens,
-						cache_creation_tokens: u.cache_creation_input_tokens,
-					}),
-					endpoint: '/v1/messages',
-					stream: true,
-				})));
-			} else {
-				ctx.waitUntil((async () => {
-					try {
-						const clonedResp = vertexResponse.clone();
-						const json = await clonedResp.json() as any;
-						// Anthropic usage: input_tokens EXCLUDES cached tokens —
-						// normalize to total prompt size for cost accounting
-						const cacheRead = json?.usage?.cache_read_input_tokens ?? 0;
-						const cacheCreation = json?.usage?.cache_creation_input_tokens ?? 0;
-						const rawInput = json?.usage?.input_tokens ?? null;
-						const inputTokens = rawInput === null ? null : rawInput + cacheRead + cacheCreation;
-						const outputTokens = json?.usage?.output_tokens ?? null;
-						await logCost(env, {
+				ctx.waitUntil(
+					usagePromise.then((u) =>
+						logCost(env, {
 							device_id: authResult.deviceId,
 							user_id: authResult.userId,
 							tier: authResult.tier,
 							provider: inferProvider(parsedModel),
 							model: parsedModel,
-							input_tokens: inputTokens,
-							output_tokens: outputTokens,
-							cache_read_tokens: cacheRead,
-							cache_creation_tokens: cacheCreation,
-							estimated_cost_usd: getModelCost(parsedModel, inputTokens, outputTokens, {
-								cache_read_tokens: cacheRead,
-								cache_creation_tokens: cacheCreation,
+							input_tokens: u.input_tokens ?? null,
+							output_tokens: u.output_tokens ?? null,
+							cache_read_tokens: u.cache_read_input_tokens ?? null,
+							cache_creation_tokens: u.cache_creation_input_tokens ?? null,
+							estimated_cost_usd: getModelCost(parsedModel, u.input_tokens ?? null, u.output_tokens ?? null, {
+								cache_read_tokens: u.cache_read_input_tokens,
+								cache_creation_tokens: u.cache_creation_input_tokens,
 							}),
 							endpoint: '/v1/messages',
-							stream: false,
-						});
-					} catch (e) {
-						console.error('cost log /v1/messages failed:', e);
-					}
-				})());
+							stream: true,
+						}),
+					),
+				);
+			} else {
+				ctx.waitUntil(
+					(async () => {
+						try {
+							const clonedResp = vertexResponse.clone();
+							const json = (await clonedResp.json()) as any;
+							// Anthropic usage: input_tokens EXCLUDES cached tokens —
+							// normalize to total prompt size for cost accounting
+							const cacheRead = json?.usage?.cache_read_input_tokens ?? 0;
+							const cacheCreation = json?.usage?.cache_creation_input_tokens ?? 0;
+							const rawInput = json?.usage?.input_tokens ?? null;
+							const inputTokens = rawInput === null ? null : rawInput + cacheRead + cacheCreation;
+							const outputTokens = json?.usage?.output_tokens ?? null;
+							await logCost(env, {
+								device_id: authResult.deviceId,
+								user_id: authResult.userId,
+								tier: authResult.tier,
+								provider: inferProvider(parsedModel),
+								model: parsedModel,
+								input_tokens: inputTokens,
+								output_tokens: outputTokens,
+								cache_read_tokens: cacheRead,
+								cache_creation_tokens: cacheCreation,
+								estimated_cost_usd: getModelCost(parsedModel, inputTokens, outputTokens, {
+									cache_read_tokens: cacheRead,
+									cache_creation_tokens: cacheCreation,
+								}),
+								endpoint: '/v1/messages',
+								stream: false,
+							});
+						} catch (e) {
+							console.error('cost log /v1/messages failed:', e);
+						}
+					})(),
+				);
 			}
 			return vertexResponse;
 		}
@@ -869,10 +1097,15 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 			// Require authentication for OpenCode
 			if (authResult.tier === 'anonymous') {
-				return addCorsHeaders(createErrorResponse(401, JSON.stringify({
-					error: 'authentication_required',
-					message: 'OpenCode requires authentication. Please log in to screenpipe.',
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						401,
+						JSON.stringify({
+							error: 'authentication_required',
+							message: 'OpenCode requires authentication. Please log in to screenpipe.',
+						}),
+					),
+				);
 			}
 
 			// Extract model/stream before proxy consumes the body
@@ -880,7 +1113,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			let ocStream = false;
 			try {
 				const clonedReq = request.clone();
-				const reqBody = await clonedReq.json() as { model?: string; stream?: boolean };
+				const reqBody = (await clonedReq.json()) as { model?: string; stream?: boolean };
 				ocModel = reqBody.model || ocModel;
 				ocStream = reqBody.stream === true;
 			} catch (e) {
@@ -893,12 +1126,17 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// be composed with this server-key proxy to reach Business-only models.
 			if (!isModelAllowed(ocModel, authResult.tier, env)) {
 				const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
-				return addCorsHeaders(createErrorResponse(403, JSON.stringify({
-					error: 'model_not_allowed',
-					message: `Model "${ocModel}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
-					tier: authResult.tier,
-					allowed_models: allowedModels,
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						403,
+						JSON.stringify({
+							error: 'model_not_allowed',
+							message: `Model "${ocModel}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
+							tier: authResult.tier,
+							allowed_models: allowedModels,
+						}),
+					),
+				);
 			}
 
 			// Per-user daily cost cap (account-wide $ ceiling, credit-extended).
@@ -909,15 +1147,20 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, ocModel);
 			if (!usage.allowed) {
-				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
-					error: (usage.creditsRemaining ?? 0) <= 0 ? 'credits_exhausted' : 'daily_limit_exceeded',
-					message: `You've used all ${usage.limit} AI queries for today. Resets at ${usage.resetsAt}`,
-					used_today: usage.used,
-					limit_today: usage.limit,
-					resets_at: usage.resetsAt,
-					tier: authResult.tier,
-					credits_remaining: usage.creditsRemaining ?? 0,
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						429,
+						JSON.stringify({
+							error: (usage.creditsRemaining ?? 0) <= 0 ? 'credits_exhausted' : 'daily_limit_exceeded',
+							message: `You've used all ${usage.limit} AI queries for today. Resets at ${usage.resetsAt}`,
+							used_today: usage.used,
+							limit_today: usage.limit,
+							resets_at: usage.resetsAt,
+							tier: authResult.tier,
+							credits_remaining: usage.creditsRemaining ?? 0,
+						}),
+					),
+				);
 			}
 
 			let anthropicResponse = await handleVertexProxy(request, env);
@@ -925,56 +1168,62 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			if (ocStream) {
 				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(anthropicResponse, 'anthropic');
 				anthropicResponse = trackedResponse;
-				ctx.waitUntil(usagePromise.then(u => logCost(env, {
-					device_id: authResult.deviceId,
-					user_id: authResult.userId,
-					tier: authResult.tier,
-					provider: inferProvider(ocModel),
-					model: ocModel,
-					input_tokens: u.input_tokens ?? null,
-					output_tokens: u.output_tokens ?? null,
-					cache_read_tokens: u.cache_read_input_tokens ?? null,
-					cache_creation_tokens: u.cache_creation_input_tokens ?? null,
-					estimated_cost_usd: getModelCost(ocModel, u.input_tokens ?? null, u.output_tokens ?? null, {
-						cache_read_tokens: u.cache_read_input_tokens,
-						cache_creation_tokens: u.cache_creation_input_tokens,
-					}),
-					endpoint: '/anthropic/v1/messages',
-					stream: true,
-				})));
-			} else {
-				ctx.waitUntil((async () => {
-					try {
-						const clonedResp = anthropicResponse.clone();
-						const json = await clonedResp.json() as any;
-						// Anthropic usage: input_tokens EXCLUDES cached tokens —
-						// normalize to total prompt size for cost accounting
-						const cacheRead = json?.usage?.cache_read_input_tokens ?? 0;
-						const cacheCreation = json?.usage?.cache_creation_input_tokens ?? 0;
-						const rawInput = json?.usage?.input_tokens ?? null;
-						const inputTokens = rawInput === null ? null : rawInput + cacheRead + cacheCreation;
-						const outputTokens = json?.usage?.output_tokens ?? null;
-						await logCost(env, {
+				ctx.waitUntil(
+					usagePromise.then((u) =>
+						logCost(env, {
 							device_id: authResult.deviceId,
 							user_id: authResult.userId,
 							tier: authResult.tier,
 							provider: inferProvider(ocModel),
 							model: ocModel,
-							input_tokens: inputTokens,
-							output_tokens: outputTokens,
-							cache_read_tokens: cacheRead,
-							cache_creation_tokens: cacheCreation,
-							estimated_cost_usd: getModelCost(ocModel, inputTokens, outputTokens, {
-								cache_read_tokens: cacheRead,
-								cache_creation_tokens: cacheCreation,
+							input_tokens: u.input_tokens ?? null,
+							output_tokens: u.output_tokens ?? null,
+							cache_read_tokens: u.cache_read_input_tokens ?? null,
+							cache_creation_tokens: u.cache_creation_input_tokens ?? null,
+							estimated_cost_usd: getModelCost(ocModel, u.input_tokens ?? null, u.output_tokens ?? null, {
+								cache_read_tokens: u.cache_read_input_tokens,
+								cache_creation_tokens: u.cache_creation_input_tokens,
 							}),
 							endpoint: '/anthropic/v1/messages',
-							stream: false,
-						});
-					} catch (e) {
-						console.error('cost log /anthropic/v1/messages failed:', e);
-					}
-				})());
+							stream: true,
+						}),
+					),
+				);
+			} else {
+				ctx.waitUntil(
+					(async () => {
+						try {
+							const clonedResp = anthropicResponse.clone();
+							const json = (await clonedResp.json()) as any;
+							// Anthropic usage: input_tokens EXCLUDES cached tokens —
+							// normalize to total prompt size for cost accounting
+							const cacheRead = json?.usage?.cache_read_input_tokens ?? 0;
+							const cacheCreation = json?.usage?.cache_creation_input_tokens ?? 0;
+							const rawInput = json?.usage?.input_tokens ?? null;
+							const inputTokens = rawInput === null ? null : rawInput + cacheRead + cacheCreation;
+							const outputTokens = json?.usage?.output_tokens ?? null;
+							await logCost(env, {
+								device_id: authResult.deviceId,
+								user_id: authResult.userId,
+								tier: authResult.tier,
+								provider: inferProvider(ocModel),
+								model: ocModel,
+								input_tokens: inputTokens,
+								output_tokens: outputTokens,
+								cache_read_tokens: cacheRead,
+								cache_creation_tokens: cacheCreation,
+								estimated_cost_usd: getModelCost(ocModel, inputTokens, outputTokens, {
+									cache_read_tokens: cacheRead,
+									cache_creation_tokens: cacheCreation,
+								}),
+								endpoint: '/anthropic/v1/messages',
+								stream: false,
+							});
+						} catch (e) {
+							console.error('cost log /anthropic/v1/messages failed:', e);
+						}
+					})(),
+				);
 			}
 			return anthropicResponse;
 		}
@@ -987,10 +1236,15 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// exposes the account's available model catalog. Keep it behind the same
 			// verified-identity boundary as the OpenCode messages endpoint.
 			if (authResult.tier === 'anonymous') {
-				return addCorsHeaders(createErrorResponse(401, JSON.stringify({
-					error: 'authentication_required',
-					message: 'OpenCode requires authentication. Please log in to screenpipe.',
-				})));
+				return addCorsHeaders(
+					createErrorResponse(
+						401,
+						JSON.stringify({
+							error: 'authentication_required',
+							message: 'OpenCode requires authentication. Please log in to screenpipe.',
+						}),
+					),
+				);
 			}
 			console.log('OpenCode Anthropic models request');
 			return await handleVertexModels(env);
@@ -1018,9 +1272,7 @@ function scrubSentryEvent(event: any): any {
 		return s.length > n ? s.slice(0, n) + '…[truncated]' : s;
 	};
 	const redactQs = (qs: string): string =>
-		qs
-			.replace(/(^|&)(id|user_id|email|token)=[^&]*/gi, '$1$2=' + REDACTED)
-			.replace(/user_[A-Za-z0-9]+/g, 'user_' + REDACTED);
+		qs.replace(/(^|&)(id|user_id|email|token)=[^&]*/gi, '$1$2=' + REDACTED).replace(/user_[A-Za-z0-9]+/g, 'user_' + REDACTED);
 	const redactUrl = (url: string): string => {
 		if (!url) return url;
 		const [base, qs] = url.split('?');
@@ -1033,13 +1285,7 @@ function scrubSentryEvent(event: any): any {
 				// Headers often contain Authorization: Bearer <JWT>, Cookie, X-Device-Id
 				for (const k of Object.keys(event.request.headers)) {
 					const lk = k.toLowerCase();
-					if (
-						lk === 'authorization' ||
-						lk === 'cookie' ||
-						lk === 'x-device-id' ||
-						lk === 'x-forwarded-for' ||
-						lk === 'cf-connecting-ip'
-					) {
+					if (lk === 'authorization' || lk === 'cookie' || lk === 'x-device-id' || lk === 'x-forwarded-for' || lk === 'cf-connecting-ip') {
 						event.request.headers[k] = REDACTED;
 					}
 				}
@@ -1082,7 +1328,7 @@ export default {
 				request: request as any,
 				context: ctx,
 			},
-			() => handleRequest(request, env, ctx)
+			() => handleRequest(request, env, ctx),
 		);
 	},
 	async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {

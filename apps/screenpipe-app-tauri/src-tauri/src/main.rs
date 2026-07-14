@@ -665,6 +665,7 @@ async fn main() {
     )
     .await;
 
+    let cloud_token = Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token)));
     let recording_state = RecordingState {
         server_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         server: Arc::new(tokio::sync::Mutex::new(None)),
@@ -674,10 +675,10 @@ async fn main() {
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
-        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
+        cloud_token: cloud_token.clone(),
         db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
-    let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
+    let pi_state = pi::PiState::new(cloud_token);
     let suggestions_state = suggestions::SuggestionsState::new();
     let pipe_suggestions_state = pipe_suggestions_scheduler::PipeSuggestionsState::new();
     #[allow(clippy::single_match)]

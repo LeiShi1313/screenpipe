@@ -123,6 +123,10 @@ import {
   filterPresetsForEnterprisePolicy,
   isEnterpriseManagedPreset,
 } from "@/lib/enterprise-ai-preset-policy";
+import {
+  buildFreeTierAiSetupPreset,
+  type FreeTierAiSetupProvider,
+} from "@/lib/chat/free-tier-provider-setup";
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -257,11 +261,13 @@ const AISection = ({
   setDialog,
   isDuplicating,
   piAvailable,
+  initialSetupProvider,
 }: {
   preset?: AIPreset;
   setDialog: (value: boolean) => void;
   isDuplicating?: boolean;
   piAvailable?: boolean;
+  initialSetupProvider?: FreeTierAiSetupProvider;
 }) => {
   const { settings, updateSettings } = useSettings();
   const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
@@ -278,7 +284,12 @@ const AISection = ({
   const showUpsell = useModelUpsellGating();
   const [settingsPreset, setSettingsPreset] = useState<
     Partial<AIPreset> | undefined
-  >(preset);
+  >(() =>
+    preset ??
+    (initialSetupProvider
+      ? (buildFreeTierAiSetupPreset(initialSetupProvider) as Partial<AIPreset>)
+      : undefined),
+  );
   const [isLoading, setIsLoading] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
@@ -1226,6 +1237,15 @@ const AISection = ({
           />
 
           <AIProviderCard
+            type="openai"
+            title="OpenAI API"
+            description="Use your own OpenAI API key"
+            imageSrc="/images/openai.png"
+            selected={settingsPreset?.provider === "openai"}
+            onClick={() => handleAiProviderChange("openai")}
+          />
+
+          <AIProviderCard
             type="anthropic"
             title="Claude API"
             description="Use your Anthropic API key"
@@ -2029,10 +2049,21 @@ function SortablePresetCard({
   );
 }
 
-export const AIPresets = () => {
+export const AIPresets = ({
+  initialSetupProvider,
+}: {
+  initialSetupProvider?: FreeTierAiSetupProvider;
+} = {}) => {
   const { settings, updateSettings } = useSettings();
-  const [createPresetsDialog, setCreatePresentDialog] = useState(false);
-  const [selectedPreset, setSelectedPreset] = useState<AIPreset | undefined>();
+  const [createPresetsDialog, setCreatePresentDialog] = useState(
+    () => !!initialSetupProvider,
+  );
+  const [selectedPreset, setSelectedPreset] = useState<AIPreset | undefined>(
+    () =>
+      initialSetupProvider
+        ? settings.aiPresets.find((preset) => preset.provider === initialSetupProvider)
+        : undefined,
+  );
   const [isLoading, setIsLoading] = useState(false);
   const [presetToDelete, setPresetToDelete] = useState<string | null>(null);
   const [presetToSetDefault, setPresetToSetDefault] = useState<string | null>(
@@ -2053,6 +2084,21 @@ export const AIPresets = () => {
   const [chatgptTokenValid, setChatgptTokenValid] = useState<boolean | null>(null);
   const team = useTeam();
   const isTeamAdmin = !!team.team && team.role === "admin";
+  const handledInitialSetupRef = useRef(initialSetupProvider);
+
+  useEffect(() => {
+    if (!initialSetupProvider) {
+      handledInitialSetupRef.current = undefined;
+      return;
+    }
+    if (handledInitialSetupRef.current === initialSetupProvider) return;
+    handledInitialSetupRef.current = initialSetupProvider;
+    setSelectedPreset(
+      settings.aiPresets.find((preset) => preset.provider === initialSetupProvider),
+    );
+    setIsDuplicating(false);
+    setCreatePresentDialog(true);
+  }, [initialSetupProvider, settings.aiPresets]);
 
   const sharePresetToTeam = async (preset: AIPreset) => {
     try {
@@ -2134,6 +2180,7 @@ useEffect(() => {
         preset={selectedPreset}
         isDuplicating={isDuplicating}
         piAvailable={piAvailable}
+        initialSetupProvider={selectedPreset ? undefined : initialSetupProvider}
       />
     );
 

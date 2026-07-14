@@ -49,6 +49,15 @@ export interface Message {
   turnIntentId?: string;
   images?: string[];
   attachments?: ChatAttachment[];
+  /** Stable identity for one Screenpipe-hosted user turn. Manual retries reuse
+   * this UUID so the gateway can retry the same bounded turn instead of
+   * charging another lifetime preview turn. Never sent to user-owned AI. */
+  hostedTurnId?: string;
+  /** Exact latest-user content accepted by the hosted gateway for this turn,
+   * including injected history/wrappers and its hosted marker. The visible
+   * `content` stays clean; verbatim manual retries reuse these bytes so the
+   * gateway sees the same lifetime turn. Never sent to user-owned AI. */
+  hostedTurnPrompt?: string;
   timestamp: number;
   contentBlocks?: ContentBlock[];
   sourceCitations?: SourceCitation[];
@@ -68,6 +77,8 @@ export type QueuedDisplayPayload = {
   displayContent?: string;
   optimisticUserId?: string;
   turnIntentId?: string;
+  hostedTurnId?: string;
+  hostedTurnPrompt?: string;
 };
 
 export type OptimisticSteerPayload = {
@@ -86,6 +97,7 @@ export type TurnIntentRecord = {
   queueId?: string;
   createdAt: number;
   consumedAssistantId?: string;
+  hostedTurnId?: string;
 };
 
 export type PendingSteerBatchItem = {
@@ -99,4 +111,5 @@ export type PendingSteerBatchItem = {
   displayContent?: string;
   optimisticUserId: string;
   createdAt: number;
+  hostedTurnId?: string;
 };

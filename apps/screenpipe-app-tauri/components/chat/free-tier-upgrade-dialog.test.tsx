@@ -29,10 +29,11 @@ describe("FreeTierUpgradeDialog", () => {
     );
 
     expect(screen.getByText(/recording, local search/i)).toBeInTheDocument();
-    expect(screen.getByText(/chatgpt\/codex/i)).toBeInTheDocument();
+    expect(screen.getByText(/chatgpt plus \(including codex\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/openai api key/i)).toBeInTheDocument();
     expect(screen.getByText(/ollama keeps prompts/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /continue free with your ai/i }));
-    expect(onChooseOwnAI).toHaveBeenCalledOnce();
+    expect(onChooseOwnAI).toHaveBeenCalledWith("provider");
     expect(capture).toHaveBeenCalledWith(
       "free_chat_byok_clicked",
       expect.objectContaining({ provider: "screenpipe-cloud" }),

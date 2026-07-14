@@ -8,16 +8,20 @@ import type { ChatAttachment } from "@/lib/chat/types";
 export function useNextTurnAttachments(conversationId: string | null) {
   const pendingAttachmentsRef = useRef<ChatAttachment[]>([]);
 
-  const consumePendingAttachments = useCallback((): ChatAttachment[] | undefined => {
+  const consumePendingAttachments = useCallback(():
+    ChatAttachment[] | undefined => {
     const list = pendingAttachmentsRef.current;
     if (!list.length) return undefined;
     pendingAttachmentsRef.current = [];
     return list;
   }, []);
 
-  const stagePendingAttachments = useCallback((attachments: ChatAttachment[]) => {
-    pendingAttachmentsRef.current = attachments;
-  }, []);
+  const stagePendingAttachments = useCallback(
+    (attachments: ChatAttachment[]) => {
+      pendingAttachmentsRef.current = attachments;
+    },
+    [],
+  );
 
   const appendPendingAttachment = useCallback((attachment: ChatAttachment) => {
     pendingAttachmentsRef.current = [
@@ -26,12 +30,17 @@ export function useNextTurnAttachments(conversationId: string | null) {
     ];
   }, []);
 
+  const clearPendingAttachments = useCallback(() => {
+    pendingAttachmentsRef.current = [];
+  }, []);
+
   useEffect(() => {
     pendingAttachmentsRef.current = [];
   }, [conversationId]);
 
   return {
     appendPendingAttachment,
+    clearPendingAttachments,
     consumePendingAttachments,
     pendingAttachmentsRef,
     stagePendingAttachments,

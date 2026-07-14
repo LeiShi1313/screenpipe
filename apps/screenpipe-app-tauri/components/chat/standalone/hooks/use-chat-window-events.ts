@@ -13,15 +13,28 @@ import {
   shouldHandleChatLoadConversationForWindow,
   shouldHandleChatPrefillForWindow,
 } from "@/lib/chat-utils";
-import type { ContentBlock, Message, OptimisticSteerPayload } from "@/lib/chat/types";
+import type {
+  ContentBlock,
+  Message,
+  OptimisticSteerPayload,
+} from "@/lib/chat/types";
 import { normalizeImageDataUrls } from "@/lib/chat/image-content";
 import type { ChatConversation } from "@/lib/hooks/use-settings";
 import type { AIPreset } from "@/lib/utils/tauri";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { useChatPrefillEvents } from "@/components/chat/standalone/hooks/use-chat-prefill-events";
+import type { PiAuthIdentity } from "@/components/chat/standalone/hooks/pi-types";
+import { isSamePiAuthIdentity } from "@/lib/chat/free-tier-turn-marker";
+import { chatAuthBoundaryForToken } from "@/lib/chat-utils";
+import { isDevBillingBypassEnabled } from "@/lib/app-entitlement";
 
 type SendMessageRef = React.MutableRefObject<
-  ((msg: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>) | undefined
+  | ((
+      msg: string,
+      displayLabel?: string,
+      imageDataUrls?: string[],
+    ) => Promise<boolean>)
+  | undefined
 >;
 
 interface UsePipeGenerationCompletionOptions {
@@ -40,7 +53,11 @@ export function usePipeGenerationCompletion({
 
     let cancelled = false;
     (async () => {
-      let ctx: { generation_id: string; started_at: number; baseline_pipes: string[] } | null = null;
+      let ctx: {
+        generation_id: string;
+        started_at: number;
+        baseline_pipes: string[];
+      } | null = null;
       try {
         const raw = sessionStorage.getItem("pipeGenerationContext");
         if (!raw) return;
@@ -56,7 +73,10 @@ export function usePipeGenerationCompletion({
         const data = await res.json();
         if (cancelled) return;
         const installedNames: string[] = (data?.data ?? [])
-          .map((p: { config?: { name?: string }; name?: string }) => p?.config?.name ?? p?.name)
+          .map(
+            (p: { config?: { name?: string }; name?: string }) =>
+              p?.config?.name ?? p?.name,
+          )
           .filter((name: unknown): name is string => typeof name === "string");
         const baseline = new Set(ctx.baseline_pipes ?? []);
         const newPipes = installedNames.filter((name) => !baseline.has(name));
@@ -96,11 +116,20 @@ interface UseChatPrefillListenerOptions {
   piSessionIdRef: React.MutableRefObject<string>;
   piSessionSyncedRef: React.MutableRefObject<boolean>;
   autoSendBypassRef: React.MutableRefObject<boolean>;
+  authIdentityRef: React.MutableRefObject<PiAuthIdentity>;
   sendMessageRef: SendMessageRef;
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
   setIsStreaming: React.Dispatch<React.SetStateAction<boolean>>;
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setConversationId: React.Dispatch<React.SetStateAction<string | null>>;
+  pastedImagesRef: React.MutableRefObject<string[]>;
+  attachedDocsRef: React.MutableRefObject<any[]>;
+  pendingDocsRef: React.MutableRefObject<any[]>;
+  setAttachedDocs: React.Dispatch<React.SetStateAction<any[]>>;
+  setPendingDocs: React.Dispatch<React.SetStateAction<any[]>>;
+  invalidatePendingAttachmentWork: () => void;
+  clearPendingAttachments: () => void;
+  onConversationOperationStart: () => void;
 }
 
 export function useChatPrefillListener({
@@ -119,13 +148,23 @@ export function useChatPrefillListener({
   piSessionIdRef,
   piSessionSyncedRef,
   autoSendBypassRef,
+  authIdentityRef,
   sendMessageRef,
   setIsLoading,
   setIsStreaming,
   setMessages,
   setConversationId,
+  pastedImagesRef,
+  attachedDocsRef,
+  pendingDocsRef,
+  setAttachedDocs,
+  setPendingDocs,
+  invalidatePendingAttachmentWork,
+  clearPendingAttachments,
+  onConversationOperationStart,
 }: UseChatPrefillListenerOptions) {
   const prefillInFlightRef = useRef(false);
+  const prefillOperationGenerationRef = useRef(0);
   const { claimPrefillHandling } = useChatPrefillEvents();
 
   useEffect(() => {
@@ -138,31 +177,80 @@ export function useChatPrefillListener({
       autoSend?: boolean;
       source?: string;
       targetWindow?: string;
+      authBoundary?: string;
     }>("chat-prefill", (event) => {
-      const { context, prompt, displayLabel, frameId, images, autoSend, source, targetWindow } = event.payload;
+      const {
+        context,
+        prompt,
+        displayLabel,
+        frameId,
+        images,
+        autoSend,
+        source,
+        targetWindow,
+        authBoundary,
+      } = event.payload;
+      if (
+        authBoundary !==
+          chatAuthBoundaryForToken(authIdentityRef.current.token) &&
+        !(authBoundary == null && isDevBillingBypassEnabled())
+      ) {
+        return;
+      }
       const prefillImages = normalizeImageDataUrls(images);
 
-      if (!shouldHandleChatPrefillForWindow({ targetWindow, autoSend }, getCurrentWindow().label)) return;
+      if (
+        !shouldHandleChatPrefillForWindow(
+          { targetWindow, autoSend },
+          getCurrentWindow().label,
+        )
+      )
+        return;
 
       if (autoSend && prompt) {
         if (prefillInFlightRef.current) return;
         prefillInFlightRef.current = true;
+        const prefillOperationGeneration =
+          ++prefillOperationGenerationRef.current;
         setIsPreparingPrefill(true);
 
         const trimmedContext = context?.trim();
-        const fullMessage = trimmedContext ? `${trimmedContext}\n\n${prompt}` : prompt;
+        const fullMessage = trimmedContext
+          ? `${trimmedContext}\n\n${prompt}`
+          : prompt;
         const visiblePrompt = displayLabel?.trim() ? displayLabel : prompt;
+        const prefillAuthIdentity = { ...authIdentityRef.current };
 
         (async () => {
           try {
-            const imageKey = prefillImages.map((img) => img.slice(0, 96)).join("|");
+            const imageKey = prefillImages
+              .map((img) => img.slice(0, 96))
+              .join("|");
             const dedupKey = `${fullMessage.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 200)}|images:${imageKey}`;
             const claim = await claimPrefillHandling(dedupKey);
             if (!claim.claimed) {
-              console.log(`[chat-prefill] dropped duplicate autoSend (winner=${claim.winnerWindowLabel})`);
+              console.log(
+                `[chat-prefill] dropped duplicate autoSend (winner=${claim.winnerWindowLabel})`,
+              );
               return;
             }
+            if (
+              !isSamePiAuthIdentity(
+                prefillAuthIdentity,
+                authIdentityRef.current,
+              )
+            )
+              return;
 
+            onConversationOperationStart();
+            invalidatePendingAttachmentWork();
+            clearPendingAttachments();
+            pastedImagesRef.current = [];
+            attachedDocsRef.current = [];
+            pendingDocsRef.current = [];
+            setPastedImages([]);
+            setAttachedDocs([]);
+            setPendingDocs([]);
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
@@ -189,15 +277,31 @@ export function useChatPrefillListener({
             piSessionSyncedRef.current = true;
             autoSendBypassRef.current = true;
             await new Promise((resolve) => setTimeout(resolve, 200));
-            if (sendMessageRef.current) {
-              await sendMessageRef.current(fullMessage, visiblePrompt, prefillImages);
+            if (
+              isSamePiAuthIdentity(
+                prefillAuthIdentity,
+                authIdentityRef.current,
+              ) &&
+              piSessionIdRef.current === newSid &&
+              sendMessageRef.current
+            ) {
+              await sendMessageRef.current(
+                fullMessage,
+                visiblePrompt,
+                prefillImages,
+              );
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }
           } finally {
-            autoSendBypassRef.current = false;
-            prefillInFlightRef.current = false;
-            setIsPreparingPrefill(false);
+            if (
+              prefillOperationGeneration ===
+              prefillOperationGenerationRef.current
+            ) {
+              autoSendBypassRef.current = false;
+              prefillInFlightRef.current = false;
+              setIsPreparingPrefill(false);
+            }
           }
         })();
         return;
@@ -229,11 +333,17 @@ export function useChatPrefillListener({
 
 interface UseChatConversationRoutingEventsOptions {
   loadConversation: (conversation: ChatConversation) => void | Promise<void>;
-  startNewConversation: (conversationId?: string) => Promise<void>;
-  tryInChatStartNewRef: React.MutableRefObject<(() => Promise<void> | void) | null>;
+  startNewConversation: (conversationId?: string) => Promise<string | null>;
+  tryInChatStartNewRef: React.MutableRefObject<
+    (() => Promise<string | null> | void) | null
+  >;
   piSessionIdRef: React.MutableRefObject<string>;
   focusMessageById: (messageId: string) => void;
-  openFilePreview: (path: string, previousMode?: "browser" | "hidden", targetConversationId?: string | null) => void;
+  openFilePreview: (
+    path: string,
+    previousMode?: "browser" | "hidden",
+    targetConversationId?: string | null,
+  ) => void;
 }
 
 export function useChatConversationRoutingEvents({
@@ -250,55 +360,71 @@ export function useChatConversationRoutingEvents({
   startNewConversationRef.current = startNewConversation;
   tryInChatStartNewRef.current = startNewConversation;
 
-  const openConversationLocally = useCallback(async (convId: string) => {
-    const { loadConversationFile } = await import("@/lib/chat-storage");
+  const openConversationLocally = useCallback(
+    async (convId: string) => {
+      const { loadConversationFile } = await import("@/lib/chat-storage");
 
-    if (convId === piSessionIdRef.current) {
-      useChatStore.getState().actions.setCurrent(convId);
-      emit("chat-current-session", { id: convId });
-      return;
-    }
+      if (convId === piSessionIdRef.current) {
+        useChatStore.getState().actions.setCurrent(convId);
+        emit("chat-current-session", { id: convId });
+        return true;
+      }
 
-    const conv = await loadConversationFile(convId);
-    if (conv) {
-      loadConversationRef.current(conv);
-      return;
-    }
+      const conv = await loadConversationFile(convId);
+      if (conv) {
+        await loadConversationRef.current(conv);
+        return piSessionIdRef.current === convId;
+      }
 
-    const session = useChatStore.getState().sessions[convId];
-    if (session?.messages && session.messages.length > 0) {
-      loadConversationRef.current({
-        id: convId,
-        title: session.title || "untitled",
-        messages: [],
-        createdAt: session.createdAt,
-        updatedAt: session.updatedAt,
-      });
-      return;
-    }
+      const session = useChatStore.getState().sessions[convId];
+      if (session?.messages && session.messages.length > 0) {
+        await loadConversationRef.current({
+          id: convId,
+          title: session.title || "untitled",
+          messages: [],
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+        });
+        return piSessionIdRef.current === convId;
+      }
 
-    await startNewConversationRef.current(convId);
-    emit("chat-current-session", { id: convId });
-  }, [piSessionIdRef]);
+      await startNewConversationRef.current(convId);
+      const adopted = piSessionIdRef.current === convId;
+      if (adopted) emit("chat-current-session", { id: convId });
+      return adopted;
+    },
+    [piSessionIdRef],
+  );
 
   useEffect(() => {
-    const unlisten = listen<ChatLoadConversationPayload>("chat-load-conversation", async (event) => {
-      const { conversationId: convId, targetWindow, focusMessageId, filePreviewPath } = event.payload;
-      const windowLabel = getCurrentWindow().label;
-      if (!shouldHandleChatLoadConversationForWindow(
-        { conversationId: convId, targetWindow },
-        windowLabel === "chat" ? "chat" : "home",
-      )) {
-        return;
-      }
-      await openConversationLocally(convId);
-      if (focusMessageId) {
-        focusMessageById(focusMessageId);
-      }
-      if (filePreviewPath) {
-        openFilePreview(filePreviewPath, "hidden", convId);
-      }
-    });
+    const unlisten = listen<ChatLoadConversationPayload>(
+      "chat-load-conversation",
+      async (event) => {
+        const {
+          conversationId: convId,
+          targetWindow,
+          focusMessageId,
+          filePreviewPath,
+        } = event.payload;
+        const windowLabel = getCurrentWindow().label;
+        if (
+          !shouldHandleChatLoadConversationForWindow(
+            { conversationId: convId, targetWindow },
+            windowLabel === "chat" ? "chat" : "home",
+          )
+        ) {
+          return;
+        }
+        const adopted = await openConversationLocally(convId);
+        if (!adopted || piSessionIdRef.current !== convId) return;
+        if (focusMessageId) {
+          focusMessageById(focusMessageId);
+        }
+        if (filePreviewPath) {
+          openFilePreview(filePreviewPath, "hidden", convId);
+        }
+      },
+    );
     return () => {
       unlisten.then((fn) => fn());
     };
@@ -352,7 +478,7 @@ export function useChatE2EGlobals({
       const store = useChatStore.getState();
       const existing = store.sessions[sid];
       const existingMessages: Message[] = Array.isArray(existing?.messages)
-        ? existing.messages as Message[]
+        ? (existing.messages as Message[])
         : [];
       const nextMessages = [...existingMessages, message];
 
@@ -382,9 +508,11 @@ export function useChatE2EGlobals({
       void emit("chat-current-session", { id: sid });
     };
 
-    (window as unknown as {
-      __e2eSeedUserMessage?: (sid: string, text: string) => void;
-    }).__e2eSeedUserMessage = (sid: string, text: string) => {
+    (
+      window as unknown as {
+        __e2eSeedUserMessage?: (sid: string, text: string) => void;
+      }
+    ).__e2eSeedUserMessage = (sid: string, text: string) => {
       const id = `e2e-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       seedE2eSessionMessage(
         sid,
@@ -398,16 +526,18 @@ export function useChatE2EGlobals({
       );
     };
 
-    (window as unknown as {
-      __e2eSeedAssistantMessage?: (
-        sid: string,
-        payload: {
-          content?: string;
-          contentBlocks?: Message["contentBlocks"];
-          sourceCitations?: unknown[];
-        },
-      ) => void;
-    }).__e2eSeedAssistantMessage = (
+    (
+      window as unknown as {
+        __e2eSeedAssistantMessage?: (
+          sid: string,
+          payload: {
+            content?: string;
+            contentBlocks?: Message["contentBlocks"];
+            sourceCitations?: unknown[];
+          },
+        ) => void;
+      }
+    ).__e2eSeedAssistantMessage = (
       sid: string,
       payload: {
         content?: string;
@@ -424,7 +554,8 @@ export function useChatE2EGlobals({
           content: payload.content ?? "",
           contentBlocks: payload.contentBlocks,
           timestamp: Date.now(),
-          sourceCitations: payload.sourceCitations as Message["sourceCitations"],
+          sourceCitations:
+            payload.sourceCitations as Message["sourceCitations"],
         },
         (payload.content ?? "").slice(0, 60),
       );
@@ -445,8 +576,10 @@ export function useChatE2EGlobals({
     };
 
     return () => {
-      delete (window as unknown as { __e2eSeedUserMessage?: unknown }).__e2eSeedUserMessage;
-      delete (window as unknown as { __e2eSeedAssistantMessage?: unknown }).__e2eSeedAssistantMessage;
+      delete (window as unknown as { __e2eSeedUserMessage?: unknown })
+        .__e2eSeedUserMessage;
+      delete (window as unknown as { __e2eSeedAssistantMessage?: unknown })
+        .__e2eSeedAssistantMessage;
     };
   }, [
     piContentBlocksRef,

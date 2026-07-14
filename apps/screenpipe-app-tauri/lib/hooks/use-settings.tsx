@@ -94,6 +94,9 @@ export interface ChatMessage {
 	content: string;
 	intent?: "steer";
 	turnIntentId?: string;
+	hostedTurnId?: string;
+	/** Exact marked latest-user content used for an idempotent hosted retry. */
+	hostedTurnPrompt?: string;
 	timestamp: number;
 	contentBlocks?: any[];
 	sourceCitations?: SourceCitation[];
@@ -787,19 +790,29 @@ export const saveAndEncrypt = async (store: Store) => {
  * logout (`setCloudToken(null)`) does — so a save during a transient
  * pre-hydration state can't sign the user out.
  */
-async function setSettingsStripped(store: Store, settings: Settings) {
+export async function setSettingsStripped(store: Store, settings: Settings) {
 	const token = settings?.user?.token;
 	// Default to "safe to write as-is" when there's no token to protect.
 	let persisted = !token;
 	if (token) {
 		try {
-			const res = await commands.setCloudToken(token);
+			const res = await commands.setCloudToken(token, token, false);
 			if (res.status === "ok") {
 				persisted = true;
 			} else {
 				console.warn("cloud token not persisted to secret store:", res.error);
+				// A different account won the native compare-and-set race. Writing
+				// this rejected profile/JWT to shared store.bin would mix identities
+				// across webviews and reintroduce a plaintext cloud credential. Abort
+				// the entire settings write; the winning account remains authoritative.
+				if (res.error === "cloud_auth_identity_changed") {
+					throw new Error(res.error);
+				}
 			}
 		} catch (e) {
+			if (e instanceof Error && e.message === "cloud_auth_identity_changed") {
+				throw e;
+			}
 			console.warn("failed to mirror cloud token to secret store:", e);
 		}
 	}
@@ -1239,11 +1252,13 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	// "logout" resurrects the just-cleared session — the user had to click
 	// logout twice. Regression test: e2e/specs/zz-logout-resurrect.spec.ts.
 	const authGenerationRef = useRef(0);
+	const loadUserRequestRef = useRef(0);
 
 	useEffect(() => {
 		installAuthInterceptor(
 			() => settingsRef.current.user?.token ?? undefined,
-			async () => {
+				async (expectedToken) => {
+					if (settingsRef.current.user?.token !== expectedToken) return;
 				// Strip only the token — keep the profile + entitlement evidence so
 				// the entitlement gate's transient-loss cushion can hold instead of
 				// resetting onboarding (SCR-132). Because the user stays non-null,
@@ -1251,17 +1266,25 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				// updates && !updates.user) intentionally does NOT fire: an
 				// in-flight loadUser that still succeeds may legitimately restore
 				// the session after a transient 401.
-				await updateSettings({
-					user: stripSessionToken(settingsRef.current.user) as any,
-				});
 				// Mirror the sign-out into the sidecar so the pi-agent and
 				// cloud_proxy.rs stop sending the now-revoked token on the
-				// next pipe run.
+				// next pipe run. Clear native state BEFORE broadcasting the
+				// token-stripped profile; otherwise the store listener can
+				// rehydrate the old token during this exact gap.
 				try {
-					await commands.setCloudToken(null);
+						const result = await commands.setCloudToken(null, expectedToken, false);
+						if (result?.status === "error") {
+							console.warn("native token persistence failed after runtime clear:", result.error);
+							return;
+						}
 				} catch (e) {
 					console.warn("failed to clear cloud token in sidecar:", e);
+					return;
 				}
+					if (settingsRef.current.user?.token !== expectedToken) return;
+					await updateSettings({
+					user: stripSessionToken(settingsRef.current.user) as any,
+				});
 			}
 		);
 	}, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1418,11 +1441,13 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	}, [settings.fontSize]);
 
 	const updateSettings = async (updates: Partial<Settings>) => {
-		// Sign-out (user → null) must invalidate any loadUser() request that is
-		// currently in flight so the cleared session can't be resurrected when a
-		// slow refresh resolves afterwards. Bump synchronously — before the first
-		// await — so even the logout button's fire-and-forget call wins the race.
-		if ("user" in updates && !updates.user) {
+		// Every account identity transition (A→null, A→B, null→B, or token
+		// stripping) must invalidate in-flight loadUser() work. Bump
+		// synchronously, before the first await, so a slower request cannot
+		// resurrect or overwrite the identity that just won.
+		const previousUserToken = settingsRef.current.user?.token ?? null;
+		const nextUserToken = "user" in updates ? updates.user?.token ?? null : previousUserToken;
+		if ("user" in updates && previousUserToken !== nextUserToken) {
 			authGenerationRef.current += 1;
 			// Broadcast to the other windows. Each non-overlay window has its own
 			// SettingsProvider + DeeplinkHandler, so a login's deep-link fires a
@@ -1482,6 +1507,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		// abort the write below instead of resurrecting the cleared session.
 		const generation = authGenerationRef.current;
 		const startingToken = settingsRef.current.user?.token ?? null;
+		const requestId = ++loadUserRequestRef.current;
 		try {
 			const response = await fetch(screenpipeWebUrl("/api/user", "https://screenpipe.com"), {
 				method: "POST",
@@ -1507,9 +1533,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			// two clicks" bug). Abort silently; the sign-out already won.
 			if (
 				authGenerationRef.current !== generation ||
-				(startingToken !== null && settingsRef.current.user?.token !== token)
+				(settingsRef.current.user?.token ?? null) !== startingToken ||
+				loadUserRequestRef.current !== requestId
 			) {
-				console.log("loadUser: sign-out during fetch — not restoring session");
+				console.log("loadUser: auth identity changed during fetch — not restoring session");
 				return;
 			}
 
@@ -1531,8 +1558,6 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				}
 			}
 
-			await updateSettings({ user: userData });
-
 			// Push the fresh token into the running sidecar so the
 			// `Server.cloud_token` (used by /v1/chat/completions proxy) and
 			// the `PiExecutor.user_token` (used by pi-agent's models.json
@@ -1541,10 +1566,27 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			// the engine keeps whatever token it captured at boot (often
 			// `null`), and every Sonnet/Opus pipe 403s on tier=anonymous.
 			try {
-				await commands.setCloudToken(token);
+					const result = await commands.setCloudToken(token, startingToken, false);
+				if (result.status === "error") {
+					throw new Error(result.error);
+				}
 			} catch (e) {
 				console.warn("failed to push cloud token to sidecar:", e);
+				throw e;
 			}
+
+			if (
+				authGenerationRef.current !== generation ||
+				(settingsRef.current.user?.token ?? null) !== startingToken ||
+				loadUserRequestRef.current !== requestId
+			) {
+				console.log("loadUser: auth identity changed during native update — not restoring session");
+				return;
+			}
+
+			// Only broadcast/persist the profile after native identity and Pi
+			// sessions have rotated, so listeners cannot rehydrate the prior token.
+			await updateSettings({ user: userData });
 		} catch (err) {
 			console.error("failed to load user:", err instanceof Error ? err.message : err);
 			throw err;

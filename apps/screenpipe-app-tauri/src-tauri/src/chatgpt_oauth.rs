@@ -18,7 +18,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
@@ -152,6 +152,36 @@ async fn delete_tokens_from_store() -> Result<(), String> {
         .delete(SECRET_KEY)
         .await
         .map_err(|e| format!("failed to delete token: {}", e))
+}
+
+async fn stop_background_pipes_for_oauth_rotation(
+    recording_state: &crate::recording::RecordingState,
+) -> Result<(), String> {
+    // Clone the manager out of the server guard before waiting. The server
+    // lifecycle must remain free to process shutdown/recovery while OAuth is
+    // rotating.
+    let pipe_manager = {
+        let server = recording_state.server.lock().await;
+        server.as_ref().map(|core| core.pipe_manager.clone())
+    };
+    let Some(pipe_manager) = pipe_manager else {
+        return Ok(());
+    };
+
+    let statuses = pipe_manager
+        .lock()
+        .await
+        .stop_all_running_pipes_and_wait(std::time::Duration::from_secs(7))
+        .await
+        .map_err(|error| format!("failed to stop background Pi work: {error}"))?;
+    if !statuses.is_empty() {
+        info!(
+            "Stopped {} background pipe execution(s) for ChatGPT OAuth rotation: {:?}",
+            statuses.len(),
+            statuses
+        );
+    }
+    Ok(())
 }
 
 fn is_token_expired(tokens: &OAuthTokens) -> bool {
@@ -355,7 +385,38 @@ pub fn start_background_refresh() {
 
 // ── Local callback server ──────────────────────────────────────────────
 
-async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<String, String> {
+fn oauth_callback_code(request: &str, expected_state: &str) -> Result<Option<String>, &'static str> {
+    let Some(path) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        return Ok(None);
+    };
+    let Some(url) = reqwest::Url::parse(&format!("http://localhost{path}")).ok() else {
+        return Ok(None);
+    };
+    let code = url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.to_string());
+    if code.is_none() {
+        return Ok(None);
+    }
+    let returned_state = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.to_string());
+    if returned_state.as_deref() != Some(expected_state) {
+        return Err("oauth state mismatch");
+    }
+    Ok(code)
+}
+
+async fn wait_for_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<String, String> {
     loop {
         let (mut stream, _) = listener
             .accept()
@@ -370,19 +431,8 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<String, 
 
         let request = String::from_utf8_lossy(&buf[..n]);
 
-        let code = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1).map(String::from))
-            .and_then(|path| reqwest::Url::parse(&format!("http://localhost{}", path)).ok())
-            .and_then(|url| {
-                url.query_pairs()
-                    .find(|(k, _)| k == "code")
-                    .map(|(_, v)| v.to_string())
-            });
-
-        match code {
-            Some(code) => {
+        match oauth_callback_code(&request, expected_state) {
+            Ok(Some(code)) => {
                 let html = concat!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
                     "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">",
@@ -394,9 +444,17 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<String, 
                 let _ = stream.write_all(html.as_bytes()).await;
                 return Ok(code);
             }
-            None => {
+            Ok(None) => {
                 let _ = stream
                     .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+            Err(_) => {
+                // A stray/malicious localhost request must not consume the
+                // one-shot callback listener. Reject it and keep waiting for
+                // the browser redirect carrying the unguessable login state.
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nInvalid OAuth state")
                     .await;
             }
         }
@@ -407,7 +465,11 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<String, 
 
 #[tauri::command]
 #[specta::specta]
-pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> {
+pub async fn chatgpt_oauth_login(
+    app_handle: AppHandle,
+    pi_state: State<'_, crate::pi::PiState>,
+    recording_state: State<'_, crate::recording::RecordingState>,
+) -> Result<bool, String> {
     let (code_verifier, code_challenge) = generate_pkce();
 
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", CALLBACK_PORT)).await
@@ -455,7 +517,7 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
 
     let auth_code = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        wait_for_callback(listener),
+        wait_for_callback(listener, &state),
     )
     .await
     .map_err(|_| "OAuth login timed out (120s)".to_string())?
@@ -510,7 +572,25 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
         expires_at: Some(unix_now() + expires_in),
     };
 
-    write_tokens_to_store(&tokens).await?;
+    // ChatGPT credentials are spawn-time Pi state. Drain every foreground
+    // session while replacing the OAuth identity so a reconnect/account switch
+    // cannot leave an old child running with the previous account's token.
+    // Holding the Pi pool through the durable write also prevents a concurrent
+    // pi_start from slipping into the old/new identity gap.
+    // Shared Pi config/spawn lock first, then foreground pool. Background Pi
+    // takes the same first lock immediately before resolving/spawning with its
+    // provider token, so no old-account child can cross this transition.
+    let _pi_config_spawn_guard = screenpipe_core::agents::pi::lock_pi_config_spawn().await;
+    let (_, persist_result) = crate::pi::stop_all_pi_sessions_and_then_async(
+        &pi_state,
+        "chatgpt_oauth_login",
+        || async move {
+            stop_background_pipes_for_oauth_rotation(&recording_state).await?;
+            write_tokens_to_store(&tokens).await
+        },
+    )
+    .await;
+    persist_result?;
     info!("ChatGPT OAuth login successful — token saved to secret store");
 
     // Bring screenpipe back to the foreground so the user sees the preset form
@@ -597,8 +677,24 @@ pub async fn chatgpt_oauth_models() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn chatgpt_oauth_logout() -> Result<bool, String> {
-    delete_tokens_from_store().await?;
+pub async fn chatgpt_oauth_logout(
+    pi_state: State<'_, crate::pi::PiState>,
+    recording_state: State<'_, crate::recording::RecordingState>,
+) -> Result<bool, String> {
+    // Delete the durable token while the foreground Pi pool is stopped and
+    // locked. This guarantees logout returns only after no chat child can keep
+    // using the revoked ChatGPT identity or be spawned from stale storage.
+    let _pi_config_spawn_guard = screenpipe_core::agents::pi::lock_pi_config_spawn().await;
+    let (_, delete_result) = crate::pi::stop_all_pi_sessions_and_then_async(
+        &pi_state,
+        "chatgpt_oauth_logout",
+        || async {
+            stop_background_pipes_for_oauth_rotation(&recording_state).await?;
+            delete_tokens_from_store().await
+        },
+    )
+    .await;
+    delete_result?;
     info!("ChatGPT OAuth logged out");
     Ok(true)
 }
@@ -609,5 +705,34 @@ pub async fn chatgpt_oauth_check_token() -> Result<bool, String> {
     match get_valid_token().await {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oauth_callback_code;
+
+    #[test]
+    fn oauth_callback_requires_exact_state() {
+        let request = "GET /auth/callback?code=abc&state=expected HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            oauth_callback_code(request, "expected"),
+            Ok(Some("abc".to_string()))
+        );
+
+        let missing = "GET /auth/callback?code=abc HTTP/1.1\r\n\r\n";
+        assert_eq!(oauth_callback_code(missing, "expected"), Err("oauth state mismatch"));
+
+        let wrong = "GET /auth/callback?code=abc&state=attacker HTTP/1.1\r\n\r\n";
+        assert_eq!(oauth_callback_code(wrong, "expected"), Err("oauth state mismatch"));
+    }
+
+    #[test]
+    fn oauth_callback_ignores_requests_without_a_code() {
+        assert_eq!(
+            oauth_callback_code("GET /favicon.ico HTTP/1.1\r\n\r\n", "expected"),
+            Ok(None)
+        );
+        assert_eq!(oauth_callback_code("malformed", "expected"), Ok(None));
     }
 }

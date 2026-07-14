@@ -7,12 +7,14 @@
 //! Implements [`AgentExecutor`] for the pi CLI (`@earendil-works/pi-coding-agent`).
 //! Pi is installed via bun and executed as a subprocess in "print" mode (`pi -p`).
 
-use super::{install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle};
+use super::{install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle, STOP_REQUESTED_PID};
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +22,78 @@ const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.75.4";
 const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.75.4";
 const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
+pub const DEFAULT_SCREENPIPE_LOCAL_API_URL: &str = "http://127.0.0.1:3030/v1";
+const CLOUD_PROXY_CAPABILITY_DOMAIN: &[u8] = b"screenpipe-cloud-proxy-v1\0";
+pub const CLOUD_PROXY_SCOPE_BACKGROUND: &str = "background";
+pub const CLOUD_PROXY_SCOPE_INTERACTIVE: &str = "interactive";
+
+/// Derive the scoped capability accepted by the localhost cloud proxy.
+/// This is deliberately one-way and domain-separated from every other use of
+/// the Clerk JWT. The Pi child can spend through the proxy but cannot recover
+/// or replay the account credential against Screenpipe Cloud directly.
+pub fn derive_cloud_proxy_capability(cloud_token: &str, scope: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CLOUD_PROXY_CAPABILITY_DOMAIN);
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(cloud_token.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+/// Whether a resolved provider is intentionally Screenpipe Cloud. `None` is
+/// retained only for legacy direct callers; persisted presets are validated
+/// before reaching the executor and always carry an explicit provider.
+fn provider_uses_screenpipe_cloud(provider: Option<&str>) -> bool {
+    matches!(
+        provider,
+        None | Some("screenpipe") | Some("screenpipe-cloud") | Some("pi")
+    )
+}
+
+/// Apply the only Screenpipe credentials a Pi child is allowed to receive.
+///
+/// The Clerk cloud JWT is held by the engine's localhost proxy and must never
+/// cross the agent-process boundary. Pi authenticates both model requests and
+/// local data/tool requests with the scoped local API key instead.
+fn configure_pi_child_auth_env(
+    cmd: &mut tokio::process::Command,
+    _resolved_provider: &str,
+    local_api_key: Option<&str>,
+    cloud_token: Option<&str>,
+    local_api_port: u16,
+) {
+    cmd.env_remove("SCREENPIPE_API_KEY");
+    cmd.env_remove("SCREENPIPE_CLOUD_PROXY_CAPABILITY");
+    cmd.env_remove("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY");
+    cmd.env_remove("SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY");
+    cmd.env("SCREENPIPE_LOCAL_API_PORT", local_api_port.to_string());
+
+    // A background pipe receives only the background-spend capability. This
+    // is also required when the pipe's main model is BYOK/local because its
+    // media-analysis skill may explicitly call the paid background route.
+    // Never grant this process the interactive-preview capability.
+    if let Some(token) = cloud_token.filter(|token| !token.is_empty()) {
+        cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            derive_cloud_proxy_capability(token, CLOUD_PROXY_SCOPE_BACKGROUND),
+        );
+    }
+
+    if let Some(key) = local_api_key.filter(|key| !key.is_empty()) {
+        cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
+        // Deprecated alias retained for one release for old user-installed
+        // pipe.md files. It is the same local key, never the cloud JWT.
+        cmd.env("SCREENPIPE_API_AUTH_KEY", key);
+    } else {
+        cmd.env_remove("SCREENPIPE_LOCAL_API_KEY");
+        cmd.env_remove("SCREENPIPE_API_AUTH_KEY");
+    }
+}
+
+fn execution_stop_requested(shared_pid: Option<&super::SharedPid>) -> bool {
+    shared_pid.is_some_and(|pid| pid.load(Ordering::SeqCst) == STOP_REQUESTED_PID)
+}
 
 /// Windows creation flags for background agent spawns: CREATE_NO_WINDOW
 /// (0x08000000) so no console flashes, plus BELOW_NORMAL_PRIORITY_CLASS
@@ -36,6 +110,16 @@ const MAX_RATE_LIMIT_RETRIES: usize = 3;
 const RATE_LIMIT_DEFAULT_WAIT_SECS: u64 = 10;
 /// Cap so an oversized `reset_in` can't stall a pipe run indefinitely.
 const RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
+
+/// Process-wide boundary around Pi's shared models/auth files and the child
+/// spawn that consumes them. Account rotation in the desktop app acquires the
+/// same lock before scrubbing credentials, so an older background pipe cannot
+/// rewrite account A after account B (or logout) has committed.
+static PI_CONFIG_SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub async fn lock_pi_config_spawn() -> tokio::sync::MutexGuard<'static, ()> {
+    PI_CONFIG_SPAWN_LOCK.lock().await
+}
 
 /// Parse the rate-limit retry hint (in seconds) from a pi error payload.
 ///
@@ -185,6 +269,11 @@ pub struct PiExecutor {
     pub user_token: Arc<ArcSwap<Option<String>>>,
     /// Screenpipe API base URL (default: `https://api.screenpipe.com/v1`).
     pub api_url: String,
+    /// Local Screenpipe API base URL used by Pi for managed cloud requests.
+    /// The local server injects the Clerk JWT upstream, so the agent receives
+    /// only `SCREENPIPE_LOCAL_API_KEY` and never the cloud credential.
+    pub local_api_url: String,
+    pub local_api_port: u16,
     /// Bearer token for the *local* screenpipe-server API (localhost:3030).
     /// Exposed to the Pi subprocess as `SCREENPIPE_LOCAL_API_KEY` so bash/TS
     /// pipe code can authenticate against the local server. `SCREENPIPE_API_AUTH_KEY`
@@ -198,6 +287,8 @@ impl PiExecutor {
         Self {
             user_token: Arc::new(ArcSwap::new(Arc::new(user_token))),
             api_url: SCREENPIPE_API_URL.to_string(),
+            local_api_url: DEFAULT_SCREENPIPE_LOCAL_API_URL.to_string(),
+            local_api_port: 3030,
             api_auth_key: None,
         }
     }
@@ -211,6 +302,8 @@ impl PiExecutor {
         Self {
             user_token,
             api_url: SCREENPIPE_API_URL.to_string(),
+            local_api_url: DEFAULT_SCREENPIPE_LOCAL_API_URL.to_string(),
+            local_api_port: 3030,
             api_auth_key: None,
         }
     }
@@ -241,6 +334,22 @@ impl PiExecutor {
     pub fn with_api_auth_key(mut self, key: Option<String>) -> Self {
         self.api_auth_key = key.filter(|k| !k.is_empty());
         self
+    }
+
+    /// Point managed Screenpipe Cloud Pi requests at this engine instance's
+    /// local credential-injecting proxy.
+    pub fn with_local_api_port(mut self, port: u16) -> Self {
+        self.local_api_url = Self::local_api_base_url(port);
+        self.local_api_port = port;
+        self
+    }
+
+    pub fn local_api_base_url(port: u16) -> String {
+        format!("http://127.0.0.1:{}/v1", port)
+    }
+
+    pub fn runtime_config_dir_for_working_dir(working_dir: &Path) -> Result<PathBuf> {
+        pi_runtime_config_dir_for_working_dir(working_dir)
     }
 
     /// User policy: when the marker file
@@ -769,53 +878,122 @@ impl PiExecutor {
         model: Option<&str>,
         provider_url: Option<&str>,
     ) -> Result<()> {
+        Self::ensure_pi_config_with_local_api_url(
+            user_token,
+            api_url,
+            DEFAULT_SCREENPIPE_LOCAL_API_URL,
+            provider,
+            model,
+            provider_url,
+        )
+        .await
+    }
+
+    /// Configure Pi with an explicit local proxy URL. Engine-owned executors
+    /// use this path so non-default ports cannot accidentally bypass the proxy.
+    pub async fn ensure_pi_config_with_local_api_url(
+        user_token: Option<&str>,
+        api_url: &str,
+        local_api_url: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        provider_url: Option<&str>,
+    ) -> Result<()> {
         let config_dir = get_pi_config_dir()?;
+        Self::ensure_pi_config_at(
+            &config_dir,
+            user_token,
+            api_url,
+            local_api_url,
+            provider,
+            model,
+            provider_url,
+        )
+        .await
+    }
+
+    /// Configure the process-local runtime used by one background pipe.
+    /// Provider config is never written to the shared Screenpipe Pi root.
+    pub async fn ensure_pi_config_for_working_dir_with_local_api_url(
+        working_dir: &Path,
+        user_token: Option<&str>,
+        api_url: &str,
+        local_api_url: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        provider_url: Option<&str>,
+    ) -> Result<PathBuf> {
+        let config_dir = pi_runtime_config_dir_for_working_dir(working_dir)?;
+        Self::ensure_pi_config_at(
+            &config_dir,
+            user_token,
+            api_url,
+            local_api_url,
+            provider,
+            model,
+            provider_url,
+        )
+        .await?;
+        Ok(config_dir)
+    }
+
+    /// Inner config writer with an explicit directory so credential-boundary
+    /// behavior can be tested without mutating the user's real pi config.
+    async fn ensure_pi_config_at(
+        config_dir: &Path,
+        user_token: Option<&str>,
+        api_url: &str,
+        local_api_url: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        provider_url: Option<&str>,
+    ) -> Result<()> {
         std::fs::create_dir_all(&config_dir)?;
 
-        // -- models.json: merge our provider into existing config --
-        // We read the existing file and merge to avoid a race condition where
-        // concurrent pipes (scheduled at the same time) overwrite each other's
-        // providers. Each pipe adds/updates only its own provider entry.
-        let models_path = config_dir.join("models.json");
-        let mut models_config: serde_json::Value = if models_path.exists() {
-            let content = std::fs::read_to_string(&models_path).unwrap_or_default();
-            match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!("pi config: models.json is corrupt, rebuilding from scratch");
-                    json!({"providers": {}})
-                }
+        match provider {
+            None
+            | Some("screenpipe")
+            | Some("screenpipe-cloud")
+            | Some("pi")
+            | Some("ollama")
+            | Some("openai")
+            | Some("openai-chatgpt")
+            | Some("anthropic")
+            | Some("custom") => {}
+            Some(other) => {
+                return Err(anyhow!(
+                    "pi config: unsupported provider '{}'; refusing to fall back to screenpipe cloud",
+                    other
+                ));
             }
-        } else {
-            json!({"providers": {}})
-        };
-        // Ensure providers key exists and is an object
-        if models_config
-            .get("providers")
-            .and_then(|p| p.as_object())
-            .is_none()
-        {
-            models_config = json!({"providers": {}});
         }
+        if provider == Some("custom")
+            && provider_url
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .is_none()
+        {
+            return Err(anyhow!(
+                "pi config: custom provider requires a non-empty base URL"
+            ));
+        }
+
+        // The isolated config belongs to exactly one spawned credential
+        // domain at a time. Rebuild it from scratch with only the selected
+        // provider; never preserve a prior run's literal BYOK/OAuth secret.
+        // The config/spawn mutex keeps this file stable until the child has
+        // inherited its provider-specific environment.
+        let models_path = config_dir.join("models.json");
+        let mut models_config = json!({"providers": {}});
 
         // Only add screenpipe cloud provider if it's the intended provider
         // (or no provider specified). If the user explicitly chose ollama/openai/custom,
         // do NOT write screenpipe into models.json to avoid silent credit drain via fallback.
-        let should_add_screenpipe = match provider {
-            None => true,
-            Some("screenpipe") | Some("screenpipe-cloud") | Some("pi") => true,
-            Some(_) => false,
-        };
+        let should_add_screenpipe = provider_uses_screenpipe_cloud(provider);
 
         if should_add_screenpipe {
-            // Use actual token value in apiKey — Pi doesn't resolve env var names,
-            // so writing the literal string "SCREENPIPE_API_KEY" causes tier=anonymous.
-            // Resolve from: argument > env var > literal fallback (last resort).
-            let api_key_value = user_token
-                .map(|t| t.to_string())
-                .or_else(|| std::env::var("SCREENPIPE_API_KEY").ok())
-                .unwrap_or_else(|| "SCREENPIPE_API_KEY".to_string());
-            let api_key_value = api_key_value.as_str();
+            // Fetch the tier-filtered catalog directly in Rust, where the
+            // Clerk JWT is trusted. Pi itself talks only to the local proxy.
             let models = screenpipe_cloud_models(api_url, user_token).await;
             // PiExecutor only runs pipes (PipeManager: scheduled / run-now),
             // which are latency-tolerant, so tag every cloud LLM call as
@@ -825,11 +1003,14 @@ impl PiExecutor {
             // and an old gateway simply ignores the unknown header (→ standard),
             // so there's no deploy-order coupling.
             let screenpipe_provider = json!({
-                "baseUrl": api_url,
+                "baseUrl": local_api_url,
                 "api": "openai-completions",
-                "apiKey": api_key_value,
+                "apiKey": "SCREENPIPE_LOCAL_API_KEY",
                 "authHeader": true,
-                "headers": { "x-screenpipe-latency": "background" },
+                "headers": {
+                    "x-screenpipe-latency": "background",
+                    "x-screenpipe-cloud-proxy-capability": "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY"
+                },
                 "models": models
             });
 
@@ -843,7 +1024,7 @@ impl PiExecutor {
 
         // Add the pipe's own provider (ollama, openai, custom) if specified
         if let (Some(prov), Some(mdl)) = (provider, model) {
-            if prov != "screenpipe" {
+            if !provider_uses_screenpipe_cloud(Some(prov)) {
                 let (pi_provider_name, base_url, api_key) = match prov {
                     "ollama" => (
                         "ollama",
@@ -865,7 +1046,15 @@ impl PiExecutor {
                         provider_url.unwrap_or("https://api.anthropic.com"),
                         "ANTHROPIC_API_KEY",
                     ),
-                    other => (other, provider_url.unwrap_or(""), "CUSTOM_API_KEY"),
+                    "custom" => ("custom", provider_url.unwrap_or(""), "CUSTOM_API_KEY"),
+                    // Validated above. Keep this arm total so future edits do
+                    // not reintroduce an unknown-provider cloud fallback.
+                    other => {
+                        return Err(anyhow!(
+                            "pi config: unsupported provider '{}'; refusing to configure it",
+                            other
+                        ));
+                    }
                 };
 
                 // Pi's models.json schema requires baseUrl to have minLength: 1.
@@ -893,60 +1082,23 @@ impl PiExecutor {
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
                     });
 
-                    // Field-level merge: preserve user-set baseUrl/apiKey when present
-                    // (e.g. jeffutter's `~/.pi/agent/models.json` "ollama" pointing at his
-                    // home server, or "openai-byok" with his real API key) and append our
-                    // model to `models[]` instead of clobbering the array.
-                    //
-                    // Only overwrite a field when (a) the pipe explicitly provided it
-                    // (e.g. `provider_url:` in pipe.md) or (b) no value exists yet.
                     if let Some(providers) = models_config
                         .get_mut("providers")
                         .and_then(|p| p.as_object_mut())
                     {
-                        let entry = providers
-                            .entry(pi_provider_name.to_string())
-                            .or_insert_with(|| json!({}));
-                        if let Some(obj) = entry.as_object_mut() {
-                            // baseUrl: respect user's existing unless the pipe gave a URL.
-                            let user_pinned_url = obj.contains_key("baseUrl")
-                                && obj.get("baseUrl").and_then(|v| v.as_str()).is_some()
-                                && provider_url.is_none();
-                            if !user_pinned_url {
-                                obj.insert("baseUrl".to_string(), json!(base_url));
-                            }
-                            // api (wire format): always set — it's a function of model
-                            // family, not a user preference.
-                            obj.insert("api".to_string(), json!(wire_api));
-                            // apiKey: respect user's existing if any.
-                            if !obj.contains_key("apiKey")
-                                || obj
-                                    .get("apiKey")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.is_empty())
-                                    .unwrap_or(true)
-                            {
-                                obj.insert("apiKey".to_string(), json!(api_key));
-                            }
-                            // models[]: append if our id isn't already there.
-                            let models_arr =
-                                obj.entry("models".to_string()).or_insert_with(|| json!([]));
-                            if !models_arr.is_array() {
-                                *models_arr = json!([]);
-                            }
-                            if let Some(arr) = models_arr.as_array_mut() {
-                                let already = arr
-                                    .iter()
-                                    .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(mdl));
-                                if !already {
-                                    arr.push(new_model);
-                                }
-                            }
-                        }
+                        providers.insert(
+                            pi_provider_name.to_string(),
+                            json!({
+                                "baseUrl": base_url,
+                                "api": wire_api,
+                                "apiKey": api_key,
+                                "models": [new_model]
+                            }),
+                        );
                     }
 
                     info!(
-                        "pi config: merged provider '{}' (model '{}') into pi-config/models.json",
+                        "pi config: selected provider '{}' (model '{}') in pi-config/models.json",
                         pi_provider_name, mdl
                     );
                 }
@@ -965,53 +1117,35 @@ impl PiExecutor {
                 .collect::<String>()
         ));
         std::fs::write(&models_tmp, serde_json::to_string_pretty(&models_config)?)?;
-        std::fs::rename(&models_tmp, &models_path)?;
+        install_pi_config_temp(&models_tmp, &models_path)?;
 
-        // models.json embeds the raw cloud JWT as the screenpipe provider's
-        // apiKey while signed in (#3943) — same hardening as auth.json below.
+        // models.json can contain provider API keys. The Screenpipe entry now
+        // contains only the environment variable name, but retain restrictive
+        // permissions for user-supplied BYOK providers.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&models_path, std::fs::Permissions::from_mode(0o600));
         }
 
-        // -- auth.json: merge/remove screenpipe token, preserve other providers --
-        // Only manage screenpipe auth when screenpipe provider is actually being used.
-        if should_add_screenpipe {
-            let auth_path = config_dir.join("auth.json");
-            if let Some(token) = user_token.filter(|token| !token.is_empty()) {
-                let mut auth: serde_json::Value = if auth_path.exists() {
-                    let content = std::fs::read_to_string(&auth_path).unwrap_or_default();
-                    serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
-                } else {
-                    json!({})
-                };
-
-                if let Some(obj) = auth.as_object_mut() {
-                    obj.insert("screenpipe".to_string(), json!(token));
-                }
-
-                let auth_tmp = config_dir.join(format!(
-                    "auth.json.{}.{}.tmp",
-                    std::process::id(),
-                    format!("{:?}", std::thread::current().id())
-                        .chars()
-                        .filter(|c| c.is_ascii_digit())
-                        .collect::<String>()
-                ));
-                std::fs::write(&auth_tmp, serde_json::to_string_pretty(&auth)?)?;
-                std::fs::rename(&auth_tmp, &auth_path)?;
-
-                // Set restrictive permissions (user read/write only)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o600);
-                    let _ = std::fs::set_permissions(&auth_path, perms);
-                }
-            } else {
-                remove_screenpipe_auth_from_path(&auth_path)?;
-            }
+        // Pi auth storage is shared across isolated sessions, so it must never
+        // carry any provider credential. Every selected provider resolves from
+        // the child environment (or the local cloud proxy) instead.
+        let auth_path = config_dir.join("auth.json");
+        let auth_tmp = config_dir.join(format!(
+            "auth.json.{}.{}.tmp",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id())
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>()
+        ));
+        std::fs::write(&auth_tmp, "{}\n")?;
+        install_pi_config_temp(&auth_tmp, &auth_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600));
         }
 
         debug!("pi config written at {:?}", models_path);
@@ -1190,10 +1324,12 @@ impl PiExecutor {
         shared_pid: Option<super::SharedPid>,
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
+        runtime_config_dir: &Path,
+        config_spawn_guard: tokio::sync::MutexGuard<'static, ()>,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
-        apply_pi_isolation_env(&mut |k, v| {
+        apply_pi_isolation_env_for_dir(runtime_config_dir, &mut |k, v| {
             cmd.env(k, v);
         });
         // Flags MUST come before -p on Windows (see spawn_pi_streaming comment)
@@ -1210,9 +1346,30 @@ impl PiExecutor {
         cmd.arg("-p").arg(prompt);
 
         let cloud_token = self.current_user_token();
-        if let Some(ref token) = cloud_token {
-            cmd.env("SCREENPIPE_API_KEY", token);
-        }
+        configure_pi_child_auth_env(
+            &mut cmd,
+            resolved_provider,
+            self.api_auth_key.as_deref(),
+            cloud_token.as_deref(),
+            self.local_api_port,
+        );
+
+        // A queued run may have resolved its preset before ChatGPT OAuth was
+        // refreshed, disconnected, or replaced. Re-read the authoritative
+        // encrypted store while the config/spawn guard is held and use only
+        // that value; never inject a token captured before the queue/lock.
+        let refreshed_chatgpt_token = if resolved_provider == "openai-chatgpt" {
+            Some(crate::pipes::read_chatgpt_oauth_token().ok_or_else(|| {
+                anyhow!("ChatGPT OAuth token unavailable; reconnect ChatGPT and retry")
+            })?)
+        } else {
+            None
+        };
+        let provider_api_key = if resolved_provider == "openai-chatgpt" {
+            refreshed_chatgpt_token.as_deref()
+        } else {
+            provider_api_key
+        };
 
         // Pi resolves apiKey values in models.json as env var names.
         // Set the actual key so the subprocess can find it.
@@ -1234,23 +1391,9 @@ impl PiExecutor {
                     "google" => {
                         cmd.env("GOOGLE_API_KEY", key);
                     }
-                    // Ensure screenpipe API key is set as env var fallback
-                    "screenpipe" if cloud_token.is_none() => {
-                        cmd.env("SCREENPIPE_API_KEY", key);
-                    }
                     _ => {}
                 }
             }
-        }
-
-        // Canonical name: SCREENPIPE_LOCAL_API_KEY. The AUTH_KEY alias is
-        // kept ONE release as a deprecated fallback for user-installed
-        // pipe.md files that hardcoded the old name (e.g. an older
-        // meeting-summary install on disk that install_builtin_pipes won't
-        // overwrite). TODO(remove next release): drop SCREENPIPE_API_AUTH_KEY.
-        if let Some(ref key) = self.api_auth_key {
-            cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
-            cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
         }
 
         // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
@@ -1274,7 +1417,15 @@ impl PiExecutor {
         #[cfg(windows)]
         cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
 
+        if execution_stop_requested(shared_pid.as_ref()) {
+            return Err(anyhow!("pi execution canceled before spawn"));
+        }
+
         let child = cmd.spawn()?;
+        // The child has inherited the fully-written config and environment.
+        // Do not serialize the whole LLM run; account rotation may now scrub
+        // shared files without changing this already-dispatched process.
+        drop(config_spawn_guard);
         let pid = child.id();
 
         // Set PID synchronously. If a stop was requested before spawn
@@ -1320,10 +1471,12 @@ impl PiExecutor {
         pipe_system_prompt: Option<&str>,
         mcp_server_allowlist: Option<&[String]>,
         session_owner: Option<&str>,
+        runtime_config_dir: &Path,
+        config_spawn_guard: tokio::sync::MutexGuard<'static, ()>,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
-        apply_pi_isolation_env(&mut |k, v| {
+        apply_pi_isolation_env_for_dir(runtime_config_dir, &mut |k, v| {
             cmd.env(k, v);
         });
         // Flags MUST come before -p on Windows: cmd.exe /C passes everything
@@ -1345,9 +1498,28 @@ impl PiExecutor {
         cmd.arg("-p").arg(prompt);
 
         let cloud_token = self.current_user_token();
-        if let Some(ref token) = cloud_token {
-            cmd.env("SCREENPIPE_API_KEY", token);
-        }
+        configure_pi_child_auth_env(
+            &mut cmd,
+            resolved_provider,
+            self.api_auth_key.as_deref(),
+            cloud_token.as_deref(),
+            self.local_api_port,
+        );
+
+        // See the non-streaming path above: OAuth must be re-read after this
+        // run reaches the config/spawn critical section, not when it queued.
+        let refreshed_chatgpt_token = if resolved_provider == "openai-chatgpt" {
+            Some(crate::pipes::read_chatgpt_oauth_token().ok_or_else(|| {
+                anyhow!("ChatGPT OAuth token unavailable; reconnect ChatGPT and retry")
+            })?)
+        } else {
+            None
+        };
+        let provider_api_key = if resolved_provider == "openai-chatgpt" {
+            refreshed_chatgpt_token.as_deref()
+        } else {
+            provider_api_key
+        };
 
         if let Some(key) = provider_api_key {
             if !key.is_empty() {
@@ -1367,19 +1539,9 @@ impl PiExecutor {
                     "google" => {
                         cmd.env("GOOGLE_API_KEY", key);
                     }
-                    // Ensure screenpipe API key is set as env var fallback
-                    "screenpipe" if cloud_token.is_none() => {
-                        cmd.env("SCREENPIPE_API_KEY", key);
-                    }
                     _ => {}
                 }
             }
-        }
-
-        // See spawn_pi above — TODO(remove next release): drop the deprecated alias.
-        if let Some(ref key) = self.api_auth_key {
-            cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
-            cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
         }
 
         if let Some(ids) = mcp_server_allowlist {
@@ -1422,7 +1584,12 @@ impl PiExecutor {
         #[cfg(windows)]
         cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
 
+        if execution_stop_requested(shared_pid.as_ref()) {
+            return Err(anyhow!("pi execution canceled before spawn"));
+        }
+
         let mut child = cmd.spawn()?;
+        drop(config_spawn_guard);
         let pid = child.id();
 
         // Set PID synchronously. If a stop was requested before spawn
@@ -1554,10 +1721,13 @@ impl AgentExecutor for PiExecutor {
             );
         }
 
+        let config_spawn_guard = lock_pi_config_spawn().await;
         let cloud_token = self.current_user_token();
-        Self::ensure_pi_config(
+        let runtime_config_dir = Self::ensure_pi_config_for_working_dir_with_local_api_url(
+            working_dir,
             cloud_token.as_deref(),
             &self.api_url,
+            &self.local_api_url,
             provider,
             Some(&resolved_model),
             provider_url,
@@ -1594,6 +1764,8 @@ impl AgentExecutor for PiExecutor {
                 shared_pid.clone(),
                 continue_session,
                 None, // no pipe system prompt for trait-based calls
+                &runtime_config_dir,
+                config_spawn_guard,
             )
             .await?;
 
@@ -1610,10 +1782,13 @@ impl AgentExecutor for PiExecutor {
             // `set_user_token` since the run started (e.g. user signed in
             // mid-pipe). Picking up the fresh value avoids re-running with
             // the same stale token that triggered the not-found.
+            let config_spawn_guard = lock_pi_config_spawn().await;
             let cloud_token = self.current_user_token();
-            Self::ensure_pi_config(
+            let runtime_config_dir = Self::ensure_pi_config_for_working_dir_with_local_api_url(
+                working_dir,
                 cloud_token.as_deref(),
                 &self.api_url,
+                &self.local_api_url,
                 provider,
                 Some(&resolved_model),
                 provider_url,
@@ -1630,6 +1805,8 @@ impl AgentExecutor for PiExecutor {
                     None,
                     continue_session,
                     None,
+                    &runtime_config_dir,
+                    config_spawn_guard,
                 )
                 .await;
         }
@@ -1668,11 +1845,14 @@ impl AgentExecutor for PiExecutor {
         }
         // Re-read after resolution: resolve_screenpipe_model may have refreshed
         // the token internally; use the current value for config + spawn.
+        let config_spawn_guard = lock_pi_config_spawn().await;
         let cloud_token = self.current_user_token();
 
-        Self::ensure_pi_config(
+        let runtime_config_dir = Self::ensure_pi_config_for_working_dir_with_local_api_url(
+            working_dir,
             cloud_token.as_deref(),
             &self.api_url,
+            &self.local_api_url,
             provider,
             Some(&resolved_model),
             provider_url,
@@ -1711,6 +1891,8 @@ impl AgentExecutor for PiExecutor {
                 pipe_system_prompt,
                 mcp_server_allowlist,
                 session_owner,
+                &runtime_config_dir,
+                config_spawn_guard,
             )
             .await?;
 
@@ -1722,10 +1904,13 @@ impl AgentExecutor for PiExecutor {
                 output.stderr.trim()
             );
             // Re-read cloud token (see comment in `run` above).
+            let config_spawn_guard = lock_pi_config_spawn().await;
             let cloud_token = self.current_user_token();
-            Self::ensure_pi_config(
+            let runtime_config_dir = Self::ensure_pi_config_for_working_dir_with_local_api_url(
+                working_dir,
                 cloud_token.as_deref(),
                 &self.api_url,
+                &self.local_api_url,
                 provider,
                 Some(&resolved_model),
                 provider_url,
@@ -1745,6 +1930,8 @@ impl AgentExecutor for PiExecutor {
                     pipe_system_prompt,
                     mcp_server_allowlist,
                     session_owner,
+                    &runtime_config_dir,
+                    config_spawn_guard,
                 )
                 .await?;
         }
@@ -1780,6 +1967,18 @@ impl AgentExecutor for PiExecutor {
                 wait_secs, rate_limit_retries, MAX_RATE_LIMIT_RETRIES
             ));
             tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            let config_spawn_guard = lock_pi_config_spawn().await;
+            let cloud_token = self.current_user_token();
+            let runtime_config_dir = Self::ensure_pi_config_for_working_dir_with_local_api_url(
+                working_dir,
+                cloud_token.as_deref(),
+                &self.api_url,
+                &self.local_api_url,
+                provider,
+                Some(&resolved_model),
+                provider_url,
+            )
+            .await?;
             output = self
                 .spawn_pi_streaming(
                     &pi_path,
@@ -1794,6 +1993,8 @@ impl AgentExecutor for PiExecutor {
                     pipe_system_prompt,
                     mcp_server_allowlist,
                     session_owner,
+                    &runtime_config_dir,
+                    config_spawn_guard,
                 )
                 .await?;
         }
@@ -1891,7 +2092,212 @@ impl AgentExecutor for PiExecutor {
 // Helpers (extracted from apps/screenpipe-app-tauri/src-tauri/src/pi.rs)
 // ---------------------------------------------------------------------------
 
-/// Screenpipe's private pi agent dir (models.json, auth.json, sessions, …).
+const PI_RUNTIME_MARKER: &str = ".screenpipe-runtime-initialized";
+
+fn pi_runtime_identity_hash(namespace: &str, identity: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"screenpipe-pi-runtime-v1\0");
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn pi_runtime_paths_at(
+    root: &Path,
+    namespace: &str,
+    identity: &str,
+    process_id: u32,
+) -> Result<(PathBuf, PathBuf)> {
+    if !matches!(namespace, "pipe" | "chat") {
+        return Err(anyhow!("unsupported Pi runtime namespace: {namespace}"));
+    }
+    if identity.trim().is_empty() {
+        return Err(anyhow!("Pi runtime identity cannot be empty"));
+    }
+
+    let lineage = root
+        .join("runtimes")
+        .join(namespace)
+        .join(pi_runtime_identity_hash(namespace, identity));
+    let instance = lineage.join(format!("process-{process_id}"));
+    Ok((lineage, instance))
+}
+
+fn encoded_pi_session_name(working_dir: &Path) -> String {
+    let cwd = working_dir.to_string_lossy();
+    let stripped = cwd.trim_matches(|c| c == '/' || c == '\\');
+    format!("--{}--", stripped.replace(['/', '\\'], "-"))
+}
+
+fn newest_prior_runtime(lineage: &Path, current: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(lineage)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path == current || !path.is_dir() {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+/// Initialize one process-local Pi runtime without carrying provider secrets.
+///
+/// `models.json` and `auth.json` always start empty and are rebuilt for the
+/// selected provider immediately before spawn. Only safe UI/runtime settings
+/// are copied from the legacy Screenpipe-owned root. Pipe session history is
+/// copied from the prior process instance (or the pre-isolation root once) so
+/// `--continue` survives app/engine restarts without making provider config
+/// shared across concurrently running processes.
+fn seed_pi_runtime(
+    root: &Path,
+    lineage: &Path,
+    runtime: &Path,
+    working_dir: Option<&Path>,
+) -> Result<()> {
+    if runtime.join(PI_RUNTIME_MARKER).exists() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(runtime)?;
+
+    let mut settings: serde_json::Value = std::fs::read_to_string(root.join("settings.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = settings.as_object_mut() {
+        // Packages can execute arbitrary code and their installation is rooted
+        // in the legacy config directory. Do not silently activate them in a
+        // credential-bearing runtime merely because they exist in shared
+        // settings; project-owned Screenpipe extensions are installed in the
+        // working directory separately.
+        object.remove("packages");
+        object.insert("defaultProvider".to_string(), json!("screenpipe"));
+        object.insert("defaultModel".to_string(), json!("auto"));
+    }
+    std::fs::write(
+        runtime.join("settings.json"),
+        serde_json::to_string_pretty(&settings)?,
+    )?;
+
+    let trust_source = root.join("trust.json");
+    if trust_source.exists() {
+        std::fs::copy(&trust_source, runtime.join("trust.json"))?;
+    }
+
+    std::fs::write(runtime.join("models.json"), "{\"providers\":{}}\n")?;
+    std::fs::write(runtime.join("auth.json"), "{}\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["models.json", "auth.json"] {
+            let _ = std::fs::set_permissions(
+                runtime.join(name),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+    }
+
+    if let Some(working_dir) = working_dir {
+        let encoded = encoded_pi_session_name(working_dir);
+        let destination = runtime.join("sessions").join(&encoded);
+        let prior = newest_prior_runtime(lineage, runtime)
+            .map(|dir| dir.join("sessions").join(&encoded))
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                let legacy = root.join("sessions").join(&encoded);
+                legacy.is_dir().then_some(legacy)
+            });
+        if let Some(source) = prior {
+            crate::paths::copy_dir_all(&source, &destination)?;
+        }
+    }
+
+    std::fs::write(runtime.join(PI_RUNTIME_MARKER), "initialized\n")?;
+    Ok(())
+}
+
+fn normalized_runtime_working_dir(working_dir: &Path) -> String {
+    working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Return a process-local Pi config directory for a foreground conversation.
+/// Different conversations and different Screenpipe processes never share
+/// provider config or auth storage.
+pub fn pi_runtime_config_dir(namespace: &str, identity: &str) -> Result<PathBuf> {
+    let root = pi_config_dir()?;
+    let (lineage, runtime) = pi_runtime_paths_at(&root, namespace, identity, std::process::id())?;
+    seed_pi_runtime(&root, &lineage, &runtime, None)?;
+    Ok(runtime)
+}
+
+/// Return the stable config directory for a background pipe in this process.
+/// Its identity is the canonical working directory; a process suffix prevents
+/// a standalone CLI and desktop engine from rewriting each other's provider
+/// endpoint while a child is running. Safe session state is migrated between
+/// process instances so history remains available after restart.
+pub fn pi_runtime_config_dir_for_working_dir(working_dir: &Path) -> Result<PathBuf> {
+    let root = pi_config_dir()?;
+    let identity = normalized_runtime_working_dir(working_dir);
+    let (lineage, runtime) = pi_runtime_paths_at(&root, "pipe", &identity, std::process::id())?;
+    seed_pi_runtime(&root, &lineage, &runtime, Some(working_dir))?;
+    Ok(runtime)
+}
+
+fn delete_pi_runtime_sessions_at(root: &Path, working_dir: &Path) -> Result<usize> {
+    let identity = normalized_runtime_working_dir(working_dir);
+    let (lineage, _) = pi_runtime_paths_at(root, "pipe", &identity, std::process::id())?;
+    let encoded = encoded_pi_session_name(working_dir);
+    let mut candidates = vec![root.join("sessions").join(&encoded)];
+
+    if lineage.is_dir() {
+        for entry in std::fs::read_dir(&lineage)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir()
+                || !entry.file_name().to_string_lossy().starts_with("process-")
+            {
+                continue;
+            }
+            candidates.push(entry.path().join("sessions").join(&encoded));
+        }
+    }
+
+    let mut removed = 0;
+    for session_dir in candidates {
+        if session_dir.is_dir() {
+            std::fs::remove_dir_all(&session_dir)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Delete a background pipe's session history from every process-local runtime
+/// as well as the pre-isolation location. Clearing only the current process
+/// would let a later process seed its history from an older runtime again.
+pub fn delete_pi_runtime_sessions_for_working_dir(working_dir: &Path) -> Result<usize> {
+    let root = pi_config_dir()?;
+    delete_pi_runtime_sessions_at(&root, working_dir)
+}
+
+/// Set the environment variables that scope a child to an already-initialized
+/// per-runtime config directory.
+pub fn apply_pi_isolation_env_for_dir(config_dir: &Path, apply: &mut dyn FnMut(&str, &str)) {
+    apply("PI_CODING_AGENT_DIR", &config_dir.to_string_lossy());
+    apply("PI_SKIP_VERSION_CHECK", "1");
+}
+
+/// Screenpipe's private pi agent root (migration/settings/package state).
 ///
 /// Isolated from the user's global `~/.pi/agent` so screenpipe never rewrites
 /// config a standalone pi install owns
@@ -1934,7 +2340,8 @@ fn get_pi_config_dir() -> Result<PathBuf> {
 /// pi itself spawns (e.g. sub-agent runs) inherit them.
 pub fn apply_pi_isolation_env(apply: &mut dyn FnMut(&str, &str)) {
     if let Ok(dir) = pi_config_dir() {
-        apply("PI_CODING_AGENT_DIR", &dir.to_string_lossy());
+        apply_pi_isolation_env_for_dir(&dir, apply);
+        return;
     }
     // We pin the pi version ourselves (ensure_installed); don't let the
     // subprocess phone pi.dev for update checks on every run.
@@ -1947,11 +2354,12 @@ const PI_MIGRATION_MARKER: &str = ".migrated-from-global";
 /// One-time seed of the isolated pi dir from the user's global `~/.pi/agent`.
 ///
 /// Earlier releases wrote screenpipe's provider/auth into the global config
-/// and stored chat sessions there, and some users deliberately configured
-/// BYOK providers (ollama/openai) there for their pipes. Copy that state once
-/// so the switch to an isolated dir is invisible:
+/// and stored chat sessions there. Copy non-credential state once, while
+/// rebuilding provider configuration from the selected Screenpipe preset:
 ///
-/// - `models.json` / `auth.json` / `trust.json`: copied verbatim (auth 0600).
+/// - `models.json` / `auth.json`: initialized without credentials. The selected
+///   preset rebuilds the isolated provider entry on ensure (auth 0600).
+/// - `trust.json`: copied verbatim.
 /// - `settings.json`: copied with the `packages` key stripped — globally
 ///   installed pi packages are exactly the conflict vector from
 ///   https://github.com/screenpipe/screenpipe/issues/3812.
@@ -2038,8 +2446,25 @@ fn seed_from_global(global: &Path, dest: &Path, data_dir: &Path) -> bool {
     for name in ["models.json", "auth.json", "trust.json"] {
         let src = global.join(name);
         if src.exists() {
-            if let Err(e) = std::fs::copy(&src, dest.join(name)) {
-                warn!("pi config seed: failed to copy {}: {}", name, e);
+            let result = if matches!(name, "models.json" | "auth.json") {
+                (|| -> Result<()> {
+                    let value = if name == "models.json" {
+                        json!({"providers": {}})
+                    } else {
+                        json!({})
+                    };
+                    std::fs::write(dest.join(name), serde_json::to_string_pretty(&value)?)?;
+                    Ok(())
+                })()
+            } else {
+                std::fs::copy(&src, dest.join(name))
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            };
+            if let Err(e) = result {
+                // Fail closed: a malformed legacy config is not copied because
+                // it may contain a raw managed token we cannot safely identify.
+                warn!("pi config seed: failed to sanitize {}: {}", name, e);
             }
         }
     }
@@ -2118,13 +2543,19 @@ fn seed_from_global(global: &Path, dest: &Path, data_dir: &Path) -> bool {
     true
 }
 
+#[cfg(test)]
 fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<()> {
     if !auth_path.exists() {
         return Ok(());
     }
 
     let content = std::fs::read_to_string(auth_path)?;
-    let mut auth: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+    let mut auth: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        anyhow!(
+            "pi config: auth.json is malformed; preserved without rewriting: {}",
+            error
+        )
+    })?;
     let removed = auth
         .as_object_mut()
         .map(|obj| obj.remove("screenpipe").is_some())
@@ -2143,7 +2574,7 @@ fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<()> {
             .collect::<String>()
     ));
     std::fs::write(&auth_tmp, serde_json::to_string_pretty(&auth)?)?;
-    std::fs::rename(&auth_tmp, auth_path)?;
+    install_pi_config_temp(&auth_tmp, auth_path)?;
 
     #[cfg(unix)]
     {
@@ -2153,6 +2584,48 @@ fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn install_pi_config_temp(tmp: &Path, destination: &Path) -> Result<()> {
+    harden_pi_config_file(tmp);
+    if let Err(first_error) = std::fs::rename(tmp, destination) {
+        #[cfg(windows)]
+        {
+            // Windows rename does not replace an existing destination. A
+            // missing managed config is recoverable; keeping the old raw
+            // credential after an account boundary is not.
+            std::fs::remove_file(destination).map_err(|remove_error| {
+                anyhow!(
+                    "failed to replace {} ({first_error}); remove failed: {remove_error}",
+                    destination.display()
+                )
+            })?;
+            std::fs::rename(tmp, destination).map_err(|retry_error| {
+                anyhow!(
+                    "failed to install {} after removal: {retry_error}; recovery file: {}",
+                    destination.display(),
+                    tmp.display()
+                )
+            })?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(tmp);
+            return Err(first_error.into());
+        }
+    }
+    harden_pi_config_file(destination);
+    Ok(())
+}
+
+fn harden_pi_config_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 pub fn find_bun_executable() -> Option<String> {
@@ -3108,6 +3581,333 @@ mod tests {
         assert!(!auth_path.exists());
     }
 
+    #[test]
+    fn malformed_screenpipe_auth_is_preserved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let malformed = r#"{"screenpipe":"stale-jwt""#;
+        std::fs::write(&auth_path, malformed).expect("write malformed auth");
+
+        let error = remove_screenpipe_auth_from_path(&auth_path)
+            .expect_err("malformed auth must fail without replacement");
+        assert!(error.to_string().contains("preserved without rewriting"));
+        assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn cloud_proxy_capability_has_stable_domain_separated_vector() {
+        assert_eq!(
+            derive_cloud_proxy_capability("account-a-jwt", CLOUD_PROXY_SCOPE_BACKGROUND),
+            "f563ea84ced301deba16623580f8ef19e9d6033cd8cfd98e391237c63a152b80"
+        );
+        assert_ne!(
+            derive_cloud_proxy_capability("account-a-jwt", CLOUD_PROXY_SCOPE_BACKGROUND),
+            derive_cloud_proxy_capability("account-b-jwt", CLOUD_PROXY_SCOPE_BACKGROUND)
+        );
+        assert_ne!(
+            derive_cloud_proxy_capability("account-a-jwt", CLOUD_PROXY_SCOPE_BACKGROUND),
+            derive_cloud_proxy_capability("account-a-jwt", CLOUD_PROXY_SCOPE_INTERACTIVE)
+        );
+    }
+
+    #[test]
+    fn background_pi_child_receives_only_background_capability_and_no_raw_token() {
+        use std::ffi::OsStr;
+
+        let mut cloud_cmd = tokio::process::Command::new("pi");
+        cloud_cmd.env("SCREENPIPE_API_KEY", "inherited-raw-jwt");
+        cloud_cmd.env("SCREENPIPE_CLOUD_PROXY_CAPABILITY", "stale-capability");
+        cloud_cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            "stale-background-capability",
+        );
+        cloud_cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+            "stale-interactive-capability",
+        );
+        configure_pi_child_auth_env(
+            &mut cloud_cmd,
+            "screenpipe",
+            Some("sp-local-key"),
+            Some("current-raw-jwt"),
+            3030,
+        );
+
+        let envs = cloud_cmd.as_std().get_envs().collect::<Vec<_>>();
+        let env = |name: &str| {
+            envs.iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(env("SCREENPIPE_API_KEY"), Some(None));
+        assert_eq!(
+            env("SCREENPIPE_LOCAL_API_KEY"),
+            Some(Some(OsStr::new("sp-local-key")))
+        );
+        assert_eq!(
+            env("SCREENPIPE_LOCAL_API_PORT"),
+            Some(Some(OsStr::new("3030")))
+        );
+        assert_eq!(
+            env("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY"),
+            Some(Some(OsStr::new(
+                "0dac0f31ade6cfa75c8bec7aaf6ea16fa82717dda25a12ec67862cdb2c2079ad"
+            )))
+        );
+        for name in [
+            "SCREENPIPE_CLOUD_PROXY_CAPABILITY",
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+        ] {
+            assert_eq!(env(name), Some(None), "{name} must not reach a pipe");
+        }
+        assert!(envs.iter().all(|(_, value)| {
+            value
+                .map(|value| !value.to_string_lossy().contains("current-raw-jwt"))
+                .unwrap_or(true)
+        }));
+
+        let mut local_cmd = tokio::process::Command::new("pi");
+        local_cmd.env("SCREENPIPE_API_KEY", "inherited-raw-jwt");
+        local_cmd.env("SCREENPIPE_CLOUD_PROXY_CAPABILITY", "inherited-capability");
+        local_cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            "inherited-background-capability",
+        );
+        local_cmd.env(
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+            "inherited-interactive-capability",
+        );
+        configure_pi_child_auth_env(
+            &mut local_cmd,
+            "ollama",
+            Some("sp-local-key"),
+            Some("current-raw-jwt"),
+            3030,
+        );
+        let local_envs = local_cmd.as_std().get_envs().collect::<Vec<_>>();
+        let local_env = |name: &str| {
+            local_envs
+                .iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(local_env("SCREENPIPE_API_KEY"), Some(None));
+        assert_eq!(
+            local_env("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY"),
+            Some(Some(OsStr::new(
+                "0dac0f31ade6cfa75c8bec7aaf6ea16fa82717dda25a12ec67862cdb2c2079ad"
+            ))),
+            "a paid BYOK/local pipe still needs the background media route"
+        );
+        for name in [
+            "SCREENPIPE_CLOUD_PROXY_CAPABILITY",
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+        ] {
+            assert_eq!(
+                local_env(name),
+                Some(None),
+                "{} must be removed from background local/BYOK children",
+                name
+            );
+        }
+
+        let mut signed_out_local_cmd = tokio::process::Command::new("pi");
+        configure_pi_child_auth_env(
+            &mut signed_out_local_cmd,
+            "ollama",
+            Some("sp-local-key"),
+            None,
+            3030,
+        );
+        let signed_out_envs = signed_out_local_cmd.as_std().get_envs().collect::<Vec<_>>();
+        for name in [
+            "SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY",
+            "SCREENPIPE_CLOUD_PROXY_INTERACTIVE_CAPABILITY",
+        ] {
+            assert_eq!(
+                signed_out_envs
+                    .iter()
+                    .find(|(key, _)| *key == OsStr::new(name))
+                    .map(|(_, value)| *value),
+                Some(None),
+                "signed-out local child must not synthesize {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_spawn_cancellation_sentinel_is_detected() {
+        let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        assert!(!execution_stop_requested(Some(&pid)));
+        pid.store(STOP_REQUESTED_PID, Ordering::SeqCst);
+        assert!(execution_stop_requested(Some(&pid)));
+        assert!(!execution_stop_requested(None));
+    }
+
+    #[test]
+    fn deleting_pipe_history_clears_all_runtime_instances_and_legacy_state() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pipe_a = root.path().join("pipes").join("alpha");
+        let pipe_b = root.path().join("pipes").join("beta");
+        let identity_a = normalized_runtime_working_dir(&pipe_a);
+        let identity_b = normalized_runtime_working_dir(&pipe_b);
+        let (lineage_a, runtime_a_1) =
+            pi_runtime_paths_at(root.path(), "pipe", &identity_a, 101).unwrap();
+        let (_, runtime_a_2) = pi_runtime_paths_at(root.path(), "pipe", &identity_a, 202).unwrap();
+        let (_, runtime_b) = pi_runtime_paths_at(root.path(), "pipe", &identity_b, 303).unwrap();
+        let encoded_a = encoded_pi_session_name(&pipe_a);
+        let encoded_b = encoded_pi_session_name(&pipe_b);
+
+        for session_dir in [
+            root.path().join("sessions").join(&encoded_a),
+            runtime_a_1.join("sessions").join(&encoded_a),
+            runtime_a_2.join("sessions").join(&encoded_a),
+        ] {
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(session_dir.join("history.jsonl"), "alpha").unwrap();
+        }
+        let beta_session = runtime_b.join("sessions").join(&encoded_b);
+        std::fs::create_dir_all(&beta_session).unwrap();
+        std::fs::write(beta_session.join("history.jsonl"), "beta").unwrap();
+
+        assert_eq!(
+            delete_pi_runtime_sessions_at(root.path(), &pipe_a).unwrap(),
+            3
+        );
+        assert!(!root.path().join("sessions").join(&encoded_a).exists());
+        assert!(!runtime_a_1.join("sessions").join(&encoded_a).exists());
+        assert!(!runtime_a_2.join("sessions").join(&encoded_a).exists());
+        assert!(beta_session.exists(), "another pipe's history must remain");
+
+        // A later process must not be able to resurrect the cleared history
+        // from either an older runtime instance or the legacy root.
+        let (_, runtime_a_3) = pi_runtime_paths_at(root.path(), "pipe", &identity_a, 404).unwrap();
+        seed_pi_runtime(root.path(), &lineage_a, &runtime_a_3, Some(&pipe_a)).unwrap();
+        assert!(!runtime_a_3.join("sessions").join(&encoded_a).exists());
+    }
+
+    #[tokio::test]
+    async fn non_cloud_config_keeps_only_selected_provider_and_no_auth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &models_path,
+            serde_json::to_string_pretty(&json!({
+                "providers": {
+                    "screenpipe": {
+                        "baseUrl": SCREENPIPE_API_URL,
+                        "apiKey": "stale-account-a-jwt",
+                        "models": []
+                    },
+                    "user-provider": {
+                        "baseUrl": "https://example.test/v1",
+                        "apiKey": "USER_PROVIDER_KEY",
+                        "models": []
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&json!({
+                "screenpipe": "stale-account-a-jwt",
+                "user-provider": {"type": "api_key", "key": "keep-me"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        PiExecutor::ensure_pi_config_at(
+            dir.path(),
+            Some("current-account-b-jwt"),
+            SCREENPIPE_API_URL,
+            DEFAULT_SCREENPIPE_LOCAL_API_URL,
+            Some("ollama"),
+            Some("qwen3:8b"),
+            None,
+        )
+        .await
+        .expect("local provider config should succeed");
+
+        let models: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        let providers = models["providers"].as_object().unwrap();
+        assert!(!providers.contains_key("screenpipe"));
+        assert!(providers.contains_key("ollama"));
+        assert!(!providers.contains_key("user-provider"));
+        assert_eq!(providers.len(), 1);
+
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert!(auth.get("screenpipe").is_none());
+        assert!(auth.as_object().unwrap().is_empty());
+
+        let persisted = format!(
+            "{}\n{}",
+            std::fs::read_to_string(&models_path).unwrap(),
+            std::fs::read_to_string(&auth_path).unwrap()
+        );
+        assert!(!persisted.contains("stale-account-a-jwt"));
+        assert!(!persisted.contains("current-account-b-jwt"));
+    }
+
+    #[tokio::test]
+    async fn cloud_config_keeps_only_proxy_provider_and_no_auth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&json!({
+                "screenpipe": "old-raw-jwt",
+                "anthropic": {"type": "api_key", "key": "keep-me"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Port 1 is expected to refuse immediately, exercising the normal
+        // fallback catalog without reaching an external service.
+        PiExecutor::ensure_pi_config_at(
+            dir.path(),
+            Some("new-raw-jwt"),
+            "http://127.0.0.1:1/v1",
+            "http://127.0.0.1:4567/v1",
+            Some("screenpipe"),
+            Some("auto"),
+            None,
+        )
+        .await
+        .expect("cloud config should succeed with fallback catalog");
+
+        let models_text = std::fs::read_to_string(dir.path().join("models.json")).unwrap();
+        let models: serde_json::Value = serde_json::from_str(&models_text).unwrap();
+        assert_eq!(
+            models["providers"]["screenpipe"]["apiKey"],
+            json!("SCREENPIPE_LOCAL_API_KEY")
+        );
+        assert_eq!(
+            models["providers"]["screenpipe"]["baseUrl"],
+            json!("http://127.0.0.1:4567/v1")
+        );
+        assert_eq!(
+            models["providers"]["screenpipe"]["headers"]["x-screenpipe-cloud-proxy-capability"],
+            json!("SCREENPIPE_CLOUD_PROXY_BACKGROUND_CAPABILITY")
+        );
+        assert!(!models_text.contains("new-raw-jwt"));
+        assert!(!models_text.contains("old-raw-jwt"));
+        assert_eq!(models["providers"].as_object().unwrap().len(), 1);
+
+        let auth_text = std::fs::read_to_string(&auth_path).unwrap();
+        let auth: serde_json::Value = serde_json::from_str(&auth_text).unwrap();
+        assert!(auth.get("screenpipe").is_none());
+        assert!(auth.as_object().unwrap().is_empty());
+        assert!(!auth_text.contains("new-raw-jwt"));
+        assert!(!auth_text.contains("old-raw-jwt"));
+    }
+
     /// `sync_user_skills_from` mirrors store skills into a session's
     /// `.pi/skills/`, leaves baseline/hand-authored skills alone, and removes
     /// its own mirrors once a skill leaves the store.
@@ -3204,11 +4004,140 @@ mod tests {
         assert_eq!(lines[1], "OK");
     }
 
+    #[test]
+    fn runtime_paths_isolate_conversations_and_processes() {
+        let root = Path::new("/tmp/screenpipe-pi-root");
+        let (_, chat_a) = pi_runtime_paths_at(root, "chat", "conversation-a", 100).unwrap();
+        let (_, chat_b) = pi_runtime_paths_at(root, "chat", "conversation-b", 100).unwrap();
+        let (_, chat_a_other_process) =
+            pi_runtime_paths_at(root, "chat", "conversation-a", 200).unwrap();
+
+        assert_ne!(chat_a, chat_b);
+        assert_ne!(chat_a, chat_a_other_process);
+        assert!(chat_a.ends_with("process-100"));
+        assert!(chat_a_other_process.ends_with("process-200"));
+        assert!(pi_runtime_paths_at(root, "../escape", "conversation", 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn two_runtime_configs_cannot_overwrite_each_others_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("pi-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"theme":"dark","packages":["credential-reading-package"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("auth.json"), r#"{"openai":"raw-root-secret"}"#).unwrap();
+        std::fs::write(
+            root.join("models.json"),
+            r#"{"providers":{"openai":{"apiKey":"raw-root-secret"}}}"#,
+        )
+        .unwrap();
+
+        let (lineage_a, runtime_a) =
+            pi_runtime_paths_at(&root, "chat", "conversation-a", 42).unwrap();
+        let (lineage_b, runtime_b) =
+            pi_runtime_paths_at(&root, "chat", "conversation-b", 42).unwrap();
+        seed_pi_runtime(&root, &lineage_a, &runtime_a, None).unwrap();
+        seed_pi_runtime(&root, &lineage_b, &runtime_b, None).unwrap();
+
+        PiExecutor::ensure_pi_config_at(
+            &runtime_a,
+            None,
+            SCREENPIPE_API_URL,
+            DEFAULT_SCREENPIPE_LOCAL_API_URL,
+            Some("ollama"),
+            Some("qwen3:8b"),
+            None,
+        )
+        .await
+        .unwrap();
+        PiExecutor::ensure_pi_config_at(
+            &runtime_b,
+            None,
+            SCREENPIPE_API_URL,
+            DEFAULT_SCREENPIPE_LOCAL_API_URL,
+            Some("openai"),
+            Some("gpt-5"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let models_a: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(runtime_a.join("models.json")).unwrap())
+                .unwrap();
+        let models_b: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(runtime_b.join("models.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            models_a["providers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["ollama".to_string()]
+        );
+        assert_eq!(
+            models_b["providers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["openai-byok".to_string()]
+        );
+
+        for runtime in [&runtime_a, &runtime_b] {
+            let persisted = format!(
+                "{}\n{}\n{}",
+                std::fs::read_to_string(runtime.join("models.json")).unwrap(),
+                std::fs::read_to_string(runtime.join("auth.json")).unwrap(),
+                std::fs::read_to_string(runtime.join("settings.json")).unwrap()
+            );
+            assert!(!persisted.contains("raw-root-secret"));
+            assert!(!persisted.contains("credential-reading-package"));
+        }
+    }
+
+    #[test]
+    fn pipe_runtime_migrates_only_its_session_history_between_processes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("pi-root");
+        let working_dir = tmp.path().join("pipes").join("daily-summary");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = normalized_runtime_working_dir(&working_dir);
+        let encoded = encoded_pi_session_name(&working_dir);
+
+        let (lineage, first) = pi_runtime_paths_at(&root, "pipe", &identity, 10).unwrap();
+        seed_pi_runtime(&root, &lineage, &first, Some(&working_dir)).unwrap();
+        let first_session = first.join("sessions").join(&encoded);
+        std::fs::create_dir_all(&first_session).unwrap();
+        std::fs::write(first_session.join("turn.jsonl"), "pipe-history").unwrap();
+
+        let (_, second) = pi_runtime_paths_at(&root, "pipe", &identity, 11).unwrap();
+        seed_pi_runtime(&root, &lineage, &second, Some(&working_dir)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(second.join("sessions").join(encoded).join("turn.jsonl"))
+                .unwrap(),
+            "pipe-history"
+        );
+        assert!(
+            !second.join("auth.json").exists() || {
+                std::fs::read_to_string(second.join("auth.json")).unwrap() == "{}\n"
+            }
+        );
+    }
+
     /// First-run seed copies config + screenpipe-owned sessions from the
     /// global `~/.pi/agent`, strips `packages` from settings.json, and never
     /// touches the global dir. A second call is a no-op via the marker.
     #[test]
-    fn seed_from_global_copies_config_and_screenpipe_sessions() {
+    fn seed_from_global_copies_noncredential_state_without_credentials() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let global = tmp.path().join("global");
         let dest = tmp.path().join("isolated");
@@ -3217,10 +4146,14 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         std::fs::write(
             global.join("models.json"),
-            r#"{"providers":{"ollama":{"baseUrl":"http://homelab:11434/v1"}}}"#,
+            r#"{"providers":{"screenpipe":{"baseUrl":"https://api.screenpipe.com/v1","apiKey":"legacy-raw-jwt"},"ollama":{"baseUrl":"http://homelab:11434/v1"}}}"#,
         )
         .unwrap();
-        std::fs::write(global.join("auth.json"), r#"{"screenpipe":"tok"}"#).unwrap();
+        std::fs::write(
+            global.join("auth.json"),
+            r#"{"screenpipe":"legacy-raw-jwt","anthropic":"keep-anthropic"}"#,
+        )
+        .unwrap();
         std::fs::write(
             global.join("settings.json"),
             // The user's personal pi defaults must NOT leak into screenpipe's
@@ -3247,10 +4180,17 @@ mod tests {
 
         assert!(seed_from_global(&global, &dest, &data_dir));
 
-        // Config copied; settings stripped of `packages`.
-        let models = std::fs::read_to_string(dest.join("models.json")).unwrap();
-        assert!(models.contains("homelab"));
+        // Global credentials are not copied; settings are stripped of `packages`.
+        let models_text = std::fs::read_to_string(dest.join("models.json")).unwrap();
+        let models: serde_json::Value = serde_json::from_str(&models_text).unwrap();
+        assert!(models["providers"].as_object().unwrap().is_empty());
+        assert!(!models_text.contains("legacy-raw-jwt"));
         assert!(dest.join("auth.json").exists());
+        let auth_text = std::fs::read_to_string(dest.join("auth.json")).unwrap();
+        let auth: serde_json::Value = serde_json::from_str(&auth_text).unwrap();
+        assert!(auth.as_object().unwrap().is_empty());
+        assert!(!auth_text.contains("legacy-raw-jwt"));
+        assert!(!auth_text.contains("keep-anthropic"));
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dest.join("settings.json")).unwrap())
                 .unwrap();

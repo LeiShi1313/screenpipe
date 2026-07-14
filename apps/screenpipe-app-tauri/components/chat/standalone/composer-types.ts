@@ -146,6 +146,7 @@ export interface ComposerFiltersProps {
   applyConnectionFilterTag: (tag: string) => void;
   applySpeakerFilterSuggestion: (suggestion: MentionSuggestion) => void;
   onPickFiles: () => Promise<void>;
+  imagesAllowed: boolean;
 }
 
 export interface ComposerModelControlsProps {

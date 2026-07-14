@@ -6,11 +6,25 @@ import { useCallback, useEffect, useRef } from "react";
 import type * as React from "react";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { toast } from "@/components/ui/use-toast";
-import { buildAppAwarenessContext, buildConnectionsContext, buildSystemPrompt } from "@/lib/chat/system-prompt";
-import { commands, type AIPreset, type PiInfo, type PiProviderConfig } from "@/lib/utils/tauri";
-import type { ActivityAppItem, ConnectedIntegration, ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import {
+  buildAppAwarenessContext,
+  buildConnectionsContext,
+  buildSystemPrompt,
+} from "@/lib/chat/system-prompt";
+import {
+  commands,
+  type AIPreset,
+  type PiInfo,
+  type PiProviderConfig,
+} from "@/lib/utils/tauri";
+import type {
+  ActivityAppItem,
+  ConnectedIntegration,
+  ConnectionListItem,
+} from "@/lib/chat/connection-suggestions";
 import { isDevBillingBypassEnabled } from "@/lib/app-entitlement";
 import {
+  isValidPiPresetSelection,
   requiresScreenpipeCloudLogin,
   resolveScreenpipeCloudModel,
 } from "@/lib/chat/free-tier-turn-marker";
@@ -28,6 +42,12 @@ type PiRunningConfig = {
 export type ResolvedPiProviderConfig = PiProviderConfig & {
   maxTokens: number;
   systemPrompt: string | null;
+};
+
+export type PiSessionRestartBoundary = {
+  sessionId: string;
+  userToken: string | null;
+  isCurrent?: () => boolean;
 };
 
 interface UsePiSessionLifecycleOptions {
@@ -80,6 +100,10 @@ export function usePiSessionLifecycle({
   piPresetSwitchPromiseRef,
 }: UsePiSessionLifecycleOptions) {
   const pendingPresetRef = useRef<AIPreset | null>(null);
+  const pendingPresetInvalidationRef = useRef<Promise<boolean> | null>(null);
+  const pendingPresetRequestIdRef = useRef(0);
+  const presetSwitchRequestIdRef = useRef(0);
+  const systemPromptRestartRequestIdRef = useRef(0);
 
   useEffect(() => {
     // Don't resolve preset until settings are loaded from the store. Before
@@ -89,7 +113,8 @@ export function usePiSessionLifecycle({
     // Don't overwrite pipe-specific preset when watching a pipe execution.
     if (shouldFreezePresetSelection) return;
     const presets = aiPresets ?? [];
-    const fallback = presets.find((preset) => preset.defaultPreset) ?? presets[0];
+    const fallback =
+      presets.find((preset) => preset.defaultPreset) ?? presets[0];
     setActivePreset((prev) => {
       if (!prev) {
         // On fresh mount after a navigation (e.g. settings → home), restore
@@ -97,7 +122,9 @@ export function usePiSessionLifecycle({
         // falling back to the default. localStorage is written by
         // handleSetActivePreset on explicit user selection.
         let savedId: string | null = null;
-        try { savedId = localStorage.getItem("chat-active-preset-id"); } catch {}
+        try {
+          savedId = localStorage.getItem("chat-active-preset-id");
+        } catch {}
         if (savedId) {
           const saved = presets.find((preset) => preset.id === savedId);
           if (saved) return saved;
@@ -117,10 +144,15 @@ export function usePiSessionLifecycle({
       }
       return fallback;
     });
-  }, [aiPresets, isSettingsLoaded, setActivePreset, shouldFreezePresetSelection]);
+  }, [
+    aiPresets,
+    isSettingsLoaded,
+    setActivePreset,
+    shouldFreezePresetSelection,
+  ]);
 
   const hasPresets = Boolean(aiPresets && aiPresets.length > 0);
-  const hasValidModel = Boolean(activePreset?.model && activePreset.model.trim() !== "");
+  const hasValidModel = isValidPiPresetSelection(activePreset);
   const needsLogin = requiresScreenpipeCloudLogin(
     activePreset?.provider,
     userToken,
@@ -131,69 +163,84 @@ export function usePiSessionLifecycle({
   const disabledReason = (() => {
     if (!hasPresets) return "No AI presets configured";
     if (!activePreset) return "No preset selected";
-    if (!hasValidModel) return `No model selected in "${activePreset.id}" preset`;
-    if (needsLogin) return "Sign in for the included Screenpipe Cloud preview, or choose your own AI";
+    if (!hasValidModel) {
+      if (activePreset.provider === "custom" && !activePreset.url?.trim()) {
+        return `No provider URL configured in "${activePreset.id}" preset`;
+      }
+      return `Invalid model or provider in "${activePreset.id}" preset`;
+    }
+    if (needsLogin)
+      return "Sign in for the included Screenpipe Cloud preview, or choose your own AI";
     if (piStarting) return "Starting Pi agent...";
     return null;
   })();
 
-  const buildProviderConfig = useCallback((preset?: AIPreset | null): ResolvedPiProviderConfig | null => {
-    const p = preset || activePreset;
-    if (!p) return null;
-    // Native Pi historically mapped a custom preset with no URL to its
-    // catch-all Screenpipe Cloud provider. Treat an incomplete custom preset
-    // as unstartable here so a user-owned-provider failure can never cross the
-    // hosted payer boundary through that native fallback.
-    if (p.provider === "custom" && !p.url?.trim()) return null;
-    const presetPrompt = p.prompt || "";
-    const connectionsCtx = buildConnectionsContext(connections);
-    const appAwarenessCtx = buildAppAwarenessContext({
-      apps: appItems,
-      connections: allConnectionItems,
-    });
-    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}${connectionsCtx}${appAwarenessCtx}`.trim() || null;
-    return {
-      provider: p.provider,
-      url: p.url || "",
-      model: resolveScreenpipeCloudModel(
-        p.provider,
-        p.model,
-        hasHostedSubscription,
-      ),
-      apiKey: p.apiKey || null,
-      maxTokens: p.maxTokens ?? 4096,
-      systemPrompt,
-    };
-  }, [
-    activePreset?.apiKey,
-    activePreset?.maxTokens,
-    activePreset?.model,
-    activePreset?.prompt,
-    activePreset?.provider,
-    activePreset?.url,
-    allConnectionItems,
-    appItems,
-    connections,
-    hasHostedSubscription,
-  ]);
+  const buildProviderConfig = useCallback(
+    (preset?: AIPreset | null): ResolvedPiProviderConfig | null => {
+      const p = preset || activePreset;
+      if (!p || !isValidPiPresetSelection(p)) return null;
+      // Native Pi historically mapped a custom preset with no URL to its
+      // catch-all Screenpipe Cloud provider. Treat an incomplete custom preset
+      // as unstartable here so a user-owned-provider failure can never cross the
+      // hosted payer boundary through that native fallback.
+      const presetPrompt = p.prompt || "";
+      const connectionsCtx = buildConnectionsContext(connections);
+      const appAwarenessCtx = buildAppAwarenessContext({
+        apps: appItems,
+        connections: allConnectionItems,
+      });
+      const systemPrompt =
+        `${buildSystemPrompt()}\n\n${presetPrompt}${connectionsCtx}${appAwarenessCtx}`.trim() ||
+        null;
+      return {
+        provider: p.provider,
+        url: p.url || "",
+        model: resolveScreenpipeCloudModel(
+          p.provider,
+          p.model,
+          hasHostedSubscription,
+        ),
+        apiKey: p.apiKey || null,
+        maxTokens: p.maxTokens ?? 4096,
+        systemPrompt,
+      };
+    },
+    [
+      activePreset?.apiKey,
+      activePreset?.maxTokens,
+      activePreset?.model,
+      activePreset?.prompt,
+      activePreset?.provider,
+      activePreset?.url,
+      allConnectionItems,
+      appItems,
+      connections,
+      hasHostedSubscription,
+    ],
+  );
 
-  const setRunningConfigFromProviderConfig = useCallback((providerConfig: ResolvedPiProviderConfig) => {
-    piRunningConfigRef.current = {
-      provider: providerConfig.provider,
-      model: providerConfig.model,
-      url: providerConfig.url,
-      apiKey: providerConfig.apiKey,
-      maxTokens: providerConfig.maxTokens,
-      systemPrompt: providerConfig.systemPrompt,
-      token: userToken ?? null,
-    };
-  }, [piRunningConfigRef, userToken]);
+  const setRunningConfigFromProviderConfig = useCallback(
+    (providerConfig: ResolvedPiProviderConfig) => {
+      piRunningConfigRef.current = {
+        provider: providerConfig.provider,
+        model: providerConfig.model,
+        url: providerConfig.url,
+        apiKey: providerConfig.apiKey,
+        maxTokens: providerConfig.maxTokens,
+        systemPrompt: providerConfig.systemPrompt,
+        token: userToken ?? null,
+      };
+    },
+    [piRunningConfigRef, userToken],
+  );
 
   const syncThinkingLevelAfterStart = useCallback(async (sessionId: string) => {
     try {
       const result = await commands.piGetThinkingLevel();
       if (result.status === "ok") {
-        await commands.piSetThinkingLevel(sessionId, result.data).catch(() => {});
+        await commands
+          .piSetThinkingLevel(sessionId, result.data)
+          .catch(() => {});
       }
     } catch {
       // fire-and-forget
@@ -201,67 +248,135 @@ export function usePiSessionLifecycle({
     commands.piRequestState(sessionId).catch(() => {});
   }, []);
 
-  const restartCurrentPiSession = useCallback(async (providerConfig: ResolvedPiProviderConfig) => {
-    let currentPid = piInfo?.pid;
-    if (typeof currentPid !== "number") {
-      try {
-        const info = await commands.piInfo(piSessionIdRef.current);
-        if (info.status === "ok") {
-          currentPid = info.data.pid;
-        }
-      } catch {}
-    }
-    if (typeof currentPid === "number") {
-      piIntentionallyStoppedPidsRef.current.add(currentPid);
-      setTimeout(() => {
-        piIntentionallyStoppedPidsRef.current.delete(currentPid);
-      }, 30_000);
-    } else if (piInfo?.running) {
-      piStoppedIntentionallyRef.current = true;
-    }
+  const restartCurrentPiSession = useCallback(
+    async (
+      providerConfig: ResolvedPiProviderConfig,
+      boundary?: PiSessionRestartBoundary,
+    ) => {
+      const sessionId = boundary?.sessionId ?? piSessionIdRef.current;
+      const restartToken = boundary?.userToken ?? userToken ?? null;
+      const restartIsCurrent =
+        boundary?.isCurrent ?? (() => sessionId === piSessionIdRef.current);
+      if (!restartIsCurrent()) return;
+      // `piInfo` is panel-global and can briefly lag a conversation switch.
+      // Never tag another session's PID as intentionally stopped; that could
+      // hide a real crash in the newly selected conversation.
+      let currentPid =
+        piInfo?.sessionId === sessionId ? (piInfo.pid ?? undefined) : undefined;
+      if (typeof currentPid !== "number") {
+        try {
+          const info = await commands.piInfo(sessionId);
+          if (!restartIsCurrent()) return;
+          if (info.status === "ok") {
+            currentPid = info.data.pid ?? undefined;
+          }
+        } catch {}
+      }
+      if (typeof currentPid === "number") {
+        piIntentionallyStoppedPidsRef.current.add(currentPid);
+        setTimeout(() => {
+          piIntentionallyStoppedPidsRef.current.delete(currentPid);
+        }, 30_000);
+      } else if (piInfo?.sessionId === sessionId && piInfo.running) {
+        piStoppedIntentionallyRef.current = true;
+      }
 
-    const home = await homeDir();
-    const dir = await join(home, ".screenpipe", "pi-chat");
-    const result = await commands.piStart(
-      piSessionIdRef.current,
-      dir,
-      userToken ?? null,
-      providerConfig,
-    );
-    if (result.status !== "ok" || !result.data.running) {
-      throw new Error(result.status === "error" ? result.error : "Pi did not start");
-    }
-    setPiInfo(result.data);
-    piSessionSyncedRef.current = false;
-    setRunningConfigFromProviderConfig(providerConfig);
-    syncThinkingLevelAfterStart(piSessionIdRef.current);
-  }, [
-    piInfo?.pid,
-    piInfo?.running,
-    piIntentionallyStoppedPidsRef,
-    piSessionIdRef,
-    piSessionSyncedRef,
-    piStoppedIntentionallyRef,
-    setPiInfo,
-    setRunningConfigFromProviderConfig,
-    syncThinkingLevelAfterStart,
-    userToken,
-  ]);
+      const home = await homeDir();
+      if (!restartIsCurrent()) return;
+      const dir = await join(home, ".screenpipe", "pi-chat");
+      if (!restartIsCurrent()) return;
+      const result = await commands.piStart(
+        sessionId,
+        dir,
+        restartToken,
+        providerConfig,
+      );
+      if (!restartIsCurrent()) {
+        await commands.piStop(sessionId).catch(() => {});
+        return;
+      }
+      if (result.status !== "ok" || !result.data.running) {
+        throw new Error(
+          result.status === "error" ? result.error : "Pi did not start",
+        );
+      }
+      setPiInfo(result.data);
+      piSessionSyncedRef.current = false;
+      setRunningConfigFromProviderConfig(providerConfig);
+      syncThinkingLevelAfterStart(sessionId);
+    },
+    [
+      piInfo?.pid,
+      piInfo?.running,
+      piInfo?.sessionId,
+      piIntentionallyStoppedPidsRef,
+      piSessionIdRef,
+      piSessionSyncedRef,
+      piStoppedIntentionallyRef,
+      setPiInfo,
+      setRunningConfigFromProviderConfig,
+      syncThinkingLevelAfterStart,
+      userToken,
+    ],
+  );
+
+  const enqueuePresetSwitch = useCallback(
+    (task: () => Promise<void>) => {
+      const previousSwitch = piPresetSwitchPromiseRef.current;
+      let switchPromise: Promise<void>;
+      switchPromise = (previousSwitch ?? Promise.resolve())
+        .catch(() => {})
+        .then(task)
+        .finally(() => {
+          if (piPresetSwitchPromiseRef.current === switchPromise) {
+            piPresetSwitchPromiseRef.current = null;
+          }
+        });
+      piPresetSwitchPromiseRef.current = switchPromise;
+      return switchPromise;
+    },
+    [piPresetSwitchPromiseRef],
+  );
+
+  // Capture the provider-switch generation at render time, not when the
+  // passive effect eventually runs. A model selection can happen between
+  // those two points; that must make this render's context restart stale.
+  const renderedPresetSwitchRequestId = presetSwitchRequestIdRef.current;
+  const renderedSessionId = piSessionIdRef.current;
 
   useEffect(() => {
+    const contextRequestId = ++systemPromptRestartRequestIdRef.current;
     if (connections.length === 0 && appItems.length === 0) return;
     const config = buildProviderConfig();
     if (!config) return;
     const running = piRunningConfigRef.current;
     if (!running || running.systemPrompt === config.systemPrompt) return;
     if (piMessageIdRef.current) return;
-    restartCurrentPiSession(config)
-      .then(() => {
-        if (piRunningConfigRef.current) {
-          piRunningConfigRef.current = { ...piRunningConfigRef.current, systemPrompt: config.systemPrompt };
-        }
-      })
-      .catch(() => {});
+    const restartToken = userToken ?? null;
+    const isCurrent = () =>
+      systemPromptRestartRequestIdRef.current === contextRequestId &&
+      presetSwitchRequestIdRef.current === renderedPresetSwitchRequestId &&
+      piSessionIdRef.current === renderedSessionId;
+
+    void enqueuePresetSwitch(async () => {
+      if (!isCurrent()) return;
+      try {
+        await restartCurrentPiSession(config, {
+          sessionId: renderedSessionId,
+          userToken: restartToken,
+          isCurrent,
+        });
+      } catch {
+        // A connection-context refresh is best effort. The next context change
+        // will retry without crossing a conversation or provider boundary.
+      }
+    });
+
+    return () => {
+      if (systemPromptRestartRequestIdRef.current === contextRequestId) {
+        systemPromptRestartRequestIdRef.current += 1;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allConnectionItems, appItems, connections]);
 
@@ -288,89 +403,139 @@ export function usePiSessionLifecycle({
     return () => clearInterval(interval);
   }, [piSessionIdRef, setPiInfo]);
 
-  const handlePiRestart = useCallback((preset: AIPreset) => {
-    if (isStreamingRef.current) {
-      pendingPresetRef.current = preset;
-      toast({ title: "model will switch after this response finishes" });
-      return;
-    }
+  const handlePiRestart = useCallback(
+    (preset: AIPreset) => {
+      const requestId = ++presetSwitchRequestIdRef.current;
+      if (isStreamingRef.current) {
+        pendingPresetRef.current = preset;
+        pendingPresetRequestIdRef.current = requestId;
+        const sessionId = piSessionIdRef.current;
+        pendingPresetInvalidationRef.current = commands
+          .piInvalidateQueuedPrompts(sessionId)
+          .then((result) => {
+            if (result.status === "ok") return true;
+            if (presetSwitchRequestIdRef.current !== requestId) return false;
+            console.error(
+              "[Pi] Could not establish provider boundary:",
+              result.error,
+            );
+            toast({
+              title: "could not switch model safely",
+              description:
+                "queued follow-ups were not cancelled. try again after this response finishes.",
+              variant: "destructive",
+            });
+            return false;
+          })
+          .catch((error) => {
+            if (presetSwitchRequestIdRef.current !== requestId) return false;
+            console.error("[Pi] Could not establish provider boundary:", error);
+            toast({
+              title: "could not switch model safely",
+              description:
+                "queued follow-ups were not cancelled. try again after this response finishes.",
+              variant: "destructive",
+            });
+            return false;
+          });
+        toast({
+          title: "model will switch after this response finishes",
+          description:
+            "queued follow-ups were cancelled; resend them after the switch.",
+        });
+        return;
+      }
 
-    const providerConfig = buildProviderConfig(preset);
-    if (!providerConfig) return;
+      const providerConfig = buildProviderConfig(preset);
+      if (!providerConfig) return;
 
-    const running = piRunningConfigRef.current;
-    const providerChanged = !running || running.provider !== providerConfig.provider;
-    const modelChanged = !running || running.model !== providerConfig.model;
-    const spawnTimeFieldsChanged =
-      !running ||
-      running.url !== providerConfig.url ||
-      running.apiKey !== providerConfig.apiKey ||
-      running.maxTokens !== providerConfig.maxTokens ||
-      running.systemPrompt !== providerConfig.systemPrompt ||
-      running.token !== (userToken ?? null);
+      const running = piRunningConfigRef.current;
+      const providerChanged =
+        !running || running.provider !== providerConfig.provider;
+      const modelChanged = !running || running.model !== providerConfig.model;
+      const spawnTimeFieldsChanged =
+        !running ||
+        providerChanged ||
+        running.url !== providerConfig.url ||
+        running.apiKey !== providerConfig.apiKey ||
+        running.maxTokens !== providerConfig.maxTokens ||
+        running.systemPrompt !== providerConfig.systemPrompt ||
+        running.token !== (userToken ?? null);
 
-    if (!providerChanged && !modelChanged && !spawnTimeFieldsChanged) {
-      return;
-    }
+      if (!providerChanged && !modelChanged && !spawnTimeFieldsChanged) {
+        return;
+      }
 
-    const enqueuePresetSwitch = (task: () => Promise<void>) => {
-      const previousSwitch = piPresetSwitchPromiseRef.current;
-      let switchPromise: Promise<void>;
-      switchPromise = (previousSwitch ?? Promise.resolve())
-        .catch(() => {})
-        .then(task)
-        .finally(() => {
-          if (piPresetSwitchPromiseRef.current === switchPromise) {
-            piPresetSwitchPromiseRef.current = null;
+      if (!spawnTimeFieldsChanged && (providerChanged || modelChanged)) {
+        console.log(
+          "[Pi] Hot-swap model:",
+          providerConfig.provider,
+          providerConfig.model,
+        );
+        enqueuePresetSwitch(async () => {
+          try {
+            const result = await commands.piSetModel(
+              piSessionIdRef.current,
+              providerConfig,
+            );
+            if (result.status === "error") {
+              throw new Error(String(result.error));
+            }
+            setRunningConfigFromProviderConfig(providerConfig);
+            commands.piRequestState(piSessionIdRef.current).catch(() => {});
+          } catch (error) {
+            console.error(
+              "[Pi] Hot-swap failed, falling back to full restart:",
+              error,
+            );
+            try {
+              await restartCurrentPiSession(providerConfig);
+            } catch (restartError) {
+              console.error("[Pi] Fallback restart also failed:", restartError);
+            }
           }
         });
-      piPresetSwitchPromiseRef.current = switchPromise;
-      return switchPromise;
-    };
+        return;
+      }
 
-    if (!spawnTimeFieldsChanged && (providerChanged || modelChanged)) {
-      console.log("[Pi] Hot-swap model:", providerConfig.provider, providerConfig.model);
+      console.log(
+        "[Pi] Full restart (spawn-time field changed):",
+        providerConfig.provider,
+        providerConfig.model,
+      );
       enqueuePresetSwitch(async () => {
         try {
-          await commands.piSetModel(piSessionIdRef.current, providerConfig);
-          setRunningConfigFromProviderConfig(providerConfig);
-          commands.piRequestState(piSessionIdRef.current).catch(() => {});
+          await restartCurrentPiSession(providerConfig);
         } catch (error) {
-          console.error("[Pi] Hot-swap failed, falling back to full restart:", error);
-          try {
-            await restartCurrentPiSession(providerConfig);
-          } catch (restartError) {
-            console.error("[Pi] Fallback restart also failed:", restartError);
-          }
+          console.error("[Pi] Preset switch failed:", error);
         }
       });
-      return;
-    }
-
-    console.log("[Pi] Full restart (spawn-time field changed):", providerConfig.provider, providerConfig.model);
-    enqueuePresetSwitch(async () => {
-      try {
-        await restartCurrentPiSession(providerConfig);
-      } catch (error) {
-        console.error("[Pi] Preset switch failed:", error);
-      }
-    });
-  }, [
-    buildProviderConfig,
-    isStreamingRef,
-    piPresetSwitchPromiseRef,
-    piRunningConfigRef,
-    piSessionIdRef,
-    restartCurrentPiSession,
-    setRunningConfigFromProviderConfig,
-    userToken,
-  ]);
+    },
+    [
+      buildProviderConfig,
+      enqueuePresetSwitch,
+      isStreamingRef,
+      piRunningConfigRef,
+      piSessionIdRef,
+      restartCurrentPiSession,
+      setRunningConfigFromProviderConfig,
+      userToken,
+    ],
+  );
 
   useEffect(() => {
     if (!isStreaming && pendingPresetRef.current) {
       const preset = pendingPresetRef.current;
+      const invalidation =
+        pendingPresetInvalidationRef.current ?? Promise.resolve(true);
+      const requestId = pendingPresetRequestIdRef.current;
       pendingPresetRef.current = null;
-      handlePiRestart(preset);
+      pendingPresetInvalidationRef.current = null;
+      void invalidation.then((safeToSwitch) => {
+        if (safeToSwitch && presetSwitchRequestIdRef.current === requestId) {
+          handlePiRestart(preset);
+        }
+      });
     }
   }, [handlePiRestart, isStreaming]);
 

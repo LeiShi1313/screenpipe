@@ -23,7 +23,7 @@ use specta::Type;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::ChildStdin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
@@ -59,6 +59,11 @@ pub struct PiCommand {
     /// Set on user-prompt commands so the queue can publish "what's pending"
     /// to subscribers. None for new_session / abort / internal commands.
     pub prompt_meta: Option<PiQueuedPrompt>,
+    /// Provider generation captured when a user prompt entered the queue.
+    /// A model/provider switch bumps the generation before changing Pi's
+    /// active model, so every still-pending prompt from the prior provider is
+    /// rejected instead of silently running with the newly selected payer.
+    pub prompt_epoch: Option<u64>,
 }
 
 /// How the queue waits after writing a command to stdin.
@@ -138,6 +143,13 @@ pub struct PiQueueState {
     /// boundaries, so this keeps Rust from treating the turn as complete while
     /// the shell/read/edit tool is still running.
     active_tool_calls: std::sync::Mutex<HashSet<String>>,
+    /// Monotonic boundary for queued user prompts. Non-prompt RPC commands do
+    /// not participate because they are used to perform the boundary itself.
+    provider_epoch: AtomicU64,
+    /// Serializes prompt admission against provider invalidation. The stdin
+    /// mutex then provides the final linearization point against an actual
+    /// prompt write already leaving the queue.
+    prompt_epoch_transition: Mutex<()>,
 }
 
 impl PiQueueState {
@@ -154,6 +166,8 @@ impl PiQueueState {
             agent_active: AtomicBool::new(false),
             steer_in_flight: AtomicBool::new(false),
             active_tool_calls: std::sync::Mutex::new(HashSet::new()),
+            provider_epoch: AtomicU64::new(0),
+            prompt_epoch_transition: Mutex::new(()),
         })
     }
 
@@ -327,9 +341,34 @@ impl PiQueueState {
             false
         }
     }
+
+    fn current_provider_epoch(&self) -> u64 {
+        self.provider_epoch.load(Ordering::SeqCst)
+    }
+
+    fn is_prompt_epoch_current(&self, epoch: Option<u64>) -> bool {
+        match epoch {
+            Some(epoch) => epoch == self.current_provider_epoch(),
+            None => true,
+        }
+    }
+
+    fn invalidate_provider_epoch(&self) -> usize {
+        self.provider_epoch.fetch_add(1, Ordering::SeqCst);
+        let visible = self.queued.borrow().len();
+        self.queued.send_modify(|queued| queued.clear());
+        if let Ok(mut payloads) = self.queued_payloads.lock() {
+            payloads.clear();
+        }
+        visible
+    }
 }
 
 impl PiQueueHandle {
+    pub fn provider_epoch_snapshot(&self) -> u64 {
+        self.state.current_provider_epoch()
+    }
+
     /// Send a non-prompt command (new_session / abort wrapper / internal).
     /// These don't appear in the queued-prompts UI.
     pub async fn send(
@@ -344,6 +383,7 @@ impl PiQueueHandle {
                 wait_mode,
                 reply: tx,
                 prompt_meta: None,
+                prompt_epoch: None,
             }))
             .await
             .map_err(|_| "Pi command queue closed".to_string())?;
@@ -361,6 +401,11 @@ impl PiQueueHandle {
         preview: String,
         force_visible_queue: bool,
     ) -> Result<(String, oneshot::Receiver<Result<(), String>>), String> {
+        // Provider invalidation holds the same gate while bumping the epoch.
+        // This makes admission all-old or all-new; the drain loop still
+        // re-checks under stdin immediately before the irreversible write.
+        let _epoch_guard = self.state.prompt_epoch_transition.lock().await;
+        let prompt_epoch = self.state.current_provider_epoch();
         let id = format!("q_{}", uuid::Uuid::new_v4().simple());
         let queued_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -390,6 +435,7 @@ impl PiQueueHandle {
                 wait_mode,
                 reply: tx,
                 prompt_meta: Some(meta),
+                prompt_epoch: Some(prompt_epoch),
             }))
             .await
             .is_err()
@@ -400,6 +446,56 @@ impl PiQueueHandle {
             return Err("Pi command queue closed".to_string());
         }
         Ok((id, rx))
+    }
+
+    /// Cancel every user prompt that has not crossed the stdin write boundary
+    /// yet, and advance the provider generation. Holding stdin while the epoch
+    /// changes means a racing drain has exactly two outcomes: it wrote under
+    /// the old provider first, or it observes the new epoch and rejects.
+    pub async fn invalidate_pending_prompts(&self) -> Result<usize, String> {
+        let _epoch_guard = self.state.prompt_epoch_transition.lock().await;
+        let stdin = self
+            .stdin
+            .as_ref()
+            .ok_or("Pi stdin is not available".to_string())?;
+        let _stdin_guard = stdin.lock().await;
+        let invalidated = self.state.invalidate_provider_epoch();
+        self.state.done_notify.notify_waiters();
+        Ok(invalidated)
+    }
+
+    /// Advance the provider boundary and enqueue the model-switch RPC before
+    /// admitting any prompt from the new generation. This preserves FIFO:
+    /// stale prompts are rejected, then set_model runs, then new prompts may
+    /// enter the channel.
+    pub async fn send_after_invalidating_prompts(
+        &self,
+        payload: Value,
+        wait_mode: WaitMode,
+    ) -> Result<(usize, oneshot::Receiver<Result<(), String>>), String> {
+        let _epoch_guard = self.state.prompt_epoch_transition.lock().await;
+        let stdin = self
+            .stdin
+            .as_ref()
+            .ok_or("Pi stdin is not available".to_string())?;
+        let invalidated = {
+            let _stdin_guard = stdin.lock().await;
+            self.state.invalidate_provider_epoch()
+        };
+        self.state.done_notify.notify_waiters();
+
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(QueueMessage::Command(PiCommand {
+                payload,
+                wait_mode,
+                reply: tx,
+                prompt_meta: None,
+                prompt_epoch: None,
+            }))
+            .await
+            .map_err(|_| "Pi command queue closed".to_string())?;
+        Ok((invalidated, rx))
     }
 
     /// Remove a queued prompt and return its original command payload. Used
@@ -446,6 +542,44 @@ impl PiQueueHandle {
             if cmd_type == "steer" {
                 self.state.clear_steer_in_flight();
             }
+        }
+        write_result.map_err(|e| format!("stdin write failed: {}", e))
+    }
+
+    /// Provider-bound immediate write used by steering. The caller snapshots
+    /// the epoch before any async context preparation, then this method admits
+    /// and writes under the same transition gate as provider invalidation.
+    pub async fn send_immediate_for_provider_epoch(
+        &self,
+        mut payload: Value,
+        expected_epoch: u64,
+    ) -> Result<(), String> {
+        let _epoch_guard = self.state.prompt_epoch_transition.lock().await;
+        if self.state.current_provider_epoch() != expected_epoch {
+            return Err("provider_changed".to_string());
+        }
+        let stdin = self
+            .stdin
+            .as_ref()
+            .ok_or("Pi stdin is not available".to_string())?;
+        let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("id".to_string(), json!(&req_id));
+        }
+        let cmd_type = payload
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let cmd_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+        if cmd_type == "steer" {
+            self.state.set_steer_in_flight();
+        }
+        let mut stdin_guard = stdin.lock().await;
+        let write_result = writeln!(*stdin_guard, "{}", cmd_str)
+            .and_then(|_| stdin_guard.flush());
+        if write_result.is_err() && cmd_type == "steer" {
+            self.state.clear_steer_in_flight();
         }
         write_result.map_err(|e| format!("stdin write failed: {}", e))
     }
@@ -575,6 +709,14 @@ pub fn spawn_queue(
                     let prompt_id = cmd.prompt_meta.as_ref().map(|m| m.id.clone());
                     let is_prompt = prompt_id.is_some();
 
+                    if !state.is_prompt_epoch_current(cmd.prompt_epoch) {
+                        if let Some(pid) = &prompt_id {
+                            state.dequeue_prompt(pid);
+                        }
+                        let _ = cmd.reply.send(Err("provider_changed".to_string()));
+                        continue;
+                    }
+
                     // Tombstone check — if the user cancelled this prompt
                     // while it was sitting in the channel, drop it without
                     // ever writing to Pi.
@@ -668,9 +810,27 @@ pub fn spawn_queue(
                         }
                     }
 
+                    if !state.is_prompt_epoch_current(cmd.prompt_epoch) {
+                        if let Some(pid) = &prompt_id {
+                            state.dequeue_prompt(pid);
+                        }
+                        let _ = cmd.reply.send(Err("provider_changed".to_string()));
+                        continue;
+                    }
+
                     // Write to stdin
                     let write_result = {
                         let mut stdin_guard = stdin.lock().await;
+                        // Provider invalidation uses this same stdin lock as
+                        // its linearization point. Re-check after acquiring it
+                        // so an old prompt can never cross a completed switch.
+                        if !state.is_prompt_epoch_current(cmd.prompt_epoch) {
+                            if let Some(pid) = &prompt_id {
+                                state.dequeue_prompt(pid);
+                            }
+                            let _ = cmd.reply.send(Err("provider_changed".to_string()));
+                            continue;
+                        }
                         let cmd_str =
                             serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
                         info!(
@@ -1112,6 +1272,112 @@ mod tests {
         state.signal_terminated();
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A provider switch must invalidate both the prompt already pulled from
+    /// mpsc and parked behind the active turn, and every prompt still waiting
+    /// in the channel. Neither may cross stdin after the epoch bump.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_provider_invalidation_rejects_all_pending_prompt_epochs() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat as a fake pi stdin");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("child stdin")));
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        state.mark_agent_active();
+        let (_first_id, first_rx) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "text": "provider-a-first" }),
+                WaitMode::Prompt,
+                "provider-a-first".to_string(),
+                true,
+            )
+            .await
+            .expect("enqueue first provider-a prompt");
+        let (_second_id, second_rx) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "text": "provider-a-second" }),
+                WaitMode::Prompt,
+                "provider-a-second".to_string(),
+                true,
+            )
+            .await
+            .expect("enqueue second provider-a prompt");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let invalidated = handle
+            .invalidate_pending_prompts()
+            .await
+            .expect("establish provider boundary");
+        assert_eq!(invalidated, 2);
+        assert!(state.queued_snapshot().is_empty());
+
+        state.mark_agent_idle();
+        state.signal_done();
+
+        for reply in [first_rx, second_rx] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), reply)
+                .await
+                .expect("stale prompt reply must resolve")
+                .expect("stale prompt reply channel stays open");
+            assert_eq!(result, Err("provider_changed".to_string()));
+        }
+
+        state.signal_terminated();
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_provider_invalidation_rejects_delayed_immediate_steer() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat as a fake pi stdin");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("child stdin")));
+        let (tx, _rx) = mpsc::channel::<QueueMessage>(8);
+        let state = PiQueueState::new();
+        let handle = PiQueueHandle {
+            tx,
+            stdin: Some(stdin),
+            state,
+        };
+
+        // pi_steer snapshots before async connection-context expansion. A
+        // provider switch that completes during that await must make the late
+        // write fail instead of retargeting the old instruction to provider B.
+        let provider_a_epoch = handle.provider_epoch_snapshot();
+        handle
+            .invalidate_pending_prompts()
+            .await
+            .expect("establish provider-b boundary");
+        let error = handle
+            .send_immediate_for_provider_epoch(
+                json!({"type": "steer", "message": "provider-a-private"}),
+                provider_a_epoch,
+            )
+            .await
+            .expect_err("late provider-a steer must be rejected");
+        assert_eq!(error, "provider_changed");
+
+        drop(handle);
         let _ = child.kill();
         let _ = child.wait();
     }

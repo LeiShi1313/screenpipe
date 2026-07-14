@@ -57,6 +57,7 @@ interface ComposerUtilityMenuProps {
   applyConnectionFilterTag: (tag: string) => void;
   applySpeakerFilterSuggestion: (suggestion: MentionSuggestion) => void;
   handleFilePicker: () => Promise<void>;
+  imagesAllowed: boolean;
 }
 
 export function ComposerUtilityMenu({
@@ -93,6 +94,7 @@ export function ComposerUtilityMenu({
   applyConnectionFilterTag,
   applySpeakerFilterSuggestion,
   handleFilePicker,
+  imagesAllowed,
 }: ComposerUtilityMenuProps) {
   const timeLabels: Record<string, string> = {
     "today's activity": "today",
@@ -143,7 +145,12 @@ export function ComposerUtilityMenu({
           className="w-full flex items-center gap-2 px-2 py-2 text-left text-sm rounded-md hover:bg-muted disabled:opacity-40 disabled:pointer-events-none transition-colors"
         >
           <Paperclip className="h-4 w-4 text-muted-foreground shrink-0" />
-          <span>add photos & files</span>
+          <span>{imagesAllowed ? "add photos & files" : "add text files"}</span>
+          {!imagesAllowed ? (
+            <span className="ml-auto text-[10px] text-muted-foreground">
+              images need your AI or Business
+            </span>
+          ) : null}
         </button>
       </div>
 

@@ -776,12 +776,20 @@ pub async fn render_context(
                 base, def.id, suffix
             ));
         } else {
-            // No proxy config — fall back to raw credentials (webhook-style integrations)
-            for (key, value) in creds {
-                if let Some(s) = value.as_str() {
-                    out.push_str(&format!("  {}: {}\n", key, s));
+            // Never place secrets in an LLM prompt. Historically webhook and
+            // SMTP integrations without a proxy rendered every credential
+            // verbatim here (including webhook URLs, bot tokens, and SMTP app
+            // passwords). Expose only fields the integration schema explicitly
+            // marks non-secret; direct agent actions remain unavailable until
+            // that integration has a server-side proxy/action endpoint.
+            for field in def.fields.iter().filter(|field| !field.secret) {
+                if let Some(value) = creds.get(field.key).and_then(Value::as_str) {
+                    out.push_str(&format!("  {}: {}\n", field.key, value));
                 }
             }
+            out.push_str(
+                "  agent access: unavailable (this integration has no credential-safe proxy)\n",
+            );
         }
     }
 
@@ -997,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_context_includes_named_manual_instances() {
+    async fn render_context_names_manual_instances_without_exposing_secrets() {
         let dir = temp_screenpipe_dir();
         let mgr = ConnectionManager::new(dir.clone(), None);
 
@@ -1007,7 +1015,9 @@ mod tests {
 
         let context = render_context(&dir, 3030, None).await;
         assert!(context.contains("## Discord (discord, instance: work)"));
-        assert!(context.contains("webhook_url: https://example.com/webhook"));
+        assert!(!context.contains("https://example.com/webhook"));
+        assert!(!context.contains("webhook_url:"));
+        assert!(context.contains("credential-safe proxy"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

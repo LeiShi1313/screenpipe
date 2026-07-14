@@ -107,6 +107,7 @@ export function ComposerControlsRow({
             applyConnectionFilterTag={filters.applyConnectionFilterTag}
             applySpeakerFilterSuggestion={filters.applySpeakerFilterSuggestion}
             handleFilePicker={filters.onPickFiles}
+            imagesAllowed={filters.imagesAllowed}
           />
         </PopoverContent>
       </Popover>

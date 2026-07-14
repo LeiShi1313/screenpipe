@@ -4,9 +4,7 @@
 
 import { useRef, useState } from "react";
 import type { PiInfo } from "@/lib/utils/tauri";
-import type {
-  ContentBlock,
-} from "@/lib/chat/types";
+import type { ContentBlock } from "@/lib/chat/types";
 
 type PiRunningConfig = {
   provider: string;
@@ -33,7 +31,11 @@ export function usePiChatState() {
   const invalidatedAuthHandledRef = useRef(false);
   const piStartInFlightRef = useRef(false);
   const sendDispatchInFlightRef = useRef(false);
+  const sendDispatchOwnerRef = useRef<string | null>(null);
   const forceQueueModeRef = useRef(false);
+  // Invalidates delayed work whenever the foreground account/conversation
+  // boundary changes. Late completions may not mutate the next session's locks.
+  const piAsyncOperationGenerationRef = useRef(0);
   const piFirstCallRetried = useRef(false);
   // Per-turn 429 auto-retry budget; reset on each new user send + on success.
   const piRateLimitRetries = useRef(0);
@@ -75,7 +77,9 @@ export function usePiChatState() {
     invalidatedAuthHandledRef,
     piStartInFlightRef,
     sendDispatchInFlightRef,
+    sendDispatchOwnerRef,
     forceQueueModeRef,
+    piAsyncOperationGenerationRef,
     piFirstCallRetried,
     piRateLimitRetries,
     sessionActivityLastEmitAtRef,

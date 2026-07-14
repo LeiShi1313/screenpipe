@@ -70,6 +70,7 @@ import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/me
 import type { MeetingRecord } from "@/lib/utils/meeting-format";
 import { useRouter } from "next/navigation";
 import { appendAuthToken, ensureApiReady, getApiBaseUrl, localFetch } from "@/lib/api";
+import { buildAiSettingsRoute } from "@/lib/chat/free-tier-provider-setup";
 import {
   Tooltip,
   TooltipContent,
@@ -168,7 +169,8 @@ function HomeContent() {
       const section = activeSection === "disk-usage" || activeSection === "cloud-archive" || activeSection === "cloud-sync"
         ? "storage"
         : activeSection;
-      router.push(`/settings?section=${section}`);
+      const setup = new URLSearchParams(window.location.search).get("setup");
+      router.push(buildAiSettingsRoute(section, setup));
     }
   }, [activeSection, router]);
 
@@ -886,7 +888,7 @@ function HomeContent() {
     if (SETTINGS_SECTIONS.has(section)) {
       const mapped = section === "disk-usage" || section === "cloud-archive" || section === "cloud-sync"
         ? "storage" : section;
-      router.push(`/settings?section=${mapped}`);
+      router.push(buildAiSettingsRoute(mapped, url.searchParams.get("setup")));
     } else {
       const mapped = section === "feedback" ? "help" : section;
       if (ALL_SECTIONS.includes(mapped)) setActiveSection(mapped);

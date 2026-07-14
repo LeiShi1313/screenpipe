@@ -157,8 +157,11 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
   userRef.current = settings.user;
 
   const handleSessionExpired = useCallback(
-    async (context?: { source?: string; status?: number | null }) => {
-      if (!tokenRef.current) return; // already signed out
+    async (
+      context?: { source?: string; status?: number | null },
+      expectedToken: string | null | undefined = tokenRef.current,
+    ) => {
+      if (!expectedToken || tokenRef.current !== expectedToken) return;
       console.warn("auth-guard: session expired, clearing");
       // Capture WHY the session dropped so a transient post-update 401 (token
       // briefly invalid while the encrypted secret store re-hydrates) can be
@@ -168,10 +171,18 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
         source: context?.source ?? "verify_token",
         status: context?.status ?? null,
       });
-      await updateSettings({ user: stripSessionToken(userRef.current) as any });
       try {
-        await commands.setCloudToken(null);
-      } catch {}
+        const result = await commands.setCloudToken(null, expectedToken, false);
+        if (result?.status === "error") {
+          console.warn("auth-guard: native token persistence failed after runtime clear", result.error);
+          return;
+        }
+      } catch (error) {
+        console.warn("auth-guard: failed to clear native session; preserving UI identity", error);
+        return;
+      }
+      if (tokenRef.current !== expectedToken) return;
+      await updateSettings({ user: stripSessionToken(userRef.current) as any });
       showSignedOutToast();
     },
     [updateSettings],
@@ -200,7 +211,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
         await handleSessionExpired({
           source: "verify_token",
           status: msg.includes(" 403 ") ? 403 : 401,
-        });
+        }, token);
       }
     }
   }, [loadUser, handleSessionExpired]);
@@ -245,7 +256,7 @@ let _patched = false;
 
 export function installAuthInterceptor(
   getToken: () => string | undefined,
-  clearSession: () => Promise<void>
+  clearSession: (expectedToken: string) => Promise<void>
 ) {
   if (_patched || typeof window === "undefined") return;
   _patched = true;
@@ -256,6 +267,7 @@ export function installAuthInterceptor(
     input: RequestInfo | URL,
     init?: RequestInit
   ): Promise<Response> {
+    const requestToken = getToken();
     const res = await originalFetch.call(this, input, init);
 
     const url =
@@ -266,8 +278,7 @@ export function installAuthInterceptor(
           : input.url;
 
     if (isScreenpipeAuthApi(url) && (res.status === 401 || res.status === 403)) {
-      const token = getToken();
-      if (token) {
+      if (requestToken && getToken() === requestToken) {
         console.warn("auth-interceptor: 401 from", url);
         // Record which endpoint 401'd so we can pinpoint the trigger of the
         // post-update session loop (SCR-132) — host + path only, never the
@@ -288,7 +299,7 @@ export function installAuthInterceptor(
           api_host: apiHost,
           api_path: apiPath,
         });
-        await clearSession();
+        await clearSession(requestToken);
         showSignedOutToast();
       }
     }

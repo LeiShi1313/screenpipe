@@ -5,11 +5,7 @@
 import { describe, expect, it } from 'bun:test';
 import type { RequestBody } from '../types';
 import { isFrontierModel } from '../services/cost-tracker';
-import {
-	FREE_PREVIEW_WATERFALL,
-	selectAutoWaterfall,
-	shouldUseDifficultyRouter,
-} from '../handlers/chat';
+import { FREE_PREVIEW_WATERFALL, normalizeFreePreviewModel, selectAutoWaterfall, shouldUseDifficultyRouter } from '../handlers/chat';
 
 const textBody = (freePreview: boolean): RequestBody => ({
 	model: 'auto',
@@ -36,5 +32,15 @@ describe('server-funded preview routing', () => {
 	it('never invokes difficulty promotion for a preview request', () => {
 		expect(shouldUseDifficultyRouter(textBody(true), 'interactive')).toBe(false);
 		expect(shouldUseDifficultyRouter(textBody(false), 'interactive')).toBe(true);
+	});
+
+	it('forces the internal preview marker back onto auto before provider routing', () => {
+		const explicitPaidModel = {
+			...textBody(true),
+			model: 'claude-opus-4-6',
+		};
+		const normalized = normalizeFreePreviewModel(explicitPaidModel);
+		expect(normalized.model).toBe('auto');
+		expect(selectAutoWaterfall(normalized, 'interactive')).toBe(FREE_PREVIEW_WATERFALL);
 	});
 });

@@ -51,7 +51,7 @@ interface UseChatComposerShellActionsOptions {
   isKnownConnectionId: (id: string) => boolean;
   handlePastedFiles: (clipboard: DataTransfer) => boolean;
   attachPastedText: (text: string) => boolean;
-  sendMessage: (message: string, displayLabel?: string) => Promise<void>;
+  sendMessage: (message: string, displayLabel?: string) => Promise<boolean>;
   steerMessage: (message: string) => Promise<void>;
   steerQueuedPrompt: (prompt: PiQueuedPrompt) => Promise<unknown> | unknown;
 }

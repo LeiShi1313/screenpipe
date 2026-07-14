@@ -46,31 +46,36 @@ export type ReservationResult =
 	| { applies: false }
 	| { applies: true; allowed: false; limit: number; used: number; reason: FreeChatBlockedReason }
 	| {
-		applies: true;
-		allowed: true;
-		limit: number;
-		used: number;
-		remaining: number;
-		turnHash: string;
-		leaseToken: string;
-		isNew: boolean;
-	};
+			applies: true;
+			allowed: true;
+			limit: number;
+			used: number;
+			remaining: number;
+			turnHash: string;
+			leaseToken: string;
+			isNew: boolean;
+	  };
 
 export type FreeChatRequestValidation =
-	| { ok: true }
-	| { ok: false; status: 403 | 413 | 426; error: string; message: string; limit?: number };
+	{ ok: true } | { ok: false; status: 403 | 413 | 426; error: string; message: string; limit?: number };
 
 export type FreeChatShadowBudgetReservation =
 	| {
-		allowed: true;
-		limitMicroUsd: number;
-		reservedMicroUsd: number;
-	}
+			allowed: true;
+			limitMicroUsd: number;
+			reservedMicroUsd: number;
+	  }
 	| {
-		allowed: false;
-		limitMicroUsd: number;
-		usedMicroUsd: number;
-	};
+			allowed: false;
+			limitMicroUsd: number;
+			usedMicroUsd: number;
+	  };
+
+export type FreeChatUsageStatus = {
+	used: number;
+	limit: number;
+	remaining: number;
+};
 
 type TurnState = {
 	status: 'pending' | 'completed';
@@ -95,7 +100,10 @@ function normalizeIpv4(value: string): string | null {
 }
 
 function normalizeIpv6(value: string): string | null {
-	const stripped = value.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+	const stripped = value
+		.toLowerCase()
+		.replace(/^\[|\]$/g, '')
+		.split('%')[0];
 	if (!stripped.includes(':')) return null;
 	const halves = stripped.split('::');
 	if (halves.length > 2) return null;
@@ -114,7 +122,10 @@ function normalizeIpv6(value: string): string | null {
 	if (missing < 0 || (halves.length === 1 && missing !== 0)) return null;
 	const parts = [...leftExpanded, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...rightExpanded];
 	if (parts.length !== 8 || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return null;
-	return `${parts.slice(0, 4).map((part) => Number.parseInt(part, 16).toString(16).padStart(4, '0')).join(':')}::/64`;
+	return `${parts
+		.slice(0, 4)
+		.map((part) => Number.parseInt(part, 16).toString(16).padStart(4, '0'))
+		.join(':')}::/64`;
 }
 
 export function normalizeFreeChatNetwork(value: string): string | null {
@@ -123,8 +134,7 @@ export function normalizeFreeChatNetwork(value: string): string | null {
 }
 
 export async function hashFreeChatNetwork(env: Env, request: Request): Promise<string | null> {
-	const rawIp = request.headers.get('cf-connecting-ip')
-		?? (env.NODE_ENV === 'production' ? null : '127.0.0.1');
+	const rawIp = request.headers.get('cf-connecting-ip') ?? (env.NODE_ENV === 'production' ? null : '127.0.0.1');
 	const network = rawIp ? normalizeFreeChatNetwork(rawIp) : null;
 	if (!network || !env.CLERK_SECRET_KEY) return null;
 	const key = await crypto.subtle.importKey(
@@ -171,33 +181,18 @@ export function getFreeChatGlobalDailyShadowBudgetMicroUsd(env: Env): number {
 }
 
 function getMaxRequestsPerTurn(env: Env): number {
-	return boundedInteger(
-		env.FREE_CHAT_MAX_REQUESTS_PER_TURN,
-		DEFAULT_FREE_CHAT_MAX_REQUESTS_PER_TURN,
-		1,
-		MAX_CONFIGURED_REQUESTS_PER_TURN,
-	);
+	return boundedInteger(env.FREE_CHAT_MAX_REQUESTS_PER_TURN, DEFAULT_FREE_CHAT_MAX_REQUESTS_PER_TURN, 1, MAX_CONFIGURED_REQUESTS_PER_TURN);
 }
 
 function getFollowupMinutes(env: Env): number {
-	return boundedInteger(
-		env.FREE_CHAT_FOLLOWUP_MINUTES,
-		DEFAULT_FREE_CHAT_FOLLOWUP_MINUTES,
-		1,
-		MAX_CONFIGURED_FOLLOWUP_MINUTES,
-	);
+	return boundedInteger(env.FREE_CHAT_FOLLOWUP_MINUTES, DEFAULT_FREE_CHAT_FOLLOWUP_MINUTES, 1, MAX_CONFIGURED_FOLLOWUP_MINUTES);
 }
 
 function getLeaseSeconds(env: Env): number {
-	return boundedInteger(
-		env.FREE_CHAT_LEASE_SECONDS,
-		DEFAULT_FREE_CHAT_LEASE_SECONDS,
-		30,
-		MAX_CONFIGURED_LEASE_SECONDS,
-	);
+	return boundedInteger(env.FREE_CHAT_LEASE_SECONDS, DEFAULT_FREE_CHAT_LEASE_SECONDS, 30, MAX_CONFIGURED_LEASE_SECONDS);
 }
 
-function getMaxInputBytes(env: Env): number {
+export function getFreeChatMaxInputBytes(env: Env): number {
 	return boundedInteger(
 		env.FREE_CHAT_MAX_INPUT_BYTES ?? env.FREE_CHAT_MAX_INPUT_CHARS,
 		DEFAULT_FREE_CHAT_MAX_INPUT_BYTES,
@@ -207,12 +202,7 @@ function getMaxInputBytes(env: Env): number {
 }
 
 function getMaxOutputTokens(env: Env): number {
-	return boundedInteger(
-		env.FREE_CHAT_MAX_OUTPUT_TOKENS,
-		DEFAULT_FREE_CHAT_MAX_OUTPUT_TOKENS,
-		256,
-		MAX_CONFIGURED_OUTPUT_TOKENS,
-	);
+	return boundedInteger(env.FREE_CHAT_MAX_OUTPUT_TOKENS, DEFAULT_FREE_CHAT_MAX_OUTPUT_TOKENS, 256, MAX_CONFIGURED_OUTPUT_TOKENS);
 }
 
 function getNetworkDailyTurnLimit(env: Env): number {
@@ -256,14 +246,12 @@ export async function hashFreeChatTurn(messages: Message[]): Promise<string | nu
 
 export function hasFreeChatTurnMarker(messages: Message[]): boolean {
 	const content = latestUserTurnContent(messages);
-	return content !== null && /<!-- screenpipe-cloud-turn:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12} -->/i.test(content);
+	return (
+		content !== null && /<!-- screenpipe-cloud-turn:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12} -->/i.test(content)
+	);
 }
 
-export function freeChatTurnPolicyApplies(
-	tier: UserTier,
-	userId: string | undefined,
-	isBackground: boolean,
-): boolean {
+export function freeChatTurnPolicyApplies(tier: UserTier, userId: string | undefined, isBackground: boolean): boolean {
 	return tier === 'logged_in' && Boolean(userId) && !isBackground;
 }
 
@@ -275,7 +263,7 @@ export function freeChatTurnPolicyApplies(
  * non-text content is rejected. That gives shadow-cost accounting a strict
  * request-size ceiling even for Unicode, base64, files, and vision inputs.
  */
-export function prepareFreeChatRequest(env: Env, body: RequestBody): FreeChatRequestValidation {
+export function prepareFreeChatRequest(env: Env, body: RequestBody, rawInputBytes?: number): FreeChatRequestValidation {
 	if (body.model.trim().toLowerCase() !== 'auto') {
 		return {
 			ok: false,
@@ -289,7 +277,8 @@ export function prepareFreeChatRequest(env: Env, body: RequestBody): FreeChatReq
 			ok: false,
 			status: 426,
 			error: 'free_chat_client_update_required',
-			message: 'Update screenpipe to use the included hosted preview safely. Local and user-provided AI remain available on older versions.',
+			message:
+				'Update screenpipe to use the included hosted preview safely. Local and user-provided AI remain available on older versions.',
 		};
 	}
 
@@ -307,13 +296,8 @@ export function prepareFreeChatRequest(env: Env, body: RequestBody): FreeChatReq
 		}
 		if (typeof message.content === 'string') continue;
 		if (
-			!Array.isArray(message.content)
-			|| message.content.some((part) => (
-				!part
-				|| typeof part !== 'object'
-				|| part.type !== 'text'
-				|| typeof part.text !== 'string'
-			))
+			!Array.isArray(message.content) ||
+			message.content.some((part) => !part || typeof part !== 'object' || part.type !== 'text' || typeof part.text !== 'string')
 		) {
 			return {
 				ok: false,
@@ -324,8 +308,12 @@ export function prepareFreeChatRequest(env: Env, body: RequestBody): FreeChatReq
 		}
 	}
 
-	const maxInputBytes = getMaxInputBytes(env);
-	const serializedBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+	const maxInputBytes = getFreeChatMaxInputBytes(env);
+	const canonicalBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+	// The route supplies exact pre-parse wire bytes. Keep the canonical fallback
+	// in the comparison so another internal caller cannot weaken the limit by
+	// accidentally passing an undercounted value.
+	const serializedBytes = Math.max(rawInputBytes ?? 0, canonicalBytes);
 	if (serializedBytes > maxInputBytes) {
 		return {
 			ok: false,
@@ -335,6 +323,12 @@ export function prepareFreeChatRequest(env: Env, body: RequestBody): FreeChatReq
 			limit: maxInputBytes,
 		};
 	}
+
+	// Canonicalize only after measuring the original wire-shaped body. Validation
+	// deliberately accepts harmless case/whitespace variants, but measuring after
+	// this rewrite would let a huge whitespace-padded model evade the request-size
+	// ceiling. Downstream routing still receives the exact safe `auto` spelling.
+	body.model = 'auto';
 
 	const maxOutputTokens = getMaxOutputTokens(env);
 	const requestedMaxTokens = Number.isFinite(body.max_tokens) ? Math.max(1, body.max_tokens!) : maxOutputTokens;
@@ -394,14 +388,19 @@ export async function reserveFreeChatTurn(
 
 	// Refund an initial request only if it never completed and both its fixed
 	// turn window and lease have expired. Completed turns are lifetime records.
-	await env.DB.prepare(`
+	await env.DB.prepare(
+		`
 		DELETE FROM free_chat_turns
 		WHERE user_id = ? AND status = 'pending'
 		  AND followup_expires_at <= CURRENT_TIMESTAMP
 		  AND (lease_token IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
-	`).bind(userId).run();
+	`,
+	)
+		.bind(userId)
+		.run();
 
-	const inserted = await env.DB.prepare(`
+	const inserted = await env.DB.prepare(
+		`
 		INSERT OR IGNORE INTO free_chat_turns (
 			user_id, turn_hash, status, request_count,
 			lease_token, lease_expires_at, followup_expires_at,
@@ -411,7 +410,10 @@ export async function reserveFreeChatTurn(
 			datetime('now', '+' || ? || ' seconds'),
 			datetime('now', '+' || ? || ' minutes'), date('now'), ?, 0, 0
 		WHERE (SELECT COUNT(*) FROM free_chat_turns WHERE user_id = ?) < ?
-	`).bind(userId, turnHash, leaseToken, leaseSeconds, followupMinutes, networkHash, userId, limit).run();
+	`,
+	)
+		.bind(userId, turnHash, leaseToken, leaseSeconds, followupMinutes, networkHash, userId, limit)
+		.run();
 
 	if ((inserted.meta?.changes ?? 0) === 1) {
 		if (!networkHash) {
@@ -420,42 +422,58 @@ export async function reserveFreeChatTurn(
 			return { applies: true, allowed: false, limit, used: Math.min(used, limit), reason: 'network_identity' };
 		}
 		try {
-			const globalReserved = await env.DB.prepare(`
+			const globalReserved = await env.DB.prepare(
+				`
 				INSERT INTO free_chat_global_daily (day, turn_count, updated_at)
 				VALUES (date('now'), 1, CURRENT_TIMESTAMP)
 				ON CONFLICT(day) DO UPDATE SET
 					turn_count = turn_count + 1,
 					updated_at = CURRENT_TIMESTAMP
 				WHERE free_chat_global_daily.turn_count < ?
-			`).bind(getGlobalDailyTurnLimit(env)).run();
+			`,
+			)
+				.bind(getGlobalDailyTurnLimit(env))
+				.run();
 			if ((globalReserved.meta?.changes ?? 0) !== 1) {
 				await releaseFreeChatTurn(env, userId, turnHash, leaseToken);
 				const used = await countReservedTurns(env, userId);
 				return { applies: true, allowed: false, limit, used: Math.min(used, limit), reason: 'global_limit' };
 			}
-			const globalMarked = await env.DB.prepare(`
+			const globalMarked = await env.DB.prepare(
+				`
 				UPDATE free_chat_turns SET global_counted = 1
 				WHERE user_id = ? AND turn_hash = ? AND lease_token = ? AND global_counted = 0
-			`).bind(userId, turnHash, leaseToken).run();
+			`,
+			)
+				.bind(userId, turnHash, leaseToken)
+				.run();
 			if ((globalMarked.meta?.changes ?? 0) !== 1) throw new Error('failed to finalize free chat global reservation');
 
-			const networkReserved = await env.DB.prepare(`
+			const networkReserved = await env.DB.prepare(
+				`
 				INSERT INTO free_chat_network_daily (network_hash, day, turn_count, updated_at)
 				VALUES (?, date('now'), 1, CURRENT_TIMESTAMP)
 				ON CONFLICT(network_hash, day) DO UPDATE SET
 					turn_count = turn_count + 1,
 					updated_at = CURRENT_TIMESTAMP
 				WHERE free_chat_network_daily.turn_count < ?
-			`).bind(networkHash, getNetworkDailyTurnLimit(env)).run();
+			`,
+			)
+				.bind(networkHash, getNetworkDailyTurnLimit(env))
+				.run();
 			if ((networkReserved.meta?.changes ?? 0) !== 1) {
 				await releaseFreeChatTurn(env, userId, turnHash, leaseToken);
 				const used = await countReservedTurns(env, userId);
 				return { applies: true, allowed: false, limit, used: Math.min(used, limit), reason: 'network_limit' };
 			}
-			const marked = await env.DB.prepare(`
+			const marked = await env.DB.prepare(
+				`
 				UPDATE free_chat_turns SET network_counted = 1
 				WHERE user_id = ? AND turn_hash = ? AND lease_token = ? AND network_counted = 0
-			`).bind(userId, turnHash, leaseToken).run();
+			`,
+			)
+				.bind(userId, turnHash, leaseToken)
+				.run();
 			if ((marked.meta?.changes ?? 0) !== 1) throw new Error('failed to finalize free chat network reservation');
 		} catch (error) {
 			// A partially applied migration or transient D1 error must not leave a
@@ -476,7 +494,8 @@ export async function reserveFreeChatTurn(
 		};
 	}
 
-	const acquired = await env.DB.prepare(`
+	const acquired = await env.DB.prepare(
+		`
 		UPDATE free_chat_turns
 		SET request_count = request_count + 1,
 			lease_token = ?,
@@ -487,7 +506,10 @@ export async function reserveFreeChatTurn(
 			  AND global_counted = 1
 			  AND network_counted = 1
 		  AND (lease_token IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
-	`).bind(leaseToken, leaseSeconds, userId, turnHash, maxRequests).run();
+	`,
+	)
+		.bind(leaseToken, leaseSeconds, userId, turnHash, maxRequests)
+		.run();
 
 	const used = await countReservedTurns(env, userId);
 	if ((acquired.meta?.changes ?? 0) === 1) {
@@ -503,12 +525,16 @@ export async function reserveFreeChatTurn(
 		};
 	}
 
-	const state = await env.DB.prepare(`
+	const state = await env.DB.prepare(
+		`
 		SELECT status, request_count,
 			CASE WHEN lease_token IS NOT NULL AND lease_expires_at > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS lease_active,
 			CASE WHEN followup_expires_at <= CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS followup_expired
 		FROM free_chat_turns WHERE user_id = ? AND turn_hash = ?
-	`).bind(userId, turnHash).first<TurnState>();
+	`,
+	)
+		.bind(userId, turnHash)
+		.first<TurnState>();
 
 	let reason: FreeChatBlockedReason = 'limit';
 	if (state?.followup_expired) reason = 'followup_expired';
@@ -519,10 +545,30 @@ export async function reserveFreeChatTurn(
 }
 
 async function countReservedTurns(env: Env, userId: string): Promise<number> {
-	const row = await env.DB.prepare(`
+	const row = await env.DB.prepare(
+		`
 		SELECT COUNT(*) AS count FROM free_chat_turns WHERE user_id = ?
-	`).bind(userId).first<{ count: number }>();
+	`,
+	)
+		.bind(userId)
+		.first<{ count: number }>();
 	return Number(row?.count ?? 0);
+}
+
+/** Read the authoritative lifetime preview counter without reserving a turn,
+ * touching abuse/shadow ledgers, or invoking inference. */
+export async function getFreeChatUsageStatus(env: Env, auth: AuthResult): Promise<FreeChatUsageStatus | null> {
+	if (
+		!isFreeLocalTierEnforcementEnabled(env) ||
+		!isFreeChatPreviewEnabled(env) ||
+		!freeChatTurnPolicyApplies(auth.tier, auth.userId, false)
+	) {
+		return null;
+	}
+	const limit = getFreeChatTurnLimit(env);
+	const counted = await countReservedTurns(env, auth.userId!);
+	const used = Math.min(counted, limit);
+	return { used, limit, remaining: Math.max(limit - used, 0) };
 }
 
 /**
@@ -547,7 +593,8 @@ export async function reserveFreeChatShadowBudget(
 
 	// One INSERT is the budget check and exact-lease reservation. D1 serializes
 	// the statement, so concurrent workers cannot both spend the final dollar.
-	const inserted = await env.DB.prepare(`
+	const inserted = await env.DB.prepare(
+		`
 		INSERT OR IGNORE INTO free_chat_shadow_reservations (
 			lease_token, user_id, turn_hash, day, amount_microusd, status
 		)
@@ -558,26 +605,22 @@ export async function reserveFreeChatShadowBudget(
 			FROM free_chat_shadow_reservations
 			WHERE day = date('now')
 		  ), 0) <= ? - ?
-	`).bind(
-		leaseToken,
-		userId,
-		turnHash,
-		reservedMicroUsd,
-		reservedMicroUsd,
-		limitMicroUsd,
-		limitMicroUsd,
-		reservedMicroUsd,
-	).run();
+	`,
+	)
+		.bind(leaseToken, userId, turnHash, reservedMicroUsd, reservedMicroUsd, limitMicroUsd, limitMicroUsd, reservedMicroUsd)
+		.run();
 
 	if ((inserted.meta?.changes ?? 0) === 1) {
 		return { allowed: true, limitMicroUsd, reservedMicroUsd };
 	}
 
-	const row = await env.DB.prepare(`
+	const row = await env.DB.prepare(
+		`
 		SELECT COALESCE(SUM(amount_microusd), 0) AS used_microusd
 		FROM free_chat_shadow_reservations
 		WHERE day = date('now')
-	`).first<{ used_microusd: number }>();
+	`,
+	).first<{ used_microusd: number }>();
 	return {
 		allowed: false,
 		limitMicroUsd,
@@ -586,45 +629,80 @@ export async function reserveFreeChatShadowBudget(
 }
 
 /** Mark an exact reservation non-refundable immediately before provider dispatch. */
-export async function settleFreeChatShadowBudget(
-	env: Env,
-	userId: string,
-	turnHash: string,
-	leaseToken: string,
-): Promise<void> {
-	const settled = await env.DB.prepare(`
+export async function settleFreeChatShadowBudget(env: Env, userId: string, turnHash: string, leaseToken: string): Promise<void> {
+	const settled = await env.DB.prepare(
+		`
 		UPDATE free_chat_shadow_reservations
 		SET status = 'settled', settled_at = COALESCE(settled_at, CURRENT_TIMESTAMP)
 		WHERE lease_token = ? AND user_id = ? AND turn_hash = ? AND status = 'reserved'
-	`).bind(leaseToken, userId, turnHash).run();
+	`,
+	)
+		.bind(leaseToken, userId, turnHash)
+		.run();
 	if ((settled.meta?.changes ?? 0) !== 1) {
 		throw new Error('failed to settle free chat shadow reservation');
 	}
 }
 
+/**
+ * Atomically make both preview ledgers non-refundable at the provider boundary.
+ *
+ * Keeping these updates in one D1 batch prevents a shadow-ledger failure from
+ * consuming one of the user's two lifetime turns before any provider work has
+ * started. The mutual EXISTS clauses also make a stale/mismatched lease a
+ * no-op in both tables rather than a one-sided commit.
+ */
+export async function commitFreeChatDispatchGuard(env: Env, userId: string, turnHash: string, leaseToken: string): Promise<void> {
+	const [shadow, turn] = await env.DB.batch([
+		env.DB.prepare(
+			`
+			UPDATE free_chat_shadow_reservations
+			SET status = 'settled', settled_at = COALESCE(settled_at, CURRENT_TIMESTAMP)
+			WHERE lease_token = ? AND user_id = ? AND turn_hash = ? AND status = 'reserved'
+			  AND EXISTS (
+				SELECT 1 FROM free_chat_turns
+				WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
+			  )
+		`,
+		).bind(leaseToken, userId, turnHash, userId, turnHash, leaseToken),
+		env.DB.prepare(
+			`
+			UPDATE free_chat_turns
+			SET status = 'completed',
+				completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+				network_hash = NULL
+			WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
+			  AND EXISTS (
+				SELECT 1 FROM free_chat_shadow_reservations
+				WHERE lease_token = ? AND user_id = ? AND turn_hash = ? AND status = 'settled'
+			  )
+		`,
+		).bind(userId, turnHash, leaseToken, leaseToken, userId, turnHash),
+	]);
+
+	if ((shadow.meta?.changes ?? 0) !== 1 || (turn.meta?.changes ?? 0) !== 1) {
+		throw new Error('failed to commit free chat dispatch guard');
+	}
+}
+
 /** Refund only the exact lease, and only before provider dispatch begins. */
-export async function refundFreeChatShadowBudget(
-	env: Env,
-	userId: string,
-	turnHash: string,
-	leaseToken: string,
-): Promise<void> {
-	const refunded = await env.DB.prepare(`
+export async function refundFreeChatShadowBudget(env: Env, userId: string, turnHash: string, leaseToken: string): Promise<void> {
+	const refunded = await env.DB.prepare(
+		`
 		DELETE FROM free_chat_shadow_reservations
 		WHERE lease_token = ? AND user_id = ? AND turn_hash = ? AND status = 'reserved'
-	`).bind(leaseToken, userId, turnHash).run();
+	`,
+	)
+		.bind(leaseToken, userId, turnHash)
+		.run();
 	if ((refunded.meta?.changes ?? 0) !== 1) {
 		throw new Error('failed to refund free chat shadow reservation');
 	}
 }
 
-export async function completeFreeChatTurn(
-	env: Env,
-	userId: string,
-	turnHash: string,
-	leaseToken: string,
-): Promise<void> {
-	const completed = await env.DB.prepare(`
+export async function completeFreeChatTurn(env: Env, userId: string, turnHash: string, leaseToken: string): Promise<void> {
+	const completed = await env.DB.prepare(
+		`
 		UPDATE free_chat_turns
 		SET status = 'completed',
 			completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
@@ -632,7 +710,10 @@ export async function completeFreeChatTurn(
 			lease_token = NULL,
 			lease_expires_at = NULL
 		WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
-	`).bind(userId, turnHash, leaseToken).run();
+	`,
+	)
+		.bind(userId, turnHash, leaseToken)
+		.run();
 	if ((completed.meta?.changes ?? 0) !== 1) {
 		throw new Error('failed to complete free chat turn lease');
 	}
@@ -644,91 +725,115 @@ export async function completeFreeChatTurn(
  * Clearing the privacy-preserving network key here also avoids retaining it
  * for a slow, timed-out, or client-aborted request.
  */
-export async function acceptFreeChatTurn(
-	env: Env,
-	userId: string,
-	turnHash: string,
-	leaseToken: string,
-): Promise<void> {
-	const accepted = await env.DB.prepare(`
+export async function acceptFreeChatTurn(env: Env, userId: string, turnHash: string, leaseToken: string): Promise<void> {
+	const accepted = await env.DB.prepare(
+		`
 		UPDATE free_chat_turns
 		SET status = 'completed',
 			completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
 			network_hash = NULL
 		WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
-	`).bind(userId, turnHash, leaseToken).run();
+	`,
+	)
+		.bind(userId, turnHash, leaseToken)
+		.run();
 	if ((accepted.meta?.changes ?? 0) !== 1) {
 		throw new Error('failed to accept free chat turn lease');
 	}
 }
 
-export async function releaseFreeChatTurn(
-	env: Env,
-	userId: string,
-	turnHash: string,
-	leaseToken: string,
-): Promise<void> {
+export async function releaseFreeChatTurn(env: Env, userId: string, turnHash: string, leaseToken: string): Promise<void> {
 	// A never-completed first request should not burn one of the two lifetime
 	// turns. Once any request completed, retain the turn and request count; only
 	// release this caller's lease so a bounded retry remains possible.
-	const counters = await env.DB.prepare(`
+	const counters = await env.DB.prepare(
+		`
 		SELECT reservation_day, network_hash, global_counted, network_counted
 		FROM free_chat_turns
 		WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
-	`).bind(userId, turnHash, leaseToken).first<ReservationCounters>();
-	const deleted = await env.DB.prepare(`
+	`,
+	)
+		.bind(userId, turnHash, leaseToken)
+		.first<ReservationCounters>();
+	const deleted = await env.DB.prepare(
+		`
 		DELETE FROM free_chat_turns
 		WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
 		  AND status = 'pending' AND request_count = 1
-	`).bind(userId, turnHash, leaseToken).run();
+	`,
+	)
+		.bind(userId, turnHash, leaseToken)
+		.run();
 	if ((deleted.meta?.changes ?? 0) === 1) {
 		// Refund only counters proven to belong to the exact deleted lease. Any
 		// uncertain/partial state remains counted, preserving financial safety.
 		if (counters?.global_counted === 1) {
-			await env.DB.prepare(`
+			await env.DB.prepare(
+				`
 				UPDATE free_chat_global_daily
 				SET turn_count = turn_count - 1, updated_at = CURRENT_TIMESTAMP
 				WHERE day = ? AND turn_count > 0
-			`).bind(counters.reservation_day).run().catch(() => undefined);
+			`,
+			)
+				.bind(counters.reservation_day)
+				.run()
+				.catch(() => undefined);
 		}
 		if (counters?.network_counted === 1 && counters.network_hash) {
-			await env.DB.prepare(`
+			await env.DB.prepare(
+				`
 				UPDATE free_chat_network_daily
 				SET turn_count = turn_count - 1, updated_at = CURRENT_TIMESTAMP
 				WHERE network_hash = ? AND day = ? AND turn_count > 0
-			`).bind(counters.network_hash, counters.reservation_day).run().catch(() => undefined);
+			`,
+			)
+				.bind(counters.network_hash, counters.reservation_day)
+				.run()
+				.catch(() => undefined);
 		}
 		return;
 	}
 
-	await env.DB.prepare(`
+	await env.DB.prepare(
+		`
 		UPDATE free_chat_turns
 		SET lease_token = NULL, lease_expires_at = NULL
 		WHERE user_id = ? AND turn_hash = ? AND lease_token = ?
-	`).bind(userId, turnHash, leaseToken).run();
+	`,
+	)
+		.bind(userId, turnHash, leaseToken)
+		.run();
 }
 
 /** Keep privacy-preserving abuse keys bounded without delaying chat requests. */
 export async function pruneFreeChatNetworkDaily(env: Env): Promise<void> {
 	await Promise.all([
-		env.DB.prepare(`
+		env.DB.prepare(
+			`
 			DELETE FROM free_chat_network_daily
 			WHERE day < date('now', '-7 days')
-		`).run(),
-		env.DB.prepare(`
+		`,
+		).run(),
+		env.DB.prepare(
+			`
 			DELETE FROM free_chat_global_daily
 			WHERE day < date('now', '-7 days')
-		`).run(),
-		env.DB.prepare(`
+		`,
+		).run(),
+		env.DB.prepare(
+			`
 			DELETE FROM free_chat_turns
 			WHERE status = 'pending'
 			  AND created_at < datetime('now', '-7 days')
 			  AND (lease_token IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
-		`).run(),
-		env.DB.prepare(`
+		`,
+		).run(),
+		env.DB.prepare(
+			`
 			DELETE FROM free_chat_shadow_reservations
 			WHERE day < date('now', '-7 days')
-		`).run(),
+		`,
+		).run(),
 	]);
 }
 
@@ -770,25 +875,27 @@ export async function settleFreeChatTurnResponse(
 		throw error;
 	}
 
-	ctx.waitUntil((async () => {
-		try {
-			await drain.arrayBuffer();
-		} catch (error) {
+	ctx.waitUntil(
+		(async () => {
 			try {
-				await releaseFreeChatTurn(env, userId, reservation.turnHash, reservation.leaseToken);
-			} catch (releaseError) {
-				onError?.(releaseError);
+				await drain.arrayBuffer();
+			} catch (error) {
+				try {
+					await releaseFreeChatTurn(env, userId, reservation.turnHash, reservation.leaseToken);
+				} catch (releaseError) {
+					onError?.(releaseError);
+				}
+				onError?.(error);
+				return;
 			}
-			onError?.(error);
-			return;
-		}
 
-		try {
-			await completeFreeChatTurn(env, userId, reservation.turnHash, reservation.leaseToken);
-		} catch (error) {
-			// The provider body completed, so never refund on a ledger write error:
-			// doing so would let a transient D1 failure buy repeated upstream calls.
-			onError?.(error);
-		}
-	})());
+			try {
+				await completeFreeChatTurn(env, userId, reservation.turnHash, reservation.leaseToken);
+			} catch (error) {
+				// The provider body completed, so never refund on a ledger write error:
+				// doing so would let a transient D1 failure buy repeated upstream calls.
+				onError?.(error);
+			}
+		})(),
+	);
 }

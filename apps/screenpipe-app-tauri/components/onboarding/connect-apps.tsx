@@ -21,6 +21,10 @@ import { homeDir, join, dirname } from "@tauri-apps/api/path";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
 import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
+import {
+  hasEnabledCodexMcp,
+  upsertCodexMcpConfig,
+} from "@/lib/utils/codex-mcp-config";
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
 
@@ -192,36 +196,19 @@ async function getCodexConfigPath(): Promise<string> {
   return join(home, ".codex", "config.toml");
 }
 
-const CODEX_SCREENPIPE_TABLE = /(?:^|\n)\[mcp_servers\.screenpipe\][\s\S]*?(?=\n\[(?!mcp_servers\.screenpipe(?:\.|\]))[^\]]+\]|\s*$)/;
-
 async function isCodexMcpInstalled(): Promise<boolean> {
   try {
     const content = await readTextFile(await getCodexConfigPath());
-    const table = content.match(CODEX_SCREENPIPE_TABLE)?.[0] ?? "";
-    return !!table && !/^\s*enabled\s*=\s*false\s*$/m.test(table);
+    return hasEnabledCodexMcp(content);
   } catch { return false; }
 }
 
 async function installCodexMcp(): Promise<void> {
   const configPath = await getCodexConfigPath();
-  const { command, args } = await buildMcpConfig();
+  const config = await buildMcpConfig();
   let existing = "";
   try { existing = await readTextFile(configPath); } catch { /* fresh */ }
-
-  const withoutScreenpipe = existing
-    .replace(CODEX_SCREENPIPE_TABLE, "")
-    .replace(/^\n+/, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trimEnd();
-
-  const block = [
-    "[mcp_servers.screenpipe]",
-    `command = ${JSON.stringify(command)}`,
-    `args = [${args.map(a => JSON.stringify(a)).join(", ")}]`,
-    "enabled = true",
-  ].join("\n");
-
-  const next = `${withoutScreenpipe}${withoutScreenpipe ? "\n\n" : ""}${block}\n`;
+  const next = upsertCodexMcpConfig(existing, config);
   await mkdir(await dirname(configPath), { recursive: true });
   await writeFile(configPath, new TextEncoder().encode(next));
 }

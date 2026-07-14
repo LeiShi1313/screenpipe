@@ -39,6 +39,7 @@ import { UsageSection, searchIndex as usageSearchIndex } from "@/components/sett
 import { SpeakersSection, searchIndex as speakersSearchIndex } from "@/components/settings/speakers-section";
 import { searchIndex as powerSearchIndex } from "@/components/settings/battery-saver-section";
 import { SettingsSearchInput, SettingsSearchPopover, searchSettingsNav, scrollToSettingsField, type IndexedSettingsField, type SettingsField } from "@/components/settings/settings-search";
+import { parseFreeTierAiSetupProvider } from "@/lib/chat/free-tier-provider-setup";
 
 // Settings search index for the inline ReferralSection defined further down in
 // this file. Lives here because the section itself lives here; same co-location
@@ -208,6 +209,7 @@ function SettingsContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const fromSection = searchParams.get("from");
+  const aiSetupProvider = parseFreeTierAiSetupProvider(searchParams.get("setup"));
   const { isSectionHidden, isEnterprise } = useEnterprisePolicy();
   const { isTranslucent } = useSidebarContext();
 
@@ -382,7 +384,7 @@ function SettingsContent() {
     switch (section) {
       case "general":       return <GeneralSettings />;
       case "display":       return <DisplaySection />;
-      case "ai":            return <AIPresets />;
+      case "ai":            return <AIPresets initialSetupProvider={aiSetupProvider} />;
       case "account":       return <AccountSection />;
       case "recording":     return <RecordingSettings />;
       case "shortcuts":     return <ShortcutSection />;

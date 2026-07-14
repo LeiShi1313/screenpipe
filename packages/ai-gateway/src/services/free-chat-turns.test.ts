@@ -6,12 +6,14 @@ import { describe, expect, it } from 'bun:test';
 import type { AuthResult, Env, Message, RequestBody } from '../types';
 import {
 	acceptFreeChatTurn,
+	commitFreeChatDispatchGuard,
 	completeFreeChatTurn,
 	DEFAULT_FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD,
 	DEFAULT_FREE_CHAT_GLOBAL_DAILY_TURN_LIMIT,
 	FREE_CHAT_SHADOW_RESERVATION_MICRO_USD,
 	freeChatTurnPolicyApplies,
 	getFreeChatGlobalDailyShadowBudgetMicroUsd,
+	getFreeChatUsageStatus,
 	getFreeChatTurnLimit,
 	hashFreeChatNetwork,
 	hashFreeChatTurn,
@@ -334,6 +336,84 @@ function shadowBudgetEnv(budgetUsd = '50'): Env & {
 	} as Env & { shadowUsed(): number; shadowRow(leaseToken: string): ShadowRow | undefined };
 }
 
+function dispatchGuardEnv(): Env & {
+	turnStatus(): 'pending' | 'completed';
+	shadowStatus(): 'reserved' | 'settled';
+	failTurnCommit(): void;
+} {
+	const identity = { userId: 'user-1', turnHash: 'turn-1', leaseToken: 'lease-1' };
+	let turnStatus: 'pending' | 'completed' = 'pending';
+	let shadowStatus: 'reserved' | 'settled' = 'reserved';
+	let failTurnCommit = false;
+
+	const db = {
+		prepare(sql: string) {
+			const normalized = sql.replace(/\s+/g, ' ').trim();
+			return {
+				bind(...args: unknown[]) {
+					return {
+						async run() {
+							if (normalized.startsWith('UPDATE free_chat_shadow_reservations')) {
+								const [leaseToken, userId, turnHash, turnUserId, turnTurnHash, turnLeaseToken] = args as string[];
+								const exactShadow =
+									leaseToken === identity.leaseToken &&
+									userId === identity.userId &&
+									turnHash === identity.turnHash &&
+									shadowStatus === 'reserved';
+								const exactTurn =
+									turnUserId === identity.userId && turnTurnHash === identity.turnHash && turnLeaseToken === identity.leaseToken;
+								if (!exactShadow || !exactTurn) return { meta: { changes: 0 } };
+								shadowStatus = 'settled';
+								return { meta: { changes: 1 } };
+							}
+							if (normalized.startsWith('UPDATE free_chat_turns')) {
+								if (failTurnCommit) throw new Error('simulated second-statement failure');
+								const [userId, turnHash, leaseToken, shadowLeaseToken, shadowUserId, shadowTurnHash] = args as string[];
+								const exactTurn = userId === identity.userId && turnHash === identity.turnHash && leaseToken === identity.leaseToken;
+								const exactShadow =
+									shadowLeaseToken === identity.leaseToken &&
+									shadowUserId === identity.userId &&
+									shadowTurnHash === identity.turnHash &&
+									shadowStatus === 'settled';
+								if (!exactTurn || !exactShadow) return { meta: { changes: 0 } };
+								turnStatus = 'completed';
+								return { meta: { changes: 1 } };
+							}
+							return { meta: { changes: 0 } };
+						},
+					};
+				},
+			};
+		},
+		async batch(statements: Array<{ run(): Promise<D1Result> }>) {
+			const previousTurnStatus = turnStatus;
+			const previousShadowStatus = shadowStatus;
+			try {
+				const results: D1Result[] = [];
+				for (const statement of statements) results.push(await statement.run());
+				return results;
+			} catch (error) {
+				turnStatus = previousTurnStatus;
+				shadowStatus = previousShadowStatus;
+				throw error;
+			}
+		},
+	} as unknown as D1Database;
+
+	return {
+		DB: db,
+		turnStatus: () => turnStatus,
+		shadowStatus: () => shadowStatus,
+		failTurnCommit: () => {
+			failTurnCommit = true;
+		},
+	} as Env & {
+		turnStatus(): 'pending' | 'completed';
+		shadowStatus(): 'reserved' | 'settled';
+		failTurnCommit(): void;
+	};
+}
+
 const auth: AuthResult = {
 	isValid: true,
 	tier: 'logged_in',
@@ -345,18 +425,16 @@ const TEST_TURN_MARKER = '<!-- screenpipe-cloud-turn:00000000-0000-4000-8000-000
 const messages = (text: string, toolResult?: string): Message[] => [
 	{ role: 'user', content: `${text}\n\n${TEST_TURN_MARKER}` },
 	...(toolResult
-		? [{ role: 'assistant' as const, content: 'calling tool' }, { role: 'tool' as const, content: toolResult }]
+		? [
+				{ role: 'assistant' as const, content: 'calling tool' },
+				{ role: 'tool' as const, content: toolResult },
+			]
 		: []),
 ];
 
 const TEST_NETWORK_HASH = 'test-network-a';
 
-function reserveFreeChatTurn(
-	env: Env,
-	requestAuth: AuthResult,
-	requestMessages: Message[],
-	isBackground: boolean,
-) {
+function reserveFreeChatTurn(env: Env, requestAuth: AuthResult, requestMessages: Message[], isBackground: boolean) {
 	return reserveFreeChatTurnImpl(env, requestAuth, requestMessages, isBackground, TEST_NETWORK_HASH);
 }
 
@@ -380,9 +458,66 @@ describe('free hosted chat turn ledger', () => {
 		const disabledEnv = {
 			FREE_LOCAL_TIER_ENFORCEMENT_ENABLED: 'false',
 			FREE_CHAT_PREVIEW_ENABLED: 'true',
-			DB: { prepare: () => { throw new Error('migration not installed'); } },
+			DB: {
+				prepare: () => {
+					throw new Error('migration not installed');
+				},
+			},
 		} as unknown as Env;
 		expect(await reserveFreeChatTurn(disabledEnv, auth, messages('safe deploy'), false)).toEqual({ applies: false });
+	});
+
+	it('reports authoritative lifetime usage without reserving or mutating turns', async () => {
+		const migrationUnavailable = {
+			FREE_LOCAL_TIER_ENFORCEMENT_ENABLED: 'false',
+			FREE_CHAT_PREVIEW_ENABLED: 'true',
+			DB: {
+				prepare: () => {
+					throw new Error('migration not installed');
+				},
+			},
+		} as unknown as Env;
+		expect(await getFreeChatUsageStatus(migrationUnavailable, auth)).toBeNull();
+		expect(await getFreeChatUsageStatus(fakeEnv(), { ...auth, tier: 'subscribed' })).toBeNull();
+
+		const env = fakeEnv();
+		expect(await getFreeChatUsageStatus(env, auth)).toEqual({ used: 0, limit: 2, remaining: 2 });
+
+		const first = await reserveFreeChatTurn(env, auth, messages('usage one'), false);
+		if (!first.applies || !first.allowed) throw new Error('expected first reservation');
+		const beforeRead = { ...env.row(auth.userId!, first.turnHash)! };
+		expect(await getFreeChatUsageStatus(env, auth)).toEqual({ used: 1, limit: 2, remaining: 1 });
+		expect(env.row(auth.userId!, first.turnHash)).toEqual(beforeRead);
+		await complete(env, first);
+
+		const second = await reserveFreeChatTurn(env, auth, messages('usage two'), false);
+		if (!second.applies || !second.allowed) throw new Error('expected second reservation');
+		await complete(env, second);
+		expect(await getFreeChatUsageStatus(env, auth)).toEqual({ used: 2, limit: 2, remaining: 0 });
+	});
+
+	it('commits the lifetime turn and retail shadow budget in one dispatch transaction', async () => {
+		const env = dispatchGuardEnv();
+		await commitFreeChatDispatchGuard(env, 'user-1', 'turn-1', 'lease-1');
+		expect(env.turnStatus()).toBe('completed');
+		expect(env.shadowStatus()).toBe('settled');
+	});
+
+	it('rolls back both dispatch ledgers when the second D1 statement fails', async () => {
+		const env = dispatchGuardEnv();
+		env.failTurnCommit();
+		await expect(commitFreeChatDispatchGuard(env, 'user-1', 'turn-1', 'lease-1')).rejects.toThrow('simulated second-statement failure');
+		expect(env.turnStatus()).toBe('pending');
+		expect(env.shadowStatus()).toBe('reserved');
+	});
+
+	it('rejects a mismatched dispatch lease without committing either ledger', async () => {
+		const env = dispatchGuardEnv();
+		await expect(commitFreeChatDispatchGuard(env, 'user-1', 'turn-1', 'wrong-lease')).rejects.toThrow(
+			'failed to commit free chat dispatch guard',
+		);
+		expect(env.turnStatus()).toBe('pending');
+		expect(env.shadowStatus()).toBe('reserved');
 	});
 
 	it('applies only to verified non-subscribers using interactive hosted AI', () => {
@@ -393,12 +528,8 @@ describe('free hosted chat turn ledger', () => {
 	});
 
 	it('uses the latest user message so sequential tool-loop calls share one turn', async () => {
-		expect(await hashFreeChatTurn(messages('find my meeting'))).toBe(
-			await hashFreeChatTurn(messages('find my meeting', 'meeting 42')),
-		);
-		expect(await hashFreeChatTurn(messages('find another meeting'))).not.toBe(
-			await hashFreeChatTurn(messages('find my meeting')),
-		);
+		expect(await hashFreeChatTurn(messages('find my meeting'))).toBe(await hashFreeChatTurn(messages('find my meeting', 'meeting 42')));
+		expect(await hashFreeChatTurn(messages('find another meeting'))).not.toBe(await hashFreeChatTurn(messages('find my meeting')));
 	});
 
 	it('bounds the free request model, input, and output', () => {
@@ -411,19 +542,31 @@ describe('free hosted chat turn ledger', () => {
 		expect(body.max_tokens).toBe(4_096);
 		expect(body.max_completion_tokens).toBe(4_096);
 
+		const nonCanonicalAuto = { model: '  AUTO\t', messages: messages('hello') } as RequestBody;
+		expect(prepareFreeChatRequest(env, nonCanonicalAuto)).toEqual({ ok: true });
+		expect(nonCanonicalAuto.model).toBe('auto');
+
 		env.FREE_CHAT_MAX_INPUT_BYTES = '1000';
 		const huge = { model: 'auto', messages: messages('x'.repeat(2_000)) } as RequestBody;
 		expect(prepareFreeChatRequest(env, huge)).toMatchObject({ ok: false, status: 413, limit: 1_000 });
+		expect(prepareFreeChatRequest(env, huge, 1)).toMatchObject({ ok: false, status: 413, limit: 1_000 });
+		const paddedModel = { model: `${' '.repeat(2_000)}AUTO`, messages: messages('hello') } as RequestBody;
+		expect(prepareFreeChatRequest(env, paddedModel)).toMatchObject({ ok: false, status: 413, limit: 1_000 });
 		const unicode = { model: 'auto', messages: messages('é'.repeat(600)) } as RequestBody;
 		expect(JSON.stringify(unicode).length).toBeLessThan(1_000);
 		expect(prepareFreeChatRequest(env, unicode)).toMatchObject({ ok: false, status: 413, limit: 1_000 });
 
 		const remoteImage = {
 			model: 'auto',
-			messages: [{ role: 'user', content: [
-				{ type: 'text', text: TEST_TURN_MARKER },
-				{ type: 'image_url', image_url: { url: 'https://example.test/unbounded.png' } },
-			] }],
+			messages: [
+				{
+					role: 'user',
+					content: [
+						{ type: 'text', text: TEST_TURN_MARKER },
+						{ type: 'image_url', image_url: { url: 'https://example.test/unbounded.png' } },
+					],
+				},
+			],
 		} as RequestBody;
 		expect(prepareFreeChatRequest(env, remoteImage)).toMatchObject({
 			ok: false,
@@ -432,10 +575,15 @@ describe('free hosted chat turn ledger', () => {
 		});
 		const inlineImage = {
 			model: 'auto',
-			messages: [{ role: 'user', content: [
-				{ type: 'text', text: TEST_TURN_MARKER },
-				{ type: 'image', source: { type: 'url', url: 'data:image/png;base64,AA==' } },
-			] }],
+			messages: [
+				{
+					role: 'user',
+					content: [
+						{ type: 'text', text: TEST_TURN_MARKER },
+						{ type: 'image', source: { type: 'url', url: 'data:image/png;base64,AA==' } },
+					],
+				},
+			],
 		} as RequestBody;
 		expect(prepareFreeChatRequest(env, inlineImage)).toMatchObject({
 			ok: false,
@@ -462,10 +610,7 @@ describe('free hosted chat turn ledger', () => {
 		});
 		const malformedTextPart = {
 			model: 'auto',
-			messages: [{ role: 'user', content: [
-				{ type: 'text', text: TEST_TURN_MARKER },
-				{ type: 'text' },
-			] }],
+			messages: [{ role: 'user', content: [{ type: 'text', text: TEST_TURN_MARKER }, { type: 'text' }] }],
 		} as unknown as RequestBody;
 		expect(prepareFreeChatRequest(env, malformedTextPart)).toMatchObject({
 			ok: false,
@@ -588,20 +733,12 @@ describe('free hosted chat turn ledger', () => {
 			await completeFreeChatTurn(env, userId, reservation.turnHash, reservation.leaseToken);
 		}
 
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			authFor('user-network-3'),
-			messages('blocked shared network'),
-			false,
-			'shared-network',
-		)).toMatchObject({ allowed: false, reason: 'network_limit' });
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			authFor('user-network-3'),
-			messages('allowed different network'),
-			false,
-			'different-network',
-		)).toMatchObject({ allowed: true, isNew: true });
+		expect(
+			await reserveFreeChatTurnImpl(env, authFor('user-network-3'), messages('blocked shared network'), false, 'shared-network'),
+		).toMatchObject({ allowed: false, reason: 'network_limit' });
+		expect(
+			await reserveFreeChatTurnImpl(env, authFor('user-network-3'), messages('allowed different network'), false, 'different-network'),
+		).toMatchObject({ allowed: true, isNew: true });
 	});
 
 	it('atomically caps new turns globally while allowing existing tool follow-ups', async () => {
@@ -618,40 +755,30 @@ describe('free hosted chat turn ledger', () => {
 		if (!second.applies || !second.allowed) throw new Error('expected second global reservation');
 		await completeFreeChatTurn(env, secondAuth.userId!, second.turnHash, second.leaseToken);
 
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			authFor('user-global-3'),
-			messages('global blocked'),
-			false,
-			'network-global-3',
-		)).toMatchObject({ allowed: false, reason: 'global_limit' });
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			firstAuth,
-			messages('global first', 'tool result'),
-			false,
-			null,
-		)).toMatchObject({ allowed: true, isNew: false });
+		expect(
+			await reserveFreeChatTurnImpl(env, authFor('user-global-3'), messages('global blocked'), false, 'network-global-3'),
+		).toMatchObject({ allowed: false, reason: 'global_limit' });
+		expect(await reserveFreeChatTurnImpl(env, firstAuth, messages('global first', 'tool result'), false, null)).toMatchObject({
+			allowed: true,
+			isNew: false,
+		});
 	});
 
 	it('allows a previously counted turn to finish tool follow-ups without a new network identity', async () => {
 		const env = fakeEnv(1);
 		const first = await reserveFreeChatTurn(env, auth, messages('existing network turn'), false);
 		await complete(env, first);
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			auth,
-			messages('existing network turn', 'tool result'),
-			false,
-			null,
-		)).toMatchObject({ allowed: true, isNew: false });
+		expect(await reserveFreeChatTurnImpl(env, auth, messages('existing network turn', 'tool result'), false, null)).toMatchObject({
+			allowed: true,
+			isNew: false,
+		});
 	});
 
 	it('releases a fresh lifetime slot when network identity or its D1 guard is unavailable', async () => {
 		const env = fakeEnv(1);
 		const missingIdentity = await reserveFreeChatTurnImpl(env, auth, messages('missing identity'), false, null);
 		expect(missingIdentity).toMatchObject({ allowed: false, reason: 'network_identity' });
-		expect(env.row(auth.userId!, await hashFreeChatTurn(messages('missing identity')) as string)).toBeUndefined();
+		expect(env.row(auth.userId!, (await hashFreeChatTurn(messages('missing identity'))) as string)).toBeUndefined();
 
 		const originalDb = env.DB;
 		env.DB = {
@@ -661,16 +788,18 @@ describe('free hosted chat turn ledger', () => {
 			},
 		} as unknown as D1Database;
 		await expect(reserveFreeChatTurn(env, auth, messages('partial migration'), false)).rejects.toThrow('network migration missing');
-		expect(env.row(auth.userId!, await hashFreeChatTurn(messages('partial migration')) as string)).toBeUndefined();
+		expect(env.row(auth.userId!, (await hashFreeChatTurn(messages('partial migration'))) as string)).toBeUndefined();
 		env.DB = originalDb;
 		env.FREE_CHAT_GLOBAL_DAILY_TURN_LIMIT = '1';
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			{ ...auth, userId: 'user-after-partial', deviceId: 'user-after-partial' },
-			messages('after partial migration'),
-			false,
-			'different-network-after-partial',
-		)).toMatchObject({ allowed: true, isNew: true });
+		expect(
+			await reserveFreeChatTurnImpl(
+				env,
+				{ ...auth, userId: 'user-after-partial', deviceId: 'user-after-partial' },
+				messages('after partial migration'),
+				false,
+				'different-network-after-partial',
+			),
+		).toMatchObject({ allowed: true, isNew: true });
 	});
 
 	it('normalizes and HMACs networks without storing a raw address', async () => {
@@ -680,15 +809,24 @@ describe('free hosted chat turn ledger', () => {
 		expect(normalizeFreeChatNetwork('2001:db8:1234:5678::abcd')).toBe('2001:0db8:1234:5678::/64');
 
 		const hashEnv = { NODE_ENV: 'production', CLERK_SECRET_KEY: 'unit-test-secret' } as Env;
-		const left = await hashFreeChatNetwork(hashEnv, new Request('https://gateway.test', {
-			headers: { 'cf-connecting-ip': '203.0.113.7' },
-		}));
-		const right = await hashFreeChatNetwork(hashEnv, new Request('https://gateway.test', {
-			headers: { 'cf-connecting-ip': '203.0.113.250' },
-		}));
-		const other = await hashFreeChatNetwork(hashEnv, new Request('https://gateway.test', {
-			headers: { 'cf-connecting-ip': '203.0.114.7' },
-		}));
+		const left = await hashFreeChatNetwork(
+			hashEnv,
+			new Request('https://gateway.test', {
+				headers: { 'cf-connecting-ip': '203.0.113.7' },
+			}),
+		);
+		const right = await hashFreeChatNetwork(
+			hashEnv,
+			new Request('https://gateway.test', {
+				headers: { 'cf-connecting-ip': '203.0.113.250' },
+			}),
+		);
+		const other = await hashFreeChatNetwork(
+			hashEnv,
+			new Request('https://gateway.test', {
+				headers: { 'cf-connecting-ip': '203.0.114.7' },
+			}),
+		);
 		expect(left).toBe(right);
 		expect(left).not.toBe(other);
 		expect(left).not.toContain('203.0.113');
@@ -702,13 +840,15 @@ describe('free hosted chat turn ledger', () => {
 		const failed = await reserveFreeChatTurn(env, auth, messages('failed upstream'), false);
 		if (!failed.applies || !failed.allowed) throw new Error('expected reservation');
 		await releaseFreeChatTurn(env, auth.userId!, failed.turnHash, failed.leaseToken);
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			{ ...auth, userId: 'user-refund-replacement', deviceId: 'user-refund-replacement' },
-			messages('replacement'),
-			false,
-			TEST_NETWORK_HASH,
-		)).toMatchObject({ allowed: true });
+		expect(
+			await reserveFreeChatTurnImpl(
+				env,
+				{ ...auth, userId: 'user-refund-replacement', deviceId: 'user-refund-replacement' },
+				messages('replacement'),
+				false,
+				TEST_NETWORK_HASH,
+			),
+		).toMatchObject({ allowed: true });
 
 		const env2 = fakeEnv(1);
 		const accepted = await reserveFreeChatTurn(env2, auth, messages('accepted'), false);
@@ -763,12 +903,9 @@ describe('free hosted chat turn ledger', () => {
 		const reservation = await reserveFreeChatTurn(env, auth, messages('broken accepted stream'), false);
 		if (!reservation.applies || !reservation.allowed) throw new Error('expected reservation');
 
-		await expect(acceptFreeChatTurn(
-			env,
-			auth.userId!,
-			reservation.turnHash,
-			'wrong-lease',
-		)).rejects.toThrow('failed to accept free chat turn lease');
+		await expect(acceptFreeChatTurn(env, auth.userId!, reservation.turnHash, 'wrong-lease')).rejects.toThrow(
+			'failed to accept free chat turn lease',
+		);
 		expect(env.row(auth.userId!, reservation.turnHash)).toMatchObject({
 			status: 'pending',
 			networkHash: TEST_NETWORK_HASH,
@@ -815,13 +952,15 @@ describe('free hosted chat turn ledger', () => {
 			allowed: false,
 			reason: 'limit',
 		});
-		expect(await reserveFreeChatTurnImpl(
-			env,
-			{ ...auth, userId: 'other-user', deviceId: 'other-device' },
-			messages('later global turn'),
-			false,
-			'different-network',
-		)).toMatchObject({ allowed: false, reason: 'global_limit' });
+		expect(
+			await reserveFreeChatTurnImpl(
+				env,
+				{ ...auth, userId: 'other-user', deviceId: 'other-device' },
+				messages('later global turn'),
+				false,
+				'different-network',
+			),
+		).toMatchObject({ allowed: false, reason: 'global_limit' });
 	});
 
 	it('never refunds a provider-completed turn when only the completion ledger write fails', async () => {
@@ -834,7 +973,11 @@ describe('free hosted chat turn ledger', () => {
 				if (sql.includes("SET status = 'completed'") && sql.includes('lease_token = NULL')) {
 					return {
 						bind() {
-							return { run: async () => { throw new Error('completion D1 unavailable'); } };
+							return {
+								run: async () => {
+									throw new Error('completion D1 unavailable');
+								},
+							};
 						},
 					};
 				}
@@ -864,15 +1007,23 @@ describe('free hosted chat turn ledger', () => {
 		expect(DEFAULT_FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD).toBe(50);
 		expect(FREE_CHAT_SHADOW_RESERVATION_MICRO_USD).toBe(1_000_000);
 		expect(getFreeChatGlobalDailyShadowBudgetMicroUsd({} as Env)).toBe(50_000_000);
-		expect(getFreeChatGlobalDailyShadowBudgetMicroUsd({
-			FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD: '0',
-		} as Env)).toBe(0);
-		expect(getFreeChatGlobalDailyShadowBudgetMicroUsd({
-			FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD: '1000000',
-		} as Env)).toBe(1_000_000_000);
+		expect(
+			getFreeChatGlobalDailyShadowBudgetMicroUsd({
+				FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD: '0',
+			} as Env),
+		).toBe(0);
+		expect(
+			getFreeChatGlobalDailyShadowBudgetMicroUsd({
+				FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD: '1000000',
+			} as Env),
+		).toBe(1_000_000_000);
 
 		const stopped = shadowBudgetEnv('0');
-		stopped.DB = { prepare: () => { throw new Error('zero stop must not touch D1'); } } as unknown as D1Database;
+		stopped.DB = {
+			prepare: () => {
+				throw new Error('zero stop must not touch D1');
+			},
+		} as unknown as D1Database;
 		expect(await reserveFreeChatShadowBudget(stopped, 'u', 'turn', 'lease')).toEqual({
 			allowed: false,
 			limitMicroUsd: 0,
@@ -916,9 +1067,11 @@ describe('free hosted chat turn ledger', () => {
 
 	it('fails closed when the shadow reservation table is unavailable', async () => {
 		const env = shadowBudgetEnv('50');
-		env.DB = { prepare: () => { throw new Error('no such table: free_chat_shadow_reservations'); } } as unknown as D1Database;
-		await expect(reserveFreeChatShadowBudget(env, 'u', 'turn', 'lease')).rejects.toThrow(
-			'no such table: free_chat_shadow_reservations',
-		);
+		env.DB = {
+			prepare: () => {
+				throw new Error('no such table: free_chat_shadow_reservations');
+			},
+		} as unknown as D1Database;
+		await expect(reserveFreeChatShadowBudget(env, 'u', 'turn', 'lease')).rejects.toThrow('no such table: free_chat_shadow_reservations');
 	});
 });

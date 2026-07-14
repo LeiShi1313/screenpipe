@@ -36,7 +36,8 @@ export function isInjectedTitleSourcePrompt(content?: string | null): boolean {
 
   // Skip ONLY bare role/system tags with no actual user content
   // Pattern: <role>...</role> optionally followed by <system>...</system>, nothing else
-  const bareMetadataOnly = /^<role>[^<]*<\/role>\s*(<system>[^<]*<\/system>)?\s*$/;
+  const bareMetadataOnly =
+    /^<role>[^<]*<\/role>\s*(<system>[^<]*<\/system>)?\s*$/;
   if (bareMetadataOnly.test(trimmed)) return true;
 
   // Any other content (including <role> with user text after it) is real
@@ -51,11 +52,17 @@ export function isInjectedTitleSourcePrompt(content?: string | null): boolean {
  * For broader title-derivation filtering (bare <role>/<system> tags),
  * use `isInjectedTitleSourcePrompt` instead.
  */
-export function isConversationHistorySyncPrompt(value?: string | null): value is string {
-  return typeof value === "string" && value.startsWith("<conversation_history>");
+export function isConversationHistorySyncPrompt(
+  value?: string | null,
+): value is string {
+  return (
+    typeof value === "string" && value.startsWith("<conversation_history>")
+  );
 }
 
-export function extractConversationHistorySyncUserText(value?: string | null): string | null {
+export function extractConversationHistorySyncUserText(
+  value?: string | null,
+): string | null {
   if (!isConversationHistorySyncPrompt(value)) return null;
   const closingTag = "</conversation_history>";
   const closingTagIndex = value.indexOf(closingTag);
@@ -72,17 +79,26 @@ const CONNECTIONS_CONTEXT_CLOSE = "</connections_context>";
  * stripping it the blob leaks into the sidebar title and spawns a duplicate
  * "Current Screenpipe connected integrations context" chat.
  */
-export function isConnectionsContextPrompt(value?: string | null): value is string {
-  return typeof value === "string" && value.trimStart().startsWith("<connections_context>");
+export function isConnectionsContextPrompt(
+  value?: string | null,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.trimStart().startsWith("<connections_context>")
+  );
 }
 
 /** Return the original user text that follows the `</connections_context>`
  *  tag, or null when the value isn't a connections-context prompt. */
-export function extractConnectionsContextUserText(value?: string | null): string | null {
+export function extractConnectionsContextUserText(
+  value?: string | null,
+): string | null {
   if (!isConnectionsContextPrompt(value)) return null;
   const closingTagIndex = value.indexOf(CONNECTIONS_CONTEXT_CLOSE);
   if (closingTagIndex === -1) return "";
-  return value.slice(closingTagIndex + CONNECTIONS_CONTEXT_CLOSE.length).replace(/^\s+/, "");
+  return value
+    .slice(closingTagIndex + CONNECTIONS_CONTEXT_CLOSE.length)
+    .replace(/^\s+/, "");
 }
 
 /**
@@ -104,7 +120,9 @@ export function extractInjectedUserText(value?: string | null): string | null {
  * render as "untitled" instead of leaking the raw blob into the sidebar.
  */
 export function isInjectedTitle(value?: string | null): value is string {
-  return isConversationHistorySyncPrompt(value) || isConnectionsContextPrompt(value);
+  return (
+    isConversationHistorySyncPrompt(value) || isConnectionsContextPrompt(value)
+  );
 }
 
 // ============================================================================
@@ -123,6 +141,8 @@ export interface ChatPrefillData {
   source?: string;
   /** Open the Home window chat instead of the Chat overlay. */
   useHomeChat?: boolean;
+  /** Internal account owner; never contains the raw credential. */
+  authBoundary?: string;
 }
 
 export type ChatTargetWindow = "home" | "chat";
@@ -172,9 +192,7 @@ export function shouldActivateHomeSectionForChatLoadConversation(
  */
 export function shouldHandleChatPrefillForWindow(
   payload:
-    | { targetWindow?: string | null; autoSend?: boolean }
-    | null
-    | undefined,
+    { targetWindow?: string | null; autoSend?: boolean } | null | undefined,
   windowLabel: string,
 ): boolean {
   if (!payload) return false;
@@ -187,7 +205,51 @@ const CHAT_READY_MAX_ATTEMPTS = 3;
 const PENDING_CHAT_PREFILL_KEY = "pendingChatPrefill";
 const RECENT_CHAT_SEARCH_ORIGIN_KEY = "recentChatSearchOrigin";
 
-export function markSearchOpenedFromChatSurface(targetWindow: ChatTargetWindow): void {
+function opaqueTokenFingerprint(token: string): string {
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  for (let index = 0; index < token.length; index += 1) {
+    const code = token.charCodeAt(index);
+    left = Math.imul(left ^ code, 0x01000193) >>> 0;
+    right = Math.imul(right ^ (code + index), 0x85ebca6b) >>> 0;
+  }
+  return `${left.toString(16).padStart(8, "0")}${right.toString(16).padStart(8, "0")}`;
+}
+
+/** Stable account owner for delayed local events without persisting a JWT. */
+export function chatAuthBoundaryForToken(
+  token: string | null | undefined,
+): string {
+  const normalized = token?.trim();
+  if (!normalized) return "signed-out";
+  try {
+    const payloadPart = normalized.split(".")[1];
+    if (payloadPart) {
+      const padded = payloadPart
+        .replace(/-/g, "+")
+        .replace(/_/g, "/")
+        .padEnd(Math.ceil(payloadPart.length / 4) * 4, "=");
+      const payload = JSON.parse(atob(padded)) as { sub?: unknown };
+      if (typeof payload.sub === "string" && payload.sub.trim()) {
+        return `account:${payload.sub.trim()}`;
+      }
+    }
+  } catch {
+    // Non-JWT credentials are still isolated by a non-reversible fingerprint.
+  }
+  return `opaque:${opaqueTokenFingerprint(normalized)}`;
+}
+
+export async function pendingChatPrefillForCurrentAuth(
+  data: ChatPrefillData,
+): Promise<ChatPrefillData> {
+  const token = await commands.getCloudToken();
+  return { ...data, authBoundary: chatAuthBoundaryForToken(token) };
+}
+
+export function markSearchOpenedFromChatSurface(
+  targetWindow: ChatTargetWindow,
+): void {
   try {
     localStorage.setItem(
       RECENT_CHAT_SEARCH_ORIGIN_KEY,
@@ -211,7 +273,8 @@ export function readSearchOpenedFromChatSurface(): ChatTargetWindow | null {
     const raw = localStorage.getItem(RECENT_CHAT_SEARCH_ORIGIN_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as { targetWindow?: ChatTargetWindow };
-    if (parsed.targetWindow !== "home" && parsed.targetWindow !== "chat") return null;
+    if (parsed.targetWindow !== "home" && parsed.targetWindow !== "chat")
+      return null;
     return parsed.targetWindow;
   } catch {
     clearSearchOpenedFromChatSurface();
@@ -219,7 +282,9 @@ export function readSearchOpenedFromChatSurface(): ChatTargetWindow | null {
   }
 }
 
-export async function waitForChatReady(targetWindow: ChatTargetWindow): Promise<void> {
+export async function waitForChatReady(
+  targetWindow: ChatTargetWindow,
+): Promise<void> {
   let chatReady = false;
   for (let attempt = 1; attempt <= CHAT_READY_MAX_ATTEMPTS; attempt++) {
     chatReady = await new Promise<boolean>((resolve) => {
@@ -276,7 +341,14 @@ export async function openChatConversationInCurrentChatSurface(
  * "chat-ping". We wait for "chat-ready" before emitting the prefill event,
  * with a 5-second timeout fallback.
  */
-export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> {
+export async function showChatWithPrefill(
+  data: ChatPrefillData,
+): Promise<void> {
+  const ownedData = await pendingChatPrefillForCurrentAuth(data);
+  const originAuthBoundary = ownedData.authBoundary;
+  const authBoundaryIsCurrent = async () =>
+    chatAuthBoundaryForToken(await commands.getCloudToken()) ===
+    originAuthBoundary;
   const targetWindow = data.useHomeChat ? "home" : "chat";
   const currentWindowLabel = getCurrentWindow().label;
 
@@ -288,9 +360,10 @@ export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> 
     const isHomeRoute = url.pathname === "/home";
     const isHomeSection = url.searchParams.get("section") === "home";
     if (!isHomeRoute || !isHomeSection) {
+      if (!(await authBoundaryIsCurrent())) return;
       sessionStorage.setItem(
         PENDING_CHAT_PREFILL_KEY,
-        JSON.stringify({ ...data, targetWindow }),
+        JSON.stringify({ ...ownedData, targetWindow }),
       );
       window.location.assign("/home?section=home");
       return;
@@ -311,9 +384,11 @@ export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> 
     // open_chat / open_timeline notification handlers.
     await commands.showWindowActivated("Chat");
   }
+  if (!(await authBoundaryIsCurrent())) return;
 
   await waitForChatReady(targetWindow);
-  await emit("chat-prefill", { ...data, targetWindow });
+  if (!(await authBoundaryIsCurrent())) return;
+  await emit("chat-prefill", { ...ownedData, targetWindow });
 }
 
 // ============================================================================
@@ -325,18 +400,25 @@ export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> 
  * On macOS: Command (⌘) → Control (⌃) → Option (⌥) → Shift (⇧) → Key
  * On Windows/Linux: Ctrl → Alt → Shift → Key
  */
-export function formatShortcutDisplay(shortcut: string, isMac: boolean): string {
+export function formatShortcutDisplay(
+  shortcut: string,
+  isMac: boolean,
+): string {
   if (!shortcut) return "";
 
   // Parse the shortcut into parts
-  const parts = shortcut.split("+").map(p => p.trim().toLowerCase());
+  const parts = shortcut.split("+").map((p) => p.trim().toLowerCase());
 
   // Define modifier priorities (lower = comes first)
   const modifierPriority: Record<string, number> = {
-    "super": 0, "command": 0, "cmd": 0,
-    "ctrl": 1, "control": 1,
-    "alt": 2, "option": 2,
-    "shift": 3,
+    super: 0,
+    command: 0,
+    cmd: 0,
+    ctrl: 1,
+    control: 1,
+    alt: 2,
+    option: 2,
+    shift: 3,
   };
 
   // Separate modifiers from the key
@@ -352,27 +434,37 @@ export function formatShortcutDisplay(shortcut: string, isMac: boolean): string 
   }
 
   // Sort modifiers by priority
-  modifiers.sort((a, b) => (modifierPriority[a] ?? 99) - (modifierPriority[b] ?? 99));
+  modifiers.sort(
+    (a, b) => (modifierPriority[a] ?? 99) - (modifierPriority[b] ?? 99),
+  );
 
   if (isMac) {
     // Convert to Mac symbols
     const macSymbols: Record<string, string> = {
-      "super": "⌘", "command": "⌘", "cmd": "⌘",
-      "ctrl": "⌃", "control": "⌃",
-      "alt": "⌥", "option": "⌥",
-      "shift": "⇧",
+      super: "⌘",
+      command: "⌘",
+      cmd: "⌘",
+      ctrl: "⌃",
+      control: "⌃",
+      alt: "⌥",
+      option: "⌥",
+      shift: "⇧",
     };
-    const formattedMods = modifiers.map(m => macSymbols[m] || m).join("");
+    const formattedMods = modifiers.map((m) => macSymbols[m] || m).join("");
     return formattedMods + key.toUpperCase();
   } else {
     // Windows/Linux: readable format
     const winNames: Record<string, string> = {
-      "super": "Win", "command": "Ctrl", "cmd": "Ctrl",
-      "ctrl": "Ctrl", "control": "Ctrl",
-      "alt": "Alt", "option": "Alt",
-      "shift": "Shift",
+      super: "Win",
+      command: "Ctrl",
+      cmd: "Ctrl",
+      ctrl: "Ctrl",
+      control: "Ctrl",
+      alt: "Alt",
+      option: "Alt",
+      shift: "Shift",
     };
-    const formattedMods = modifiers.map(m => winNames[m] || m);
+    const formattedMods = modifiers.map((m) => winNames[m] || m);
     return [...formattedMods, key.toUpperCase()].join("+");
   }
 }
@@ -390,7 +482,8 @@ interface TimeRange {
 export interface ParsedMentions {
   cleanedInput: string;
   timeRanges: TimeRange[];
-  contentType: "all" | "ocr" | "audio" | "input" | "accessibility" | "screen" | null;
+  contentType:
+    "all" | "ocr" | "audio" | "input" | "accessibility" | "screen" | null;
   appName: string | null;
   usedSelection: boolean;
   speakerName: string | null;
@@ -404,39 +497,44 @@ export interface ParseMentionsOptions {
 
 // Common app name mappings (user-friendly -> actual app name patterns)
 const APP_MAPPINGS: Record<string, string[]> = {
-  "chrome": ["Google Chrome", "Chrome"],
-  "slack": ["Slack"],
-  "vscode": ["Code", "Visual Studio Code"],
-  "code": ["Code", "Visual Studio Code"],
-  "terminal": ["Terminal", "iTerm", "iTerm2", "Warp", "Alacritty", "kitty"],
-  "zoom": ["zoom.us", "Zoom"],
-  "teams": ["Microsoft Teams", "Teams"],
-  "discord": ["Discord"],
-  "figma": ["Figma"],
-  "notion": ["Notion"],
-  "obsidian": ["Obsidian"],
-  "safari": ["Safari"],
-  "firefox": ["Firefox"],
-  "arc": ["Arc"],
-  "cursor": ["Cursor"],
-  "finder": ["Finder"],
-  "mail": ["Mail"],
-  "messages": ["Messages"],
-  "spotify": ["Spotify"],
-  "twitter": ["Twitter", "X"],
-  "x": ["Twitter", "X"],
-  "linear": ["Linear"],
-  "github": ["GitHub Desktop"],
-  "postman": ["Postman"],
-  "iterm": ["iTerm", "iTerm2"],
-  "warp": ["Warp"],
+  chrome: ["Google Chrome", "Chrome"],
+  slack: ["Slack"],
+  vscode: ["Code", "Visual Studio Code"],
+  code: ["Code", "Visual Studio Code"],
+  terminal: ["Terminal", "iTerm", "iTerm2", "Warp", "Alacritty", "kitty"],
+  zoom: ["zoom.us", "Zoom"],
+  teams: ["Microsoft Teams", "Teams"],
+  discord: ["Discord"],
+  figma: ["Figma"],
+  notion: ["Notion"],
+  obsidian: ["Obsidian"],
+  safari: ["Safari"],
+  firefox: ["Firefox"],
+  arc: ["Arc"],
+  cursor: ["Cursor"],
+  finder: ["Finder"],
+  mail: ["Mail"],
+  messages: ["Messages"],
+  spotify: ["Spotify"],
+  twitter: ["Twitter", "X"],
+  x: ["Twitter", "X"],
+  linear: ["Linear"],
+  github: ["GitHub Desktop"],
+  postman: ["Postman"],
+  iterm: ["iTerm", "iTerm2"],
+  warp: ["Warp"],
 };
 
-export function parseMentions(input: string, options?: ParseMentionsOptions): ParsedMentions {
+export function parseMentions(
+  input: string,
+  options?: ParseMentionsOptions,
+): ParsedMentions {
   const now = new Date();
   const timeRanges: TimeRange[] = [];
   let cleanedInput = input;
-  let contentType: "all" | "ocr" | "audio" | "input" | "accessibility" | "screen" | null = null;
+  let contentType:
+    "all" | "ocr" | "audio" | "input" | "accessibility" | "screen" | null =
+    null;
   let appName: string | null = null;
   let usedSelection = false;
   let speakerName: string | null = null;
@@ -542,7 +640,10 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
 
   // Check for dynamic @appname patterns from autocomplete
   for (const [tag, actualName] of appTagEntries) {
-    const appPattern = new RegExp(`@${tag.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`, "gi");
+    const appPattern = new RegExp(
+      `@${tag.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`,
+      "gi",
+    );
     if (appPattern.test(cleanedInput)) {
       appName = actualName;
       cleanedInput = cleanedInput.replace(appPattern, "").trim();
@@ -578,9 +679,14 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
       const potentialName = simpleMatch[1];
       // Check if it's not a known app or time tag
       const knownTags = [
-        "today", "yesterday", "selection", "audio", "screen", "ocr",
-        ...Object.keys(APP_MAPPINGS).map(k => k.toLowerCase()),
-        ...Object.keys(appTagMap).map(k => k.toLowerCase()),
+        "today",
+        "yesterday",
+        "selection",
+        "audio",
+        "screen",
+        "ocr",
+        ...Object.keys(APP_MAPPINGS).map((k) => k.toLowerCase()),
+        ...Object.keys(appTagMap).map((k) => k.toLowerCase()),
       ];
       if (!knownTags.includes(potentialName.toLowerCase())) {
         speakerName = potentialName;
@@ -604,7 +710,15 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
     cleanedInput = cleanedInput.replace(tagPattern, "").trim();
   }
 
-  return { cleanedInput, timeRanges, contentType, appName, usedSelection, speakerName, tagNames };
+  return {
+    cleanedInput,
+    timeRanges,
+    contentType,
+    appName,
+    usedSelection,
+    speakerName,
+    tagNames,
+  };
 }
 
 // ============================================================================
@@ -633,7 +747,7 @@ export function normalizeAppTag(name: string) {
 
 export function buildAppMentionSuggestions(
   items: AppAutocompleteItem[],
-  limit: number
+  limit: number,
 ): MentionSuggestion[] {
   const usedTags = new Set<string>();
   return items.slice(0, limit).map((item) => {
@@ -656,7 +770,7 @@ export function buildAppMentionSuggestions(
 
 export function buildTagMentionSuggestions(
   items: AppAutocompleteItem[],
-  limit: number
+  limit: number,
 ): MentionSuggestion[] {
   return items.slice(0, limit).map((item) => ({
     tag: `#${item.name}`,
@@ -673,7 +787,9 @@ function formatTagAutocompleteDescription(item: AppAutocompleteItem) {
   const parts = [
     item.frame_count ? pluralize(item.frame_count, "frame") : null,
     item.audio_count ? pluralize(item.audio_count, "audio clip") : null,
-    item.memory_count ? pluralize(item.memory_count, "memory", "memories") : null,
+    item.memory_count
+      ? pluralize(item.memory_count, "memory", "memories")
+      : null,
   ].filter((part): part is string => Boolean(part));
 
   if (parts.length > 0) return parts.join(", ");

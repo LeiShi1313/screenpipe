@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import type { Env } from '../types';
 
 const verifyTokenMock = mock(async () => ({ sub: 'user_free' }));
-const handleChatCompletionsMock = mock(async () => new Response('{"ok":true}', {
-	status: 200,
-	headers: { 'Content-Type': 'application/json', 'x-screenpipe-model': 'glm-4.7' },
-}));
+const handleChatCompletionsMock = mock(
+	async () =>
+		new Response('{"ok":true}', {
+			status: 200,
+			headers: { 'Content-Type': 'application/json', 'x-screenpipe-model': 'glm-4.7' },
+		}),
+);
 
 mock.module('@clerk/backend', () => ({
 	verifyToken: verifyTokenMock,
@@ -18,15 +21,21 @@ mock.module('../handlers/chat', () => ({
 	handleChatCompletions: handleChatCompletionsMock,
 }));
 
-const { default: worker, handleRequest } = await import('../index');
+const { default: worker, handleRequest, hostedBusinessGate } = await import('../index');
 
-const rateLimiterFetch = mock(async () => new Response(JSON.stringify({
-	allowed: true,
-	remaining: 24,
-	reset_in: 60,
-	tier: 'logged_in',
-	rpm_limit: 25,
-}), { status: 200 }));
+const rateLimiterFetch = mock(
+	async () =>
+		new Response(
+			JSON.stringify({
+				allowed: true,
+				remaining: 24,
+				reset_in: 60,
+				tier: 'logged_in',
+				rpm_limit: 25,
+			}),
+			{ status: 200 },
+		),
+);
 
 const missingLedgerDb = {
 	prepare(sql: string) {
@@ -124,9 +133,9 @@ function allowedTurnDb(): D1Database & { hasTurn(): boolean } {
 						return { meta: { changes: 1 } };
 					}
 					if (
-						normalized.startsWith('DELETE FROM free_chat_turns')
-						&& normalized.includes('request_count = 1')
-						&& String(args[2]) === leaseToken
+						normalized.startsWith('DELETE FROM free_chat_turns') &&
+						normalized.includes('request_count = 1') &&
+						String(args[2]) === leaseToken
 					) {
 						inserted = false;
 						return { meta: { changes: 1 } };
@@ -153,6 +162,26 @@ function allowedTurnDb(): D1Database & { hasTurn(): boolean } {
 	return db as unknown as D1Database & { hasTurn(): boolean };
 }
 
+function usageStatusDb(used: number): D1Database {
+	return {
+		prepare(sql: string) {
+			const normalized = sql.replace(/\s+/g, ' ').trim();
+			return {
+				bind() {
+					return {
+						async first<T>() {
+							if (normalized.startsWith('SELECT daily_count, last_reset')) return null;
+							if (normalized.startsWith('SELECT CASE WHEN cost_day')) return { daily_cost: 0 } as T;
+							if (normalized.startsWith('SELECT COUNT')) return { count: used } as T;
+							return null;
+						},
+					};
+				},
+			};
+		},
+	} as unknown as D1Database;
+}
+
 type DispatchLedgerSnapshot = {
 	turn: null | {
 		status: 'pending' | 'completed';
@@ -166,7 +195,7 @@ type DispatchLedgerSnapshot = {
 	shadow: null | { status: 'reserved' | 'settled'; amountMicroUsd: number };
 };
 
-function dispatchInvariantDb(): D1Database & { snapshot(): DispatchLedgerSnapshot } {
+function dispatchInvariantDb(options: { failBatchStatement?: number } = {}): D1Database & { snapshot(): DispatchLedgerSnapshot } {
 	let turn: DispatchLedgerSnapshot['turn'] = null;
 	let globalCount = 0;
 	let networkCount = 0;
@@ -174,6 +203,25 @@ function dispatchInvariantDb(): D1Database & { snapshot(): DispatchLedgerSnapsho
 	let shadowLease = '';
 	let shadowUser = '';
 	let shadowTurn = '';
+	type MockBatchStatement = { run(): Promise<{ meta: { changes: number } }> };
+	const snapshotState = () => ({
+		turn: turn ? { ...turn } : null,
+		globalCount,
+		networkCount,
+		shadow: shadow ? { ...shadow } : null,
+		shadowLease,
+		shadowUser,
+		shadowTurn,
+	});
+	const restoreState = (state: ReturnType<typeof snapshotState>) => {
+		turn = state.turn;
+		globalCount = state.globalCount;
+		networkCount = state.networkCount;
+		shadow = state.shadow;
+		shadowLease = state.shadowLease;
+		shadowUser = state.shadowUser;
+		shadowTurn = state.shadowTurn;
+	};
 	const db = {
 		prepare(sql: string) {
 			const normalized = sql.replace(/\s+/g, ' ').trim();
@@ -237,25 +285,15 @@ function dispatchInvariantDb(): D1Database & { snapshot(): DispatchLedgerSnapsho
 					}
 					if (normalized.startsWith('UPDATE free_chat_shadow_reservations')) {
 						const [leaseToken, userId, turnHash] = args as [string, string, string];
-						if (
-							!shadow
-							|| shadow.status !== 'reserved'
-							|| leaseToken !== shadowLease
-							|| userId !== shadowUser
-							|| turnHash !== shadowTurn
-						) return { meta: { changes: 0 } };
+						if (!shadow || shadow.status !== 'reserved' || leaseToken !== shadowLease || userId !== shadowUser || turnHash !== shadowTurn)
+							return { meta: { changes: 0 } };
 						shadow.status = 'settled';
 						return { meta: { changes: 1 } };
 					}
 					if (normalized.startsWith('DELETE FROM free_chat_shadow_reservations')) {
 						const [leaseToken, userId, turnHash] = args as [string, string, string];
-						if (
-							!shadow
-							|| shadow.status !== 'reserved'
-							|| leaseToken !== shadowLease
-							|| userId !== shadowUser
-							|| turnHash !== shadowTurn
-						) return { meta: { changes: 0 } };
+						if (!shadow || shadow.status !== 'reserved' || leaseToken !== shadowLease || userId !== shadowUser || turnHash !== shadowTurn)
+							return { meta: { changes: 0 } };
 						shadow = null;
 						return { meta: { changes: 1 } };
 					}
@@ -291,10 +329,35 @@ function dispatchInvariantDb(): D1Database & { snapshot(): DispatchLedgerSnapsho
 				},
 			});
 			return {
-				bind(...args: unknown[]) { return bound(args); },
-				async first<T>() { return bound([]).first<T>(); },
-				async run() { return bound([]).run(); },
+				bind(...args: unknown[]) {
+					return bound(args);
+				},
+				async first<T>() {
+					return bound([]).first<T>();
+				},
+				async run() {
+					return bound([]).run();
+				},
 			};
+		},
+		async batch(statements: MockBatchStatement[]) {
+			// D1 executes a batch transactionally: if any statement fails, none of
+			// its mutations are committed. Preserve that behavior in the route mock
+			// so dispatch-boundary tests catch one-sided ledger commits.
+			const before = snapshotState();
+			const results: Array<{ meta: { changes: number } }> = [];
+			try {
+				for (const [index, statement] of statements.entries()) {
+					if (options.failBatchStatement === index + 1) {
+						throw new Error(`injected D1 batch failure at statement ${index + 1}`);
+					}
+					results.push(await statement.run());
+				}
+				return results;
+			} catch (error) {
+				restoreState(before);
+				throw error;
+			}
 		},
 		snapshot(): DispatchLedgerSnapshot {
 			return {
@@ -341,7 +404,7 @@ function chatRequest(headers?: HeadersInit, content = TEST_TURN): Request {
 }
 
 async function errorCode(response: Response): Promise<string> {
-	const outer = await response.json() as { error: string };
+	const outer = (await response.json()) as { error: string };
 	return JSON.parse(outer.error).error;
 }
 
@@ -353,79 +416,118 @@ const hostedRouteCases: Array<{
 	{
 		name: 'web search',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/web-search', {
-			method: 'POST', headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' }, body: '{}',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/web-search', {
+				method: 'POST',
+				headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' },
+				body: '{}',
+			}),
 	},
 	{
 		name: 'file transcription',
 		capability: 'cloud_transcription',
-		request: (authorization) => new Request('https://gateway.test/v1/listen', {
-			method: 'POST', headers: authorization ? { Authorization: authorization } : {}, body: 'audio',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/listen', {
+				method: 'POST',
+				headers: authorization ? { Authorization: authorization } : {},
+				body: 'audio',
+			}),
 	},
 	{
 		name: 'realtime transcription',
 		capability: 'cloud_transcription',
-		request: (authorization) => new Request('https://gateway.test/v1/realtime', {
-			headers: authorization ? { Authorization: authorization } : {},
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/realtime', {
+				headers: authorization ? { Authorization: authorization } : {},
+			}),
 	},
 	{
 		name: 'Tinfoil chat',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/tinfoil/chat/completions', {
-			method: 'POST', headers: authorization ? { Authorization: authorization } : {}, body: 'encrypted',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/tinfoil/chat/completions', {
+				method: 'POST',
+				headers: authorization ? { Authorization: authorization } : {},
+				body: 'encrypted',
+			}),
 	},
 	{
 		name: 'Tinfoil responses',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/tinfoil/responses', {
-			method: 'POST', headers: authorization ? { Authorization: authorization } : {}, body: 'encrypted',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/tinfoil/responses', {
+				method: 'POST',
+				headers: authorization ? { Authorization: authorization } : {},
+				body: 'encrypted',
+			}),
 	},
 	{
 		name: 'voice transcription',
 		capability: 'cloud_transcription',
-		request: (authorization) => new Request('https://gateway.test/v1/voice/transcribe', {
-			method: 'POST', headers: authorization ? { Authorization: authorization } : {}, body: 'audio',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/voice/transcribe', {
+				method: 'POST',
+				headers: authorization ? { Authorization: authorization } : {},
+				body: 'audio',
+			}),
 	},
 	{
 		name: 'voice query',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/voice/query', {
-			method: 'POST', headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' }, body: '{}',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/voice/query', {
+				method: 'POST',
+				headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' },
+				body: '{}',
+			}),
 	},
 	{
 		name: 'text to speech',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/text-to-speech', {
-			method: 'POST', headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' }, body: '{}',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/text-to-speech', {
+				method: 'POST',
+				headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' },
+				body: '{}',
+			}),
 	},
 	{
 		name: 'voice chat',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/voice/chat', {
-			method: 'POST', headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' }, body: '{}',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/voice/chat', {
+				method: 'POST',
+				headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' },
+				body: '{}',
+			}),
 	},
 	{
 		name: 'Vertex Anthropic messages',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/v1/messages', {
-			method: 'POST', headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' }, body: '{}',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/v1/messages', {
+				method: 'POST',
+				headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' },
+				body: '{}',
+			}),
 	},
 	{
 		name: 'OpenCode Anthropic messages',
 		capability: 'hosted_ai',
-		request: (authorization) => new Request('https://gateway.test/anthropic/v1/messages', {
-			method: 'POST', headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' }, body: '{}',
-		}),
+		request: (authorization) =>
+			new Request('https://gateway.test/anthropic/v1/messages', {
+				method: 'POST',
+				headers: { ...(authorization ? { Authorization: authorization } : {}), 'Content-Type': 'application/json' },
+				body: '{}',
+			}),
+	},
+	{
+		name: 'OpenCode Anthropic model catalog',
+		capability: 'hosted_ai',
+		request: (authorization) =>
+			new Request('https://gateway.test/anthropic/v1/models', {
+				headers: authorization ? { Authorization: authorization } : {},
+			}),
 	},
 ];
 
@@ -436,10 +538,13 @@ describe('staged free-tier hosted route gates', () => {
 		verifyTokenMock.mockImplementation(async () => ({ sub: 'user_free' }));
 		rateLimiterFetch.mockClear();
 		handleChatCompletionsMock.mockClear();
-		handleChatCompletionsMock.mockImplementation(async () => new Response('{"ok":true}', {
-			status: 200,
-			headers: { 'Content-Type': 'application/json', 'x-screenpipe-model': 'glm-4.7' },
-		}));
+		handleChatCompletionsMock.mockImplementation(
+			async () =>
+				new Response('{"ok":true}', {
+					status: 200,
+					headers: { 'Content-Type': 'application/json', 'x-screenpipe-model': 'glm-4.7' },
+				}),
+		);
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const url = String(input);
 			if (url.includes('/rest/v1/users?select=id&clerk_id=')) {
@@ -449,10 +554,13 @@ describe('staged free-tier hosted route gates', () => {
 				return new Response('[]', { status: 200 });
 			}
 			if (url === 'https://screenpipe.com/api/user') {
-				return new Response(JSON.stringify({
-					success: true,
-					user: { clerk_id: 'user_free', cloud_subscribed: false, app_entitled: false },
-				}), { status: 200 });
+				return new Response(
+					JSON.stringify({
+						success: true,
+						user: { clerk_id: 'user_free', cloud_subscribed: false, app_entitled: false },
+					}),
+					{ status: 200 },
+				);
 			}
 			throw new Error(`unexpected upstream fetch: ${url}`);
 		}) as typeof fetch;
@@ -472,9 +580,7 @@ describe('staged free-tier hosted route gates', () => {
 			const freeAccount = await handleRequest(routeCase.request('Bearer verified-clerk-token'), env, ctx);
 			expect(freeAccount.status).toBe(402);
 			expect(await errorCode(freeAccount)).toBe(
-				routeCase.capability === 'cloud_transcription'
-					? 'cloud_transcription_subscription_required'
-					: 'hosted_ai_subscription_required',
+				routeCase.capability === 'cloud_transcription' ? 'cloud_transcription_subscription_required' : 'hosted_ai_subscription_required',
 			);
 		});
 	}
@@ -493,6 +599,83 @@ describe('staged free-tier hosted route gates', () => {
 		expect(response.headers.get('X-Free-Chat-Preview')).toBe('true');
 	});
 
+	it('returns the authoritative lifetime preview counter from the usage endpoint', async () => {
+		const response = await handleRequest(
+			new Request('https://gateway.test/v1/usage', {
+				headers: { Authorization: 'Bearer verified-clerk-token' },
+			}),
+			{ ...env, DB: usageStatusDb(1) } as Env,
+			ctx,
+		);
+
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as { free_chat?: { used: number; limit: number; remaining: number } };
+		expect(body.free_chat).toEqual({ used: 1, limit: 2, remaining: 1 });
+	});
+
+	it('fails the usage endpoint closed when the preview ledger cannot be read', async () => {
+		const response = await handleRequest(
+			new Request('https://gateway.test/v1/usage', {
+				headers: { Authorization: 'Bearer verified-clerk-token' },
+			}),
+			env,
+			ctx,
+		);
+
+		expect(response.status).toBe(503);
+		expect(await errorCode(response)).toBe('free_chat_ledger_unavailable');
+	});
+
+	it('does not show Clerk-authenticated users as downgraded in entitlement metadata during lookup outages', async () => {
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes('/rest/v1/users?select=id&clerk_id=')) {
+				return new Response(JSON.stringify([{ id: '00000000-0000-4000-8000-000000000001' }]), { status: 200 });
+			}
+			if (url.includes('/rest/v1/cloud_subscriptions?') || url === 'https://screenpipe.com/api/user') {
+				return new Response('unavailable', { status: 503 });
+			}
+			throw new Error(`unexpected upstream fetch: ${url}`);
+		}) as typeof fetch;
+
+		for (const path of ['/v1/usage', '/v1/models']) {
+			const response = await handleRequest(
+				new Request(`https://gateway.test${path}`, {
+					headers: { Authorization: 'Bearer verified-clerk-token' },
+				}),
+				env,
+				ctx,
+			);
+			expect(response.status).toBe(503);
+			expect(await errorCode(response)).toBe('subscription_status_unavailable');
+		}
+	});
+
+	it('does not show legacy-token users as downgraded in entitlement metadata during lookup outages', async () => {
+		verifyTokenMock.mockImplementation(async () => {
+			throw new Error('not a Clerk token');
+		});
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url === 'https://screenpipe.com/api/user') {
+				return new Response('unavailable', { status: 503 });
+			}
+			throw new Error(`unexpected upstream fetch: ${url}`);
+		}) as typeof fetch;
+
+		for (const path of ['/v1/usage', '/v1/models']) {
+			const response = await handleRequest(
+				new Request(`https://gateway.test${path}`, {
+					headers: { Authorization: 'Bearer eyJ.legacy.metadata-outage' },
+				}),
+				env,
+				ctx,
+			);
+			expect(response.status).toBe(503);
+			expect(await errorCode(response)).toBe('subscription_status_unavailable');
+		}
+	});
+
 	it('keeps raw health headers visible while an invalid rollout fails every hosted inference route closed', async () => {
 		const invalidEnv = {
 			...env,
@@ -504,20 +687,12 @@ describe('staged free-tier hosted route gates', () => {
 		expect(health.headers.get('X-Free-Local-Tier-Enforcement')).toBe('false');
 		expect(health.headers.get('X-Free-Chat-Preview')).toBe('true');
 
-		const chat = await handleRequest(
-			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
-			invalidEnv,
-			ctx,
-		);
+		const chat = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), invalidEnv, ctx);
 		expect(chat.status).toBe(503);
 		expect(await errorCode(chat)).toBe('free_tier_rollout_misconfigured');
 
 		for (const routeCase of hostedRouteCases) {
-			const response = await handleRequest(
-				routeCase.request('Bearer verified-clerk-token'),
-				invalidEnv,
-				ctx,
-			);
+			const response = await handleRequest(routeCase.request('Bearer verified-clerk-token'), invalidEnv, ctx);
 			expect(response.status).toBe(503);
 			expect(await errorCode(response)).toBe('free_tier_rollout_misconfigured');
 		}
@@ -537,7 +712,9 @@ describe('staged free-tier hosted route gates', () => {
 		} as unknown as Env;
 		const pending: Promise<unknown>[] = [];
 		const scheduledCtx = {
-			waitUntil(promise: Promise<unknown>) { pending.push(promise); },
+			waitUntil(promise: Promise<unknown>) {
+				pending.push(promise);
+			},
 			passThroughOnException() {},
 		} as unknown as ExecutionContext;
 
@@ -561,6 +738,41 @@ describe('staged free-tier hosted route gates', () => {
 		expect(rateLimiterFetch).not.toHaveBeenCalled();
 	});
 
+	it('keeps every hosted route paid-only in the safe rollback state (enforcement on, preview off)', async () => {
+		const rollbackEnv = { ...env, FREE_CHAT_PREVIEW_ENABLED: 'false' } as Env;
+		for (const routeCase of hostedRouteCases) {
+			const response = await handleRequest(routeCase.request('Bearer verified-clerk-token'), rollbackEnv, ctx);
+			expect(response.status).toBe(402);
+			expect(await errorCode(response)).toBe(
+				routeCase.capability === 'cloud_transcription' ? 'cloud_transcription_subscription_required' : 'hosted_ai_subscription_required',
+			);
+		}
+		expect(handleChatCompletionsMock).not.toHaveBeenCalled();
+	});
+
+	it('preserves the legacy prelaunch path only when both rollout flags are off', async () => {
+		const prelaunchEnv = {
+			...env,
+			FREE_LOCAL_TIER_ENFORCEMENT_ENABLED: 'false',
+			FREE_CHAT_PREVIEW_ENABLED: 'false',
+		} as Env;
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), prelaunchEnv, ctx);
+
+		expect(response.status).toBe(200);
+		expect(handleChatCompletionsMock).toHaveBeenCalledTimes(1);
+		expect(handleChatCompletionsMock.mock.calls[0]?.[0]).toMatchObject({ model: 'auto' });
+		expect(handleChatCompletionsMock.mock.calls[0]?.[0]?.freePreview).toBeUndefined();
+
+		const authenticatedFree = {
+			tier: 'logged_in',
+			deviceId: 'user_free',
+			userId: 'user_free',
+		} as const;
+		for (const routeCase of hostedRouteCases) {
+			expect(hostedBusinessGate(prelaunchEnv, authenticatedFree, routeCase.capability)).toBeNull();
+		}
+	});
+
 	it('requires the new client turn marker before rate limits, D1, or inference', async () => {
 		const response = await handleRequest(
 			chatRequest({ Authorization: 'Bearer verified-clerk-token' }, 'unmarked old-client request'),
@@ -570,6 +782,39 @@ describe('staged free-tier hosted route gates', () => {
 		expect(response.status).toBe(426);
 		expect(await errorCode(response)).toBe('free_chat_client_update_required');
 		expect(rateLimiterFetch).not.toHaveBeenCalled();
+	});
+
+	it('bounds the raw preview body before parsing or stripping internal fields', async () => {
+		const oversizedBodies = [
+			JSON.stringify({
+				model: 'auto',
+				messages: [{ role: 'user', content: TEST_TURN }],
+				freePreview: 'x'.repeat(2_000),
+			}),
+			`${' '.repeat(2_000)}${JSON.stringify({
+				model: 'auto',
+				messages: [{ role: 'user', content: TEST_TURN }],
+			})}`,
+		];
+
+		for (const body of oversizedBodies) {
+			const response = await handleRequest(
+				new Request('https://gateway.test/v1/chat/completions', {
+					method: 'POST',
+					headers: {
+						Authorization: 'Bearer verified-clerk-token',
+						'Content-Type': 'application/json',
+					},
+					body,
+				}),
+				{ ...env, FREE_CHAT_MAX_INPUT_BYTES: '1000' } as Env,
+				ctx,
+			);
+			expect(response.status).toBe(413);
+			expect(await errorCode(response)).toBe('free_chat_input_too_large');
+		}
+		expect(rateLimiterFetch).not.toHaveBeenCalled();
+		expect(handleChatCompletionsMock).not.toHaveBeenCalled();
 	});
 
 	it('returns a structured 429 when the global daily new-turn circuit breaker is full', async () => {
@@ -598,6 +843,33 @@ describe('staged free-tier hosted route gates', () => {
 		expect(db.hasTurn()).toBe(false);
 	});
 
+	it('canonicalizes accepted Auto spelling before the funded provider dispatch', async () => {
+		const db = dispatchInvariantDb();
+		const response = await handleRequest(
+			new Request('https://gateway.test/v1/chat/completions', {
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer verified-clerk-token',
+					'Content-Type': 'application/json',
+					'cf-connecting-ip': '203.0.113.7',
+				},
+				body: JSON.stringify({
+					model: '  AUTO\t',
+					messages: [{ role: 'user', content: TEST_TURN }],
+				}),
+			}),
+			{ ...env, DB: db } as Env,
+			ctx,
+		);
+
+		expect(response.status).toBe(200);
+		expect(handleChatCompletionsMock).toHaveBeenCalledTimes(1);
+		expect(handleChatCompletionsMock.mock.calls[0]?.[0]).toMatchObject({
+			model: 'auto',
+			freePreview: true,
+		});
+	});
+
 	it('keeps every allowance consumed when provider dispatch throws or times out', async () => {
 		const db = dispatchInvariantDb();
 		let atDispatch: DispatchLedgerSnapshot | undefined;
@@ -606,11 +878,7 @@ describe('staged free-tier hosted route gates', () => {
 			throw new Error('upstream timeout after provider dispatch');
 		});
 
-		const response = await handleRequest(
-			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
-			{ ...env, DB: db } as Env,
-			ctx,
-		);
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), { ...env, DB: db } as Env, ctx);
 
 		expect(response.status).toBe(500);
 		expect(handleChatCompletionsMock).toHaveBeenCalledTimes(1);
@@ -640,6 +908,22 @@ describe('staged free-tier hosted route gates', () => {
 		});
 	});
 
+	it('rolls back a second-statement dispatch-guard failure without inference or lifetime-turn consumption', async () => {
+		const db = dispatchInvariantDb({ failBatchStatement: 2 });
+
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), { ...env, DB: db } as Env, ctx);
+
+		expect(response.status).toBe(503);
+		expect(await errorCode(response)).toBe('free_chat_dispatch_guard_unavailable');
+		expect(handleChatCompletionsMock).not.toHaveBeenCalled();
+		expect(db.snapshot()).toEqual({
+			turn: null,
+			globalCount: 0,
+			networkCount: 0,
+			shadow: null,
+		});
+	});
+
 	it('keeps every allowance consumed when the fallback cascade ends in a 5xx', async () => {
 		const db = dispatchInvariantDb();
 		let atDispatch: DispatchLedgerSnapshot | undefined;
@@ -651,11 +935,7 @@ describe('staged free-tier hosted route gates', () => {
 			});
 		});
 
-		const response = await handleRequest(
-			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
-			{ ...env, DB: db } as Env,
-			ctx,
-		);
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), { ...env, DB: db } as Env, ctx);
 
 		expect(response.status).toBe(503);
 		expect(handleChatCompletionsMock).toHaveBeenCalledTimes(1);
@@ -686,11 +966,7 @@ describe('staged free-tier hosted route gates', () => {
 	});
 
 	it('fails closed with a structured 503 when the staged D1 migration is missing', async () => {
-		const response = await handleRequest(
-			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
-			env,
-			ctx,
-		);
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), env, ctx);
 		expect(response.status).toBe(503);
 		expect(await errorCode(response)).toBe('free_chat_ledger_unavailable');
 	});
@@ -710,13 +986,49 @@ describe('staged free-tier hosted route gates', () => {
 			throw new Error(`unexpected upstream fetch: ${url}`);
 		}) as typeof fetch;
 
-		const response = await handleRequest(
-			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
-			env,
-			ctx,
-		);
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), env, ctx);
 		expect(response.status).toBe(503);
 		expect(await errorCode(response)).toBe('subscription_status_unavailable');
+	});
+
+	it('returns retryable 503 for an old client when legacy token lookup is unavailable', async () => {
+		verifyTokenMock.mockImplementation(async () => {
+			throw new Error('not a Clerk token');
+		});
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url === 'https://screenpipe.com/api/user') {
+				return new Response('unavailable', { status: 503 });
+			}
+			throw new Error(`unexpected upstream fetch: ${url}`);
+		}) as typeof fetch;
+
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer eyJ.legacy.outage' }), env, ctx);
+
+		expect(response.status).toBe(503);
+		expect(await errorCode(response)).toBe('subscription_status_unavailable');
+		expect(rateLimiterFetch).not.toHaveBeenCalled();
+		expect(handleChatCompletionsMock).not.toHaveBeenCalled();
+	});
+
+	it('returns retryable 503 for an old client when legacy token lookup has a network failure', async () => {
+		verifyTokenMock.mockImplementation(async () => {
+			throw new Error('not a Clerk token');
+		});
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url === 'https://screenpipe.com/api/user') {
+				throw new Error('network offline');
+			}
+			throw new Error(`unexpected upstream fetch: ${url}`);
+		}) as typeof fetch;
+
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer eyJ.legacy.network' }), env, ctx);
+
+		expect(response.status).toBe(503);
+		expect(await errorCode(response)).toBe('subscription_status_unavailable');
+		expect(rateLimiterFetch).not.toHaveBeenCalled();
+		expect(handleChatCompletionsMock).not.toHaveBeenCalled();
 	});
 
 	it('keeps cloud file and realtime transcription subscriber-only', async () => {
@@ -731,36 +1043,31 @@ describe('staged free-tier hosted route gates', () => {
 	});
 
 	it('closes the Anthropic server-key route for a verified free account', async () => {
-		const response = await handleRequest(new Request('https://gateway.test/v1/messages', {
-			method: 'POST',
-			headers: {
-				Authorization: 'Bearer verified-clerk-token',
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] }),
-		}), env, ctx);
-		expect(response.status).toBe(402);
-		expect(await errorCode(response)).toBe('hosted_ai_subscription_required');
-	});
-
-	it('keeps alternate hosted routes gated when the interactive preview is off', async () => {
-		const response = await handleRequest(new Request('https://gateway.test/v1/messages', {
-			method: 'POST',
-			headers: {
-				Authorization: 'Bearer verified-clerk-token',
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] }),
-		}), { ...env, FREE_CHAT_PREVIEW_ENABLED: 'false' } as Env, ctx);
+		const response = await handleRequest(
+			new Request('https://gateway.test/v1/messages', {
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer verified-clerk-token',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] }),
+			}),
+			env,
+			ctx,
+		);
 		expect(response.status).toBe(402);
 		expect(await errorCode(response)).toBe('hosted_ai_subscription_required');
 	});
 
 	it('closes Tinfoil inference while leaving attestation outside the paid gate', async () => {
-		const response = await handleRequest(new Request('https://gateway.test/v1/tinfoil/responses', {
-			method: 'POST',
-			body: 'encrypted',
-		}), env, ctx);
+		const response = await handleRequest(
+			new Request('https://gateway.test/v1/tinfoil/responses', {
+				method: 'POST',
+				body: 'encrypted',
+			}),
+			env,
+			ctx,
+		);
 		expect(response.status).toBe(401);
 		expect(await errorCode(response)).toBe('hosted_ai_sign_in_required');
 	});

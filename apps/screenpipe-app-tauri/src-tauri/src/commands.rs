@@ -523,7 +523,8 @@ pub fn get_enterprise_team_api_token() -> Option<String> {
 /// mirrored into an in-process cache at startup and on every
 /// `set_cloud_token`; that cache is served first. The legacy plaintext
 /// `~/.screenpipe/auth.json` (the CLI credential file) remains as a fallback
-/// for installs that have not migrated yet; sign-out removes it. Returns
+/// only for installs that have not migrated yet; successful migration or
+/// token rotation removes its JWT field. Sign-out removes it. Returns
 /// None when signed out. Used by the settings hydration and the
 /// enterprise-policy hook to send the Bearer header even when the in-app
 /// user object is still null.
@@ -549,6 +550,32 @@ pub fn get_cloud_token() -> Option<String> {
         .map(String::from)
 }
 
+async fn stop_background_pipes_for_cloud_identity_change(
+    state: &crate::recording::RecordingState,
+) -> Result<(), String> {
+    let pipe_manager = {
+        let server = state.server.lock().await;
+        server.as_ref().map(|core| core.pipe_manager.clone())
+    };
+    let Some(pipe_manager) = pipe_manager else {
+        return Ok(());
+    };
+    let statuses = pipe_manager
+        .lock()
+        .await
+        .stop_all_running_pipes_and_wait(std::time::Duration::from_secs(7))
+        .await
+        .map_err(|error| format!("failed to stop background Pi work: {error}"))?;
+    if !statuses.is_empty() {
+        info!(
+            "stopped {} background pipe execution(s) for cloud identity change: {:?}",
+            statuses.len(),
+            statuses
+        );
+    }
+    Ok(())
+}
+
 /// Push a fresh cloud-auth token into the running sidecar.
 ///
 /// The frontend invokes this on every sign-in (after `loadUser` writes
@@ -570,39 +597,239 @@ pub fn get_cloud_token() -> Option<String> {
 #[specta::specta]
 pub async fn set_cloud_token(
     token: Option<String>,
+    expected_current_token: Option<String>,
+    force_clear: bool,
     state: tauri::State<'_, crate::recording::RecordingState>,
+    pi_state: tauri::State<'_, crate::pi::PiState>,
 ) -> Result<(), String> {
     let supplied_non_empty = token.as_ref().is_some_and(|value| !value.is_empty());
     let normalized = crate::auth_token::normalize_cloud_token(token);
     if supplied_non_empty && normalized.is_none() {
         return Err("invalid_cloud_session_token".to_string());
     }
-    let should_clear_pi_auth = normalized.is_none();
-    // Unblock cloud calls for THIS session first — the ArcSwap + cache are the
-    // runtime source of truth, so a failed durable write below never breaks an
-    // active sign-in.
-    state
-        .cloud_token
-        .store(std::sync::Arc::new(normalized.clone()));
 
-    // Sign-out: scrub the screenpipe token from pi's auth files before the
-    // fallible secret-store write so the on-disk copies never outlive the
-    // session even if persistence below fails.
-    if should_clear_pi_auth {
-        if let Err(e) = crate::pi::clear_screenpipe_auth_token_files() {
-            warn!("failed to clear pi screenpipe auth token: {}", e);
-        }
+    // Multiple webviews, a token refresh, and an explicit logout can all call
+    // this command concurrently. Serialize the complete identity transition —
+    // including durable persistence — so an older write cannot finish last and
+    // resurrect a credential that a newer call already replaced.
+    let _auth_update_guard = pi_state.lock_auth_update().await;
+    // Serialize the credential transition with every foreground/background
+    // Pi config write and the child spawn that consumes it. A run that already
+    // crossed spawn may finish under its captured identity; once this guard is
+    // acquired, no older run can rewrite A's files after B/logout commits.
+    let _pi_config_spawn_guard = screenpipe_core::agents::pi::lock_pi_config_spawn().await;
+    let supplied_expected_non_empty = expected_current_token
+        .as_ref()
+        .is_some_and(|value| !value.is_empty());
+    let expected = crate::auth_token::normalize_cloud_token(expected_current_token);
+    if supplied_expected_non_empty && expected.is_none() {
+        return Err("invalid_expected_cloud_session_token".to_string());
+    }
+    let previous = state.cloud_token.load_full();
+    let previous_identity = previous.as_ref().clone();
+    if !cloud_token_compare_and_set_allowed(
+        previous.as_ref(),
+        &normalized,
+        &expected,
+        force_clear,
+    ) {
+        return Err("cloud_auth_identity_changed".to_string());
+    }
+    let should_invalidate_pi_sessions = should_invalidate_pi_sessions_for_cloud_auth(
+        previous.as_ref(),
+        &normalized,
+        &expected,
+        force_clear,
+    );
+    // Pi children retain SCREENPIPE_API_KEY and queued work from their spawn.
+    // Every explicit sign-out must invalidate them even if the Arc was already
+    // empty; a different non-empty token also means an account/credential
+    // boundary. Keep the Pi pool locked while updating the runtime token and
+    // scrubbing auth files, so a concurrent start/send cannot cross that gap.
+    // Local/BYOK chats auto-start again on the next user message.
+    let transition_result = if should_invalidate_pi_sessions {
+        let (_, result) = crate::pi::stop_all_pi_sessions_and_then_async(
+            &pi_state,
+            "cloud auth identity change",
+            || async {
+                // Background/event-triggered Pi processes are not owned by
+                // PiState and may retain spawn-time credentials. Drain them
+                // under the shared config/spawn lock before publishing or
+                // persisting a new cloud identity.
+                stop_background_pipes_for_cloud_identity_change(&state).await?;
+                // Publish a transient signed-out state to every ArcSwap reader
+                // before touching disk. The background Pi executor is separate
+                // from PiState; without this on A→B (not only logout), a newly
+                // scheduled run could snapshot A while B's SecretStore commit
+                // was still awaiting. Already-dispatched work is bounded and
+                // may finish, but no new work can acquire the prior identity.
+                if previous_identity != normalized {
+                    state.cloud_token.store(std::sync::Arc::new(None));
+                }
+                // Scrub both auth.json and models.json on logout AND account
+                // rotation. The new identity is written back only when its Pi
+                // process starts; no raw token from the previous account may
+                // survive that boundary on disk.
+                let scrub_result = crate::pi::clear_screenpipe_auth_token_files();
+
+                if normalized.is_some() && scrub_result.is_err() {
+                    // The non-null rotation never committed. Restore the
+                    // previous authoritative identity so the still-visible A
+                    // account is not left split from native runtime state.
+                    state
+                        .cloud_token
+                        .store(std::sync::Arc::new(previous_identity.clone()));
+                    return scrub_result;
+                }
+
+                // Non-null account rotation commits durably before becoming
+                // visible in runtime state. Logout is the opposite: clear the
+                // runtime first and remain fail-closed even if deletion fails.
+                let persistence_result = crate::auth_token::store_cloud_token(
+                    normalized.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("failed to persist cloud token to secret store: {e}"));
+                if normalized.is_some() && persistence_result.is_ok() {
+                    state
+                        .cloud_token
+                        .store(std::sync::Arc::new(normalized.clone()));
+                } else if normalized.is_some() {
+                    // The store helper normally rolls a partial B write back
+                    // to A, but a rollback can itself fail. Do not guess which
+                    // durable identity won: keep every runtime reader signed
+                    // out until the UI retries or the next launch resolves the
+                    // authoritative SecretStore row.
+                    crate::auth_token::seed_cloud_token(None);
+                    state.cloud_token.store(std::sync::Arc::new(None));
+                }
+
+                match (scrub_result, persistence_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(pi_error), Ok(())) if normalized.is_none() => {
+                        // Runtime and durable sign-out already committed. A
+                        // malformed isolated Pi file is unusable and was
+                        // deliberately preserved instead of wiping the user's
+                        // other provider config; report it in logs without
+                        // making the webview resurrect the signed-out account.
+                        warn!(
+                            "signed out, but preserved an unreadable isolated Pi config: {}",
+                            pi_error
+                        );
+                        Ok(())
+                    }
+                    (Err(pi_error), Ok(())) => {
+                        Err(format!("failed to scrub Pi cloud token: {pi_error}"))
+                    }
+                    (Ok(()), Err(store_error)) => Err(store_error),
+                    (Err(pi_error), Err(store_error)) => Err(format!(
+                        "failed to scrub Pi cloud token: {pi_error}; {store_error}"
+                    )),
+                }
+            },
+        )
+        .await;
+        result
+    } else {
+        // Idempotent same-token refresh: no process restart, but refresh the
+        // durable row/cache. A failure leaves the already-active identity
+        // untouched.
+        crate::auth_token::store_cloud_token(normalized.as_deref())
+            .await
+            .map_err(|e| format!("failed to persist cloud token to secret store: {e}"))
+    };
+    transition_result
+}
+
+/// Compare-and-set contract for the process-wide cloud identity. A user-driven
+/// logout may force-clear any previous identity. Automatic invalidation and
+/// non-null writes must still target the identity they started from; an
+/// idempotent write of the identity that already won is also safe. This keeps a
+/// late account-A refresh/401 from overwriting or clearing account B.
+fn cloud_token_compare_and_set_allowed(
+    previous: &Option<String>,
+    next: &Option<String>,
+    expected: &Option<String>,
+    force_clear: bool,
+) -> bool {
+    (force_clear && next.is_none()) || previous == expected || previous == next
+}
+
+fn should_invalidate_pi_sessions_for_cloud_auth(
+    previous: &Option<String>,
+    next: &Option<String>,
+    expected: &Option<String>,
+    force_clear: bool,
+) -> bool {
+    previous != next || (next.is_none() && (force_clear || expected.is_some()))
+}
+
+#[cfg(test)]
+mod cloud_token_cas_tests {
+    use super::{
+        cloud_token_compare_and_set_allowed, should_invalidate_pi_sessions_for_cloud_auth,
+    };
+
+    fn token(value: &str) -> Option<String> {
+        Some(value.to_string())
     }
 
-    // #3943: persist to the encrypted secret store (authoritative at-rest copy)
-    // and refresh the in-process cache. We surface a persistence failure as an
-    // Err so the frontend won't strip the last plaintext copy of a token it
-    // couldn't durably save (the caller ignores the Result for session purposes;
-    // only the save-and-strip path checks it).
-    crate::auth_token::store_cloud_token(normalized.as_deref())
-        .await
-        .map_err(|e| format!("failed to persist cloud token to secret store: {e}"))?;
-    Ok(())
+    #[test]
+    fn stale_refresh_or_automatic_clear_cannot_cross_accounts() {
+        assert!(!cloud_token_compare_and_set_allowed(
+            &token("account-b"),
+            &token("account-a"),
+            &token("account-a"),
+            false,
+        ));
+        assert!(!cloud_token_compare_and_set_allowed(
+            &token("account-b"),
+            &None,
+            &token("account-a"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn expected_rotation_idempotence_and_explicit_logout_are_allowed() {
+        assert!(cloud_token_compare_and_set_allowed(
+            &token("account-a"),
+            &token("account-b"),
+            &token("account-a"),
+            false,
+        ));
+        assert!(cloud_token_compare_and_set_allowed(
+            &token("account-b"),
+            &token("account-b"),
+            &token("account-a"),
+            false,
+        ));
+        assert!(cloud_token_compare_and_set_allowed(
+            &token("account-b"),
+            &None,
+            &token("account-a"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn failed_logout_scrub_retries_but_signed_out_noop_preserves_local_pi() {
+        assert!(should_invalidate_pi_sessions_for_cloud_auth(
+            &None,
+            &None,
+            &token("account-a"),
+            false,
+        ));
+        assert!(!should_invalidate_pi_sessions_for_cloud_auth(
+            &None, &None, &None, false,
+        ));
+        assert!(should_invalidate_pi_sessions_for_cloud_auth(
+            &token("account-a"),
+            &None,
+            &token("account-a"),
+            false,
+        ));
+    }
 }
 
 /// Persist the user's enterprise admin status + team API token so the

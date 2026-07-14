@@ -293,6 +293,34 @@ describe('validateAuth — verified identities only', () => {
     });
   });
 
+  it('marks a legacy screenpipe JWT lookup 5xx as unavailable instead of signed out', async () => {
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('https://screenpipe.com/api/user');
+      return new Response('temporarily unavailable', { status: 503 });
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.legacy.outage'), env)).toEqual({
+      isValid: true,
+      tier: 'anonymous',
+      deviceId: 'device-from-header',
+      error: 'subscription_lookup_unavailable',
+    });
+  });
+
+  it('marks a legacy screenpipe JWT lookup network failure as unavailable', async () => {
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('https://screenpipe.com/api/user');
+      throw new Error('network offline');
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.legacy.network'), env)).toEqual({
+      isValid: true,
+      tier: 'anonymous',
+      deviceId: 'device-from-header',
+      error: 'subscription_lookup_unavailable',
+    });
+  });
+
   it('does not authenticate an unsuccessful 200 response from /api/user', async () => {
     globalThis.fetch = mock(async () => new Response(JSON.stringify({
       success: false,

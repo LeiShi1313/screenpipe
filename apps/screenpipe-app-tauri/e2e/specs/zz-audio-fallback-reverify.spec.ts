@@ -170,7 +170,11 @@ async function loginStatusText(): Promise<string> {
     try {
       const btn = await $('[data-testid="account-logout-button"]');
       if (await btn.isExisting()) await btn.click();
-      await invoke("set_cloud_token", { token: null });
+      await invoke("set_cloud_token", {
+        token: null,
+        expectedCurrentToken: null,
+        forceClear: true,
+      });
     } catch {
       // best-effort cleanup
     }

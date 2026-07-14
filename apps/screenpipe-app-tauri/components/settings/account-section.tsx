@@ -297,17 +297,46 @@ export function AccountSection() {
                 size="sm"
                 data-testid="account-logout-button"
                 onClick={async () => {
-                  await updateSettings({ user: null as any });
                   try {
-                    await commands.setCloudToken(null);
+                    const result = await commands.setCloudToken(
+                      null,
+                      settings.user?.token ?? null,
+                      true,
+                    );
+                    if (result?.status === "error") {
+                      console.warn("cloud token persistence failed after runtime logout:", result.error);
+                      toast({
+                        title: "couldn't log out safely",
+                        description: "please try again before switching accounts",
+                        variant: "destructive",
+                      });
+                      return;
+                    }
                   } catch (e) {
                     console.warn("failed to clear cloud token on logout:", e);
+                    toast({
+                      title: "couldn't log out safely",
+                      description: "please try again before switching accounts",
+                      variant: "destructive",
+                    });
+                    return;
                   }
-                  // Restart Pi with null token so it stops using the old
-                  // account's quota. Next message will auto-start as anonymous.
+                  // Defense in depth: null/null is a session-wide auth reset.
+                  // It stops every legacy and UUID Pi child and never starts an
+                  // anonymous hosted session with the old account's work.
                   try {
-                    await commands.piUpdateConfig(null, null);
+                    const result = await commands.piUpdateConfig(null, null);
+                    if (result?.status === "error") {
+                      console.warn("failed to reset Pi sessions on logout:", result.error);
+                      toast({
+                        title: "couldn't finish logging out",
+                        description: "your account changed during logout; please try again",
+                        variant: "destructive",
+                      });
+                      return;
+                    }
                   } catch {}
+                  await updateSettings({ user: null as any });
                   toast({ title: "logged out" });
                 }}
               >

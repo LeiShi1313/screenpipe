@@ -11,8 +11,14 @@ import { queuedPreviewForText } from "@/lib/chat/queued-display";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { buildSteerPrompt } from "@/components/chat/standalone/hooks/pi-steering-helpers";
 import {
+  hasCloudEntitlement,
+  isDevBillingBypassEnabled,
+} from "@/lib/app-entitlement";
+import {
+  isFreeScreenpipeCloudTextOnly,
+  isSamePiAuthIdentity,
   markScreenpipeCloudTurn,
-  resolvePiDispatchProvider,
+  piProviderConfigsMatch,
 } from "@/lib/chat/free-tier-turn-marker";
 import type {
   Message,
@@ -48,6 +54,9 @@ export function usePiSteeringTransport(
   const {
     activePreset,
     activePresetRef,
+    authIdentityRef,
+    buildProviderConfig,
+    conversationOperationPendingRef,
     beginQueuedAction,
     consumePendingAttachments,
     currentQueueSessionId,
@@ -64,6 +73,7 @@ export function usePiSteeringTransport(
     pendingSteerBatchRef,
     pendingSteerFlushInFlightRef,
     piActiveStopRequestedRef,
+    piAsyncOperationGenerationRef,
     piContentBlocksRef,
     piInfo,
     piMessageIdRef,
@@ -82,11 +92,27 @@ export function usePiSteeringTransport(
     setIsStreaming,
     setMessages,
     setPastedImages,
+    settings,
     takeQueuedDisplayById,
     turnIntentLedgerRef,
   } = context;
+  const isFreeHostedTextOnly = (provider: string | null | undefined) =>
+    isFreeScreenpipeCloudTextOnly(
+      provider,
+      hasCloudEntitlement(settings.user) || isDevBillingBypassEnabled(),
+    );
+  const showHostedTextOnlyError = () =>
+    toast({
+      title: "hosted preview is text-only",
+      description:
+        "Remove the image, use your own AI provider, or upgrade to Business.",
+      variant: "destructive",
+    });
 
-  function setAssistantInterruptedState(activeAssistantId: string | null, interruptedBySteer: boolean) {
+  function setAssistantInterruptedState(
+    activeAssistantId: string | null,
+    interruptedBySteer: boolean,
+  ) {
     if (!activeAssistantId) return;
     let changed = false;
     let nextRows: Message[] | null = null;
@@ -125,16 +151,79 @@ export function usePiSteeringTransport(
     pendingNextPiUserDisplayRef.current = null;
     optimisticSteerRef.current = null;
     if (sessionId) {
-      pendingSteerBatchRef.current = pendingSteerBatchRef.current.filter((item) => item.sessionId !== sessionId);
-      turnIntentLedgerRef.current = turnIntentLedgerRef.current.filter((record) =>
-        record.sessionId !== sessionId ||
-        record.kind !== "steer" ||
-        Boolean(record.consumedAssistantId)
+      pendingSteerBatchRef.current = pendingSteerBatchRef.current.filter(
+        (item) => item.sessionId !== sessionId,
+      );
+      turnIntentLedgerRef.current = turnIntentLedgerRef.current.filter(
+        (record) =>
+          record.sessionId !== sessionId ||
+          record.kind !== "steer" ||
+          Boolean(record.consumedAssistantId),
       );
     }
   }
 
-  function prepareSteerBatch(sessionId: string) {
+  function attachHostedTurnPromptToUser(
+    userMessageId: string,
+    hostedTurnPrompt: string,
+  ) {
+    let nextLocalRows: Message[] | null = null;
+    setMessages((prev) => {
+      let changed = false;
+      const next = prev.map((message) => {
+        if (
+          message.id !== userMessageId ||
+          message.role !== "user" ||
+          message.hostedTurnPrompt === hostedTurnPrompt
+        ) {
+          return message;
+        }
+        changed = true;
+        return { ...message, hostedTurnPrompt };
+      });
+      if (changed) nextLocalRows = next;
+      return changed ? next : prev;
+    });
+
+    const sessionId = piSessionIdRef.current;
+    let rowsToPersist: Message[] | null = nextLocalRows;
+    if (sessionId) {
+      const storeState = useChatStore.getState();
+      const storedMessages = storeState.sessions?.[sessionId]?.messages as
+        Message[] | undefined;
+      if (storedMessages) {
+        let changed = false;
+        const nextStoredRows = storedMessages.map((message) => {
+          if (
+            message.id !== userMessageId ||
+            message.role !== "user" ||
+            message.hostedTurnPrompt === hostedTurnPrompt
+          ) {
+            return message;
+          }
+          changed = true;
+          return { ...message, hostedTurnPrompt };
+        });
+        if (changed) {
+          storeState.actions.setMessages(sessionId, nextStoredRows as any);
+          rowsToPersist = nextStoredRows;
+        }
+      } else if (nextLocalRows) {
+        storeState.actions.setMessages(sessionId, nextLocalRows as any);
+      }
+    }
+    if (rowsToPersist) {
+      void saveConversation(rowsToPersist, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
+    }
+  }
+
+  function prepareSteerBatch(
+    sessionId: string,
+    providerConfig: NonNullable<ReturnType<typeof buildProviderConfig>>,
+  ) {
     const batch = pendingSteerBatchRef.current.filter(
       (item) => item.sessionId === sessionId,
     );
@@ -144,20 +233,18 @@ export function usePiSteeringTransport(
     );
 
     const latest = batch[batch.length - 1];
-    const prompt = markScreenpipeCloudTurn(
-      buildSteerPrompt(batch),
-      {
-        provider: resolvePiDispatchProvider(
-          piRunningConfigRef.current?.provider,
-          (activePresetRef?.current ?? activePreset)?.provider,
-          Boolean(piInfo?.running),
-        ),
-      },
-    );
+    const basePrompt = buildSteerPrompt(batch);
+    const prompt = latest.hostedTurnId
+      ? markScreenpipeCloudTurn(basePrompt, providerConfig, latest.hostedTurnId)
+      : basePrompt;
     const preview = queuedPreviewForText(latest.content);
     const combinedImages = imageDataUrlsToPiImages(
       batch.flatMap((item) => item.images),
     );
+
+    if (latest.hostedTurnId) {
+      attachHostedTurnPromptToUser(latest.optimisticUserId, prompt);
+    }
 
     batch.slice(0, -1).forEach((item) => removeTurnIntent(item.turnIntentId));
 
@@ -173,6 +260,8 @@ export function usePiSteeringTransport(
         : {}),
       optimisticUserId: latest.optimisticUserId,
       turnIntentId: latest.turnIntentId,
+      ...(latest.hostedTurnId ? { hostedTurnId: latest.hostedTurnId } : {}),
+      ...(latest.hostedTurnId ? { hostedTurnPrompt: prompt } : {}),
     };
     optimisticSteerRef.current = {
       id: latest.optimisticUserId,
@@ -187,21 +276,58 @@ export function usePiSteeringTransport(
       preview,
       displayedUserId: latest.optimisticUserId,
       createdAt: latest.createdAt,
+      ...(latest.hostedTurnId ? { hostedTurnId: latest.hostedTurnId } : {}),
     });
 
     return { batch, latest, prompt, preview, combinedImages };
   }
 
   async function flushPendingSteerBatch() {
+    if (conversationOperationPendingRef?.current) return;
+    const expectedAuthIdentity = { ...authIdentityRef.current };
     const sessionId = piSessionIdRef.current;
+    const expectedOperationGeneration = piAsyncOperationGenerationRef.current;
+    const expectedProviderConfig = buildProviderConfig(
+      activePresetRef?.current ?? activePreset,
+    );
+    if (!expectedProviderConfig) return;
+    const boundaryIsCurrent = () =>
+      !conversationOperationPendingRef?.current &&
+      expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
+      sessionId === piSessionIdRef.current &&
+      isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
+      piProviderConfigsMatch(
+        expectedProviderConfig,
+        buildProviderConfig(activePresetRef?.current ?? activePreset),
+      );
     if (!sessionId || pendingSteerFlushInFlightRef.current) return;
+    if (
+      !piProviderConfigsMatch(
+        piRunningConfigRef.current,
+        expectedProviderConfig,
+      )
+    )
+      return;
 
-    const prepared = prepareSteerBatch(sessionId);
+    const pendingBatch = pendingSteerBatchRef.current.filter(
+      (item) => item.sessionId === sessionId,
+    );
+    if (
+      isFreeHostedTextOnly(expectedProviderConfig.provider) &&
+      pendingBatch.some((item) => item.images.length > 0)
+    ) {
+      showHostedTextOnlyError();
+      return;
+    }
+
+    const prepared = prepareSteerBatch(sessionId, expectedProviderConfig);
     if (!prepared) return;
     pendingSteerFlushInFlightRef.current = true;
 
     const { batch, latest, prompt, preview, combinedImages } = prepared;
-    const interruptedAssistantId = batch.find((item) => item.interruptedAssistantId)?.interruptedAssistantId ?? null;
+    const interruptedAssistantId =
+      batch.find((item) => item.interruptedAssistantId)
+        ?.interruptedAssistantId ?? null;
     const hasActiveAssistant = Boolean(piMessageIdRef.current);
 
     const labelMarkers: Message[] = batch.slice(0, -1).map((item, index) => ({
@@ -220,7 +346,9 @@ export function usePiSteeringTransport(
     if (labelMarkers.length > 0) {
       setMessages((prev) => {
         const existingIds = new Set(prev.map((message) => message.id));
-        const markersToAppend = labelMarkers.filter((marker) => !existingIds.has(marker.id));
+        const markersToAppend = labelMarkers.filter(
+          (marker) => !existingIds.has(marker.id),
+        );
         if (markersToAppend.length === 0) return prev;
         const next = [...prev, ...markersToAppend];
         nextRowsAfterLabels = next;
@@ -231,7 +359,9 @@ export function usePiSteeringTransport(
           refreshHistory: false,
           syncActiveConversation: false,
         });
-        useChatStore.getState().actions.setMessages(sessionId, nextRowsAfterLabels as any);
+        useChatStore
+          .getState()
+          .actions.setMessages(sessionId, nextRowsAfterLabels as any);
       }
     }
 
@@ -252,9 +382,13 @@ export function usePiSteeringTransport(
       };
       let nextRowsAfterAssistant: Message[] | null = null;
       setMessages((prev) => {
-        if (prev.some((message) => message.id === steerAssistantId)) return prev;
-        const steerUserIndex = prev.findIndex((message) => message.id === latest.optimisticUserId);
-        const insertIndex = steerUserIndex >= 0 ? steerUserIndex + 1 : prev.length;
+        if (prev.some((message) => message.id === steerAssistantId))
+          return prev;
+        const steerUserIndex = prev.findIndex(
+          (message) => message.id === latest.optimisticUserId,
+        );
+        const insertIndex =
+          steerUserIndex >= 0 ? steerUserIndex + 1 : prev.length;
         const next = [
           ...prev.slice(0, insertIndex),
           steerAssistantPlaceholder,
@@ -268,7 +402,9 @@ export function usePiSteeringTransport(
           refreshHistory: false,
           syncActiveConversation: false,
         });
-        useChatStore.getState().actions.setMessages(sessionId, nextRowsAfterAssistant as any);
+        useChatStore
+          .getState()
+          .actions.setMessages(sessionId, nextRowsAfterAssistant as any);
       }
       markTurnIntentConsumed(latest.turnIntentId, steerAssistantId);
       piMessageIdRef.current = steerAssistantId;
@@ -289,6 +425,7 @@ export function usePiSteeringTransport(
     setIsStreaming(true);
 
     try {
+      if (!boundaryIsCurrent()) return;
       const result = hasActiveAssistant
         ? await commands.piSteer(
             sessionId,
@@ -302,6 +439,8 @@ export function usePiSteeringTransport(
             preview,
           );
 
+      if (!boundaryIsCurrent()) return;
+
       if (result.status !== "ok") {
         pendingNextPiUserIntentRef.current = null;
         pendingNextPiUserDisplayRef.current = null;
@@ -309,52 +448,116 @@ export function usePiSteeringTransport(
         removeTurnIntent(latest.turnIntentId);
         setAssistantInterruptedState(interruptedAssistantId, false);
         if (labelMarkerIds.size > 0) {
-          setMessages((prev) => prev.filter((message) => !labelMarkerIds.has(message.id)));
+          setMessages((prev) =>
+            prev.filter((message) => !labelMarkerIds.has(message.id)),
+          );
         }
         if (precreatedSteerAssistantId) {
-          setMessages((prev) => prev.filter((message) => message.id !== precreatedSteerAssistantId));
+          setMessages((prev) =>
+            prev.filter((message) => message.id !== precreatedSteerAssistantId),
+          );
           piMessageIdRef.current = null;
           piStreamingTextRef.current = "";
           piContentBlocksRef.current = [];
         }
-        pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
+        pendingSteerBatchRef.current = [
+          ...batch,
+          ...pendingSteerBatchRef.current,
+        ];
         setIsLoading(false);
         setIsStreaming(false);
-        toast({ title: "failed to send steered message", description: result.error, variant: "destructive" });
+        toast({
+          title: "failed to send steered message",
+          description: result.error,
+          variant: "destructive",
+        });
       }
     } catch (e) {
+      if (!boundaryIsCurrent()) return;
       pendingNextPiUserIntentRef.current = null;
       pendingNextPiUserDisplayRef.current = null;
       optimisticSteerRef.current = null;
       removeTurnIntent(latest.turnIntentId);
       setAssistantInterruptedState(interruptedAssistantId, false);
       if (labelMarkerIds.size > 0) {
-        setMessages((prev) => prev.filter((message) => !labelMarkerIds.has(message.id)));
+        setMessages((prev) =>
+          prev.filter((message) => !labelMarkerIds.has(message.id)),
+        );
       }
       if (precreatedSteerAssistantId) {
-        setMessages((prev) => prev.filter((message) => message.id !== precreatedSteerAssistantId));
+        setMessages((prev) =>
+          prev.filter((message) => message.id !== precreatedSteerAssistantId),
+        );
         piMessageIdRef.current = null;
         piStreamingTextRef.current = "";
         piContentBlocksRef.current = [];
       }
-      pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
+      pendingSteerBatchRef.current = [
+        ...batch,
+        ...pendingSteerBatchRef.current,
+      ];
       setIsLoading(false);
       setIsStreaming(false);
       const description = e instanceof Error ? e.message : String(e);
-      toast({ title: "failed to send steered message", description, variant: "destructive" });
+      toast({
+        title: "failed to send steered message",
+        description,
+        variant: "destructive",
+      });
     } finally {
-      pendingSteerFlushInFlightRef.current = false;
+      if (boundaryIsCurrent()) {
+        pendingSteerFlushInFlightRef.current = false;
+      }
     }
   }
 
-  async function steerMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
-    const hasImages = imageDataUrls ? imageDataUrls.length > 0 : pastedImages.length > 0;
+  async function steerMessage(
+    userMessage: string,
+    displayLabel?: string,
+    imageDataUrls?: string[],
+  ) {
+    if (conversationOperationPendingRef?.current) return;
+    const expectedAuthIdentity = { ...authIdentityRef.current };
+    const expectedSessionId = piSessionIdRef.current;
+    const expectedOperationGeneration = piAsyncOperationGenerationRef.current;
+    const expectedProviderConfig = buildProviderConfig(
+      activePresetRef?.current ?? activePreset,
+    );
+    if (!expectedProviderConfig) return;
+    const boundaryIsCurrent = () =>
+      !conversationOperationPendingRef?.current &&
+      expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
+      expectedSessionId === piSessionIdRef.current &&
+      isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
+      piProviderConfigsMatch(
+        expectedProviderConfig,
+        buildProviderConfig(activePresetRef?.current ?? activePreset),
+      );
+    const hasImages = imageDataUrls
+      ? imageDataUrls.length > 0
+      : pastedImages.length > 0;
     const trimmed = userMessage.trim();
     if (!trimmed && !hasImages) return;
+    if (isFreeHostedTextOnly(expectedProviderConfig.provider) && hasImages) {
+      showHostedTextOnlyError();
+      return;
+    }
 
     const hadActiveReply = isLoading || isStreaming || !!piMessageIdRef.current;
-    if (!hadActiveReply || !piInfo?.running) {
-      return sendPiMessage(trimmed, displayLabel, imageDataUrls);
+    if (
+      !hadActiveReply ||
+      !piInfo?.running ||
+      !piProviderConfigsMatch(
+        piRunningConfigRef.current,
+        expectedProviderConfig,
+      )
+    ) {
+      return sendPiMessage(trimmed, displayLabel, imageDataUrls, {
+        authIdentity: expectedAuthIdentity,
+        sessionId: expectedSessionId,
+        operationGeneration: expectedOperationGeneration,
+        providerConfig: expectedProviderConfig,
+      });
     }
 
     posthog.capture("chat_message_steered", {
@@ -365,12 +568,16 @@ export function usePiSteeringTransport(
     });
 
     const outgoingImages = imageDataUrls ?? pastedImages;
-    const shouldClearPastedImages = imageDataUrls == null && pastedImages.length > 0;
+    const shouldClearPastedImages =
+      imageDataUrls == null && pastedImages.length > 0;
     const fallbackOriginalUserMessage = lastUserMessageRef.current;
 
     piRateLimitRetries.current = 0;
     lastUserMessageRef.current = trimmed;
     const turnIntentId = `steer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const hostedTurnId = isFreeHostedTextOnly(expectedProviderConfig.provider)
+      ? crypto.randomUUID()
+      : undefined;
     const steerAttachments = consumePendingAttachments();
     const optimisticUser: Message = {
       id: turnIntentId,
@@ -381,6 +588,7 @@ export function usePiSteeringTransport(
       ...(steerAttachments ? { attachments: steerAttachments } : {}),
       intent: "steer",
       turnIntentId,
+      ...(hostedTurnId ? { hostedTurnId } : {}),
       timestamp: Date.now(),
     };
     markCurrentAssistantInterrupted();
@@ -407,10 +615,11 @@ export function usePiSteeringTransport(
       }
 
       const activeAssistant = prev[activeAssistantIndex];
-      const hasVisibleAssistantContent = Boolean(
-        activeAssistant?.content &&
-        activeAssistant.content !== "Processing..."
-      ) || Boolean(activeAssistant?.contentBlocks?.length);
+      const hasVisibleAssistantContent =
+        Boolean(
+          activeAssistant?.content &&
+          activeAssistant.content !== "Processing...",
+        ) || Boolean(activeAssistant?.contentBlocks?.length);
       let insertIndex = hasVisibleAssistantContent
         ? activeAssistantIndex + 1
         : activeAssistantIndex;
@@ -435,9 +644,11 @@ export function usePiSteeringTransport(
         syncActiveConversation: false,
       });
     }
-    const sidNow = piSessionIdRef.current;
+    const sidNow = expectedSessionId;
     if (sidNow && nextRowsAfterOptimisticAppend) {
-      useChatStore.getState().actions.setMessages(sidNow, nextRowsAfterOptimisticAppend as any);
+      useChatStore
+        .getState()
+        .actions.setMessages(sidNow, nextRowsAfterOptimisticAppend as any);
     }
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
@@ -448,7 +659,7 @@ export function usePiSteeringTransport(
       ...pendingSteerBatchRef.current,
       {
         turnIntentId,
-        sessionId: piSessionIdRef.current,
+        sessionId: expectedSessionId,
         content: trimmed,
         originalUserMessage,
         interruptedAssistantId: activeAssistantId ?? undefined,
@@ -457,21 +668,22 @@ export function usePiSteeringTransport(
         ...(displayLabel ? { displayContent: displayLabel } : {}),
         optimisticUserId: optimisticUser.id,
         createdAt: Date.now(),
+        ...(hostedTurnId ? { hostedTurnId } : {}),
       },
     ];
     if (hadActiveReply) {
-      const sid = piSessionIdRef.current;
+      const sid = expectedSessionId;
       if (sid) {
-        const prepared = prepareSteerBatch(sid);
+        const prepared = prepareSteerBatch(sid, expectedProviderConfig);
         if (!prepared) return;
         const { batch, latest, prompt, combinedImages } = prepared;
 
         lastPiDispatchPromptRef.current = prompt;
 
         piActiveStopRequestedRef.current = true;
-        const interruptedAssistantId =
-          latest.interruptedAssistantId ?? null;
+        const interruptedAssistantId = latest.interruptedAssistantId ?? null;
 
+        if (!boundaryIsCurrent()) return;
         void commands
           .piSteer(
             sid,
@@ -479,6 +691,7 @@ export function usePiSteeringTransport(
             combinedImages.length > 0 ? combinedImages : null,
           )
           .then((result) => {
+            if (!boundaryIsCurrent()) return;
             if (result.status === "ok") {
               // Clear the flag — this stop was an internal steering redirect,
               // not a user-initiated stop. Without this the steered response
@@ -495,6 +708,7 @@ export function usePiSteeringTransport(
             }
           })
           .catch((err: unknown) => {
+            if (!boundaryIsCurrent()) return;
             console.warn("[steer] piSteer failed, reverting", err);
             revertFailedComposerSteer(
               batch,
@@ -537,10 +751,7 @@ export function usePiSteeringTransport(
       ),
     );
 
-    pendingSteerBatchRef.current = [
-      ...batch,
-      ...pendingSteerBatchRef.current,
-    ];
+    pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
 
     toast({
       title: "failed to send steered message",
@@ -550,22 +761,84 @@ export function usePiSteeringTransport(
   }
 
   async function steerQueuedPrompt(prompt: PiQueuedPrompt) {
+    if (conversationOperationPendingRef?.current) return;
+    const expectedAuthIdentity = { ...authIdentityRef.current };
+    const expectedSessionId = currentQueueSessionId ?? piSessionIdRef.current;
+    const expectedOperationGeneration = piAsyncOperationGenerationRef.current;
+    const expectedProviderConfig = buildProviderConfig(
+      activePresetRef?.current ?? activePreset,
+    );
+    if (!expectedProviderConfig) return;
+    const boundaryIsCurrent = () =>
+      !conversationOperationPendingRef?.current &&
+      expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
+      expectedSessionId === piSessionIdRef.current &&
+      isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
+      piProviderConfigsMatch(
+        expectedProviderConfig,
+        buildProviderConfig(activePresetRef?.current ?? activePreset),
+      ) &&
+      piProviderConfigsMatch(
+        piRunningConfigRef.current,
+        expectedProviderConfig,
+      );
+    if (!boundaryIsCurrent()) return;
+    const queuedDisplay = takeQueuedDisplayById(
+      currentQueueSessionId,
+      prompt.id,
+    );
+    if (
+      isFreeHostedTextOnly(expectedProviderConfig.provider) &&
+      queuedDisplay?.images.length
+    ) {
+      restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
+      showHostedTextOnlyError();
+      return;
+    }
     beginQueuedAction(prompt.id);
-    const queuedDisplay = takeQueuedDisplayById(currentQueueSessionId, prompt.id);
     const existingTurnIntent = queuedDisplay?.turnIntentId
-      ? turnIntentLedgerRef.current.find((record) => record.sessionId === currentQueueSessionId && record.id === queuedDisplay.turnIntentId)
-      : turnIntentLedgerRef.current.find((record) => record.sessionId === currentQueueSessionId && record.queueId === prompt.id);
+      ? turnIntentLedgerRef.current.find(
+          (record) =>
+            record.sessionId === currentQueueSessionId &&
+            record.id === queuedDisplay.turnIntentId,
+        )
+      : turnIntentLedgerRef.current.find(
+          (record) =>
+            record.sessionId === currentQueueSessionId &&
+            record.queueId === prompt.id,
+        );
     const turnIntentId = existingTurnIntent?.id ?? `queued-steer-${prompt.id}`;
-    const optimisticQueuedContent = existingTurnIntent?.kind === "steer"
-      ? existingTurnIntent.preview
-      : queuedDisplay?.preview ?? prompt.preview;
+    const optimisticQueuedContent =
+      existingTurnIntent?.kind === "steer"
+        ? existingTurnIntent.preview
+        : (queuedDisplay?.preview ?? prompt.preview);
+    const queuedHostedTurnPrompt =
+      queuedDisplay?.hostedTurnPrompt ??
+      (existingTurnIntent?.hostedTurnId
+        ? existingTurnIntent.content
+        : undefined);
     const optimisticQueuedUser: Message = {
       id: turnIntentId,
       role: "user",
       content: optimisticQueuedContent,
-      ...(queuedDisplay?.displayContent ? { displayContent: queuedDisplay.displayContent } : {}),
-      ...(queuedDisplay?.images.length ? { images: [...queuedDisplay.images] } : {}),
-      ...(queuedDisplay?.attachments?.length ? { attachments: [...queuedDisplay.attachments] } : {}),
+      ...(queuedDisplay?.displayContent
+        ? { displayContent: queuedDisplay.displayContent }
+        : {}),
+      ...(queuedDisplay?.images.length
+        ? { images: [...queuedDisplay.images] }
+        : {}),
+      ...(queuedDisplay?.attachments?.length
+        ? { attachments: [...queuedDisplay.attachments] }
+        : {}),
+      ...((queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId)
+        ? {
+            hostedTurnId:
+              queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId,
+          }
+        : {}),
+      ...(queuedHostedTurnPrompt
+        ? { hostedTurnPrompt: queuedHostedTurnPrompt }
+        : {}),
       intent: "steer",
       turnIntentId,
       timestamp: Date.now(),
@@ -574,26 +847,58 @@ export function usePiSteeringTransport(
     try {
       pendingNextPiUserIntentRef.current = "steer";
       pendingNextPiUserDisplayRef.current = {
-        preview: existingTurnIntent?.preview ?? queuedDisplay?.preview ?? prompt.preview,
+        preview:
+          existingTurnIntent?.preview ??
+          queuedDisplay?.preview ??
+          prompt.preview,
         images: queuedDisplay?.images ? [...queuedDisplay.images] : [],
-        ...(queuedDisplay?.displayContent ? { displayContent: queuedDisplay.displayContent } : {}),
+        ...(queuedDisplay?.displayContent
+          ? { displayContent: queuedDisplay.displayContent }
+          : {}),
         optimisticUserId: optimisticQueuedUser.id,
         turnIntentId,
+        ...((queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId)
+          ? {
+              hostedTurnId:
+                queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId,
+            }
+          : {}),
+        ...(queuedHostedTurnPrompt
+          ? { hostedTurnPrompt: queuedHostedTurnPrompt }
+          : {}),
       };
       registerTurnIntent({
         id: turnIntentId,
-        sessionId: currentQueueSessionId ?? piSessionIdRef.current,
+        sessionId: expectedSessionId,
         kind: "steer",
-        content: existingTurnIntent?.content ?? queuedDisplay?.preview ?? prompt.preview,
-        preview: existingTurnIntent?.preview ?? queuedDisplay?.preview ?? prompt.preview,
+        content:
+          existingTurnIntent?.content ??
+          queuedDisplay?.preview ??
+          prompt.preview,
+        preview:
+          existingTurnIntent?.preview ??
+          queuedDisplay?.preview ??
+          prompt.preview,
         displayedUserId: optimisticQueuedUser.id,
         queueId: prompt.id,
         createdAt: existingTurnIntent?.createdAt ?? Date.now(),
+        ...((queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId)
+          ? {
+              hostedTurnId:
+                queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId,
+            }
+          : {}),
       });
       markCurrentAssistantInterrupted();
       let nextRowsAfterQueuedSteer: Message[] | null = null;
       setMessages((prev) => {
-        if (prev.some((message) => message.turnIntentId === turnIntentId || message.id === optimisticQueuedUser.id)) {
+        if (
+          prev.some(
+            (message) =>
+              message.turnIntentId === turnIntentId ||
+              message.id === optimisticQueuedUser.id,
+          )
+        ) {
           return prev;
         }
         const next = [...prev, optimisticQueuedUser];
@@ -605,12 +910,16 @@ export function usePiSteeringTransport(
           refreshHistory: false,
           syncActiveConversation: false,
         });
-        const sidNow = piSessionIdRef.current;
+        const sidNow = expectedSessionId;
         if (sidNow) {
-          useChatStore.getState().actions.setMessages(sidNow, nextRowsAfterQueuedSteer as any);
+          useChatStore
+            .getState()
+            .actions.setMessages(sidNow, nextRowsAfterQueuedSteer as any);
         }
       }
-      const result = await commands.piSteerQueued(piSessionIdRef.current, prompt.id);
+      if (!boundaryIsCurrent()) return;
+      const result = await commands.piSteerQueued(expectedSessionId, prompt.id);
+      if (!boundaryIsCurrent()) return;
       if (result.status !== "ok") {
         pendingNextPiUserIntentRef.current = null;
         pendingNextPiUserDisplayRef.current = null;
@@ -627,7 +936,11 @@ export function usePiSteeringTransport(
         );
         restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
         setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
-        toast({ title: "failed to steer queued message", description: result.error, variant: "destructive" });
+        toast({
+          title: "failed to steer queued message",
+          description: result.error,
+          variant: "destructive",
+        });
         return;
       }
       if (!result.data) {
@@ -656,6 +969,7 @@ export function usePiSteeringTransport(
         removeQueuedPrompt(currentQueueSessionId, prompt.id);
       }
     } catch (e) {
+      if (!boundaryIsCurrent()) return;
       pendingNextPiUserIntentRef.current = null;
       pendingNextPiUserDisplayRef.current = null;
       removeTurnIntent(turnIntentId);
@@ -677,7 +991,9 @@ export function usePiSteeringTransport(
         variant: "destructive",
       });
     } finally {
-      finishQueuedAction(prompt.id);
+      if (boundaryIsCurrent()) {
+        finishQueuedAction(prompt.id);
+      }
     }
   }
 

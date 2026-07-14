@@ -922,6 +922,11 @@ impl SCServer {
                 "/v1/chat/completions",
                 axum::routing::post(crate::routes::cloud_proxy::chat_completions)
                     .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)), // 50MB
+            )
+            .route(
+                "/v1/interactive/chat/completions",
+                axum::routing::post(crate::routes::cloud_proxy::interactive_chat_completions)
+                    .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)), // 50MB
             );
 
         // Pipe API routes (if pipe manager is available)

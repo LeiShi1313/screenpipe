@@ -268,7 +268,10 @@ describe("AuthGuard session-expiry handling", () => {
     expect(arg.user).not.toBeNull();
     expect(arg.user.token).toBeUndefined();
     expect(arg.user.cloud_subscribed).toBe(false); // profile fields preserved
-    expect(mocks.setCloudToken).toHaveBeenCalledWith(null);
+    expect(mocks.setCloudToken).toHaveBeenCalledWith(null, "tok-123", false);
+    expect(mocks.setCloudToken.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.updateSettings.mock.invocationCallOrder[0],
+    );
     expect(mocks.capture).toHaveBeenCalledWith(
       "session_expired",
       expect.objectContaining({ source: "verify_token", status: 401 }),
@@ -286,7 +289,7 @@ describe("AuthGuard session-expiry handling", () => {
     const arg = mocks.updateSettings.mock.calls[0][0];
     expect(arg.user).not.toBeNull();
     expect(arg.user.token).toBeUndefined();
-    expect(mocks.setCloudToken).toHaveBeenCalledWith(null);
+    expect(mocks.setCloudToken).toHaveBeenCalledWith(null, "tok-123", false);
   });
 
   it("keeps the session on a transient network / 5xx error", async () => {
@@ -298,6 +301,37 @@ describe("AuthGuard session-expiry handling", () => {
     // a network blip must NOT clear the session — only 401/403 do
     expect(mocks.updateSettings).not.toHaveBeenCalled();
     expect(mocks.setCloudToken).not.toHaveBeenCalled();
+  });
+
+  it("does not broadcast a token-stripped profile when native clearing cannot run", async () => {
+    mocks.loadUser.mockRejectedValueOnce(
+      new Error("failed to verify token: 401 Unauthorized")
+    );
+    mocks.setCloudToken.mockRejectedValueOnce(new Error("invoke unavailable"));
+    renderGuard();
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() =>
+      expect(mocks.setCloudToken).toHaveBeenCalledWith(null, "tok-123", false),
+    );
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("does not broadcast a token-stripped profile when native clearing returns an error", async () => {
+    mocks.loadUser.mockRejectedValueOnce(
+      new Error("failed to verify token: 401 Unauthorized")
+    );
+    mocks.setCloudToken.mockResolvedValueOnce({
+      status: "error",
+      error: "secret_store_unavailable",
+    });
+    renderGuard();
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() =>
+      expect(mocks.setCloudToken).toHaveBeenCalledWith(null, "tok-123", false),
+    );
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
   });
 });
 
@@ -336,6 +370,7 @@ describe("installAuthInterceptor sign-out scoping", () => {
     originalFetch.mockResolvedValue({ status: 401 });
     await (window as any).fetch("https://screenpipe.com/api/user");
     expect(clearSession).toHaveBeenCalledTimes(1);
+    expect(clearSession).toHaveBeenCalledWith("tok-123");
     expect(mocks.capture).toHaveBeenCalledWith(
       "session_expired",
       expect.objectContaining({ source: "fetch_interceptor", status: 401 }),

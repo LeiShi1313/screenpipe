@@ -68,6 +68,10 @@ import {
   extractInjectedUserText,
   isInjectedTitleSourcePrompt,
 } from "@/lib/chat-utils";
+import {
+  extractScreenpipeCloudTurnId,
+  stripScreenpipeCloudTurnMarker,
+} from "@/lib/chat/free-tier-turn-marker";
 import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
 import { isInternalTitleSession } from "@/lib/utils/internal-session";
 import {
@@ -123,13 +127,17 @@ export function statusForEvent(evt: PiInnerEvent): SessionStatus | null {
       return "idle";
     case "message_start":
     case "message_end":
-      if (evt.message?.role === "assistant" && evt.message.stopReason === "error") {
+      if (
+        evt.message?.role === "assistant" &&
+        evt.message.stopReason === "error"
+      ) {
         return "error";
       }
       return null;
     case "message_update": {
       const inner = evt.assistantMessageEvent?.type;
-      if (inner === "thinking_start" || inner === "thinking_delta") return "thinking";
+      if (inner === "thinking_start" || inner === "thinking_delta")
+        return "thinking";
       if (inner === "thinking_end") return "streaming";
       if (inner === "text_delta") return "streaming";
       return null;
@@ -255,7 +263,8 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   if (writePreview) patch.preview = snippet!;
   // Background assistant text should mark the session as having new
   // unseen content once the user has switched away.
-  if (snippet && !isSessionForeground(store, sid)) patch.lastContentAt = Date.now();
+  if (snippet && !isSessionForeground(store, sid))
+    patch.lastContentAt = Date.now();
   if (nextStatus === "error" && err) patch.lastError = err;
   if (nextStatus && nextStatus !== "error") patch.lastError = undefined;
 
@@ -442,8 +451,9 @@ function textFromPiMessageContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
-    .filter((part): part is { type?: unknown; text?: unknown } =>
-      !!part && typeof part === "object",
+    .filter(
+      (part): part is { type?: unknown; text?: unknown } =>
+        !!part && typeof part === "object",
     )
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
@@ -498,28 +508,78 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
   // assistant replies and the user turns appear to vanish from history.
   if (t === "message_start" && payload.message?.role === "user") {
     const rawText = textFromPiMessageContent(payload.message?.content);
-    const text = extractInjectedUserText(rawText) ?? rawText;
+    const hostedTurnId = extractScreenpipeCloudTurnId(rawText);
+    const text = stripScreenpipeCloudTurnMarker(
+      extractInjectedUserText(rawText) ?? rawText,
+    );
     const images = imageDataUrlsFromPiContent(payload.message?.content);
     if (!text && images.length === 0) return;
 
-    const userId = `pi-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // A normal send (and an optimistic steer) is mirrored into the store
+    // before the native command resolves. If the user switches chats in that
+    // narrow gap, this background handler receives the later native echo. A
+    // hosted marker gives us a collision-safe identity for updating that
+    // existing row with the exact gateway bytes instead of duplicating it.
+    const existingMessages = (existing.messages ?? []) as MutableMessage[];
+    const existingUser = hostedTurnId
+      ? [...existingMessages]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "user" && message.hostedTurnId === hostedTurnId,
+          )
+      : undefined;
+    if (existingUser) {
+      store.actions.patchMessage(sid, existingUser.id, (message: any) => ({
+        ...message,
+        hostedTurnPrompt: rawText,
+      }));
+
+      const existingUserIndex = existingMessages.lastIndexOf(existingUser);
+      const existingAssistant = existingMessages.find(
+        (message, index) =>
+          index > existingUserIndex &&
+          message.role === "assistant" &&
+          (existingUser.turnIntentId
+            ? message.turnIntentId === existingUser.turnIntentId
+            : message.id === existing.streamingMessageId),
+      );
+      if (existingAssistant) {
+        // The normal-send path already installed the assistant placeholder;
+        // the router only needed to replace the provisional hosted payload.
+        return;
+      }
+    }
+
+    const userId =
+      existingUser?.id ??
+      `pi-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const assistantId = `pi-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const userMsg: MutableMessage = {
-      id: userId,
-      role: "user",
-      content: text,
-      ...(images.length ? { images } : {}),
-      timestamp: Date.now(),
-    };
+    const userMsg: MutableMessage | null = existingUser
+      ? null
+      : {
+          id: userId,
+          role: "user",
+          content: text,
+          ...(images.length ? { images } : {}),
+          ...(hostedTurnId ? { hostedTurnId } : {}),
+          ...(hostedTurnId ? { hostedTurnPrompt: rawText } : {}),
+          timestamp: Date.now(),
+        };
     const assistantShell: MutableMessage = {
       id: assistantId,
       role: "assistant",
       content: "",
       contentBlocks: [],
+      ...(existingUser?.intent === "steer" ? { intent: "steer" } : {}),
+      ...(existingUser?.turnIntentId
+        ? { turnIntentId: existingUser.turnIntentId }
+        : {}),
+      ...(existingUser?.intent === "steer" ? { steeredResponse: true } : {}),
       timestamp: Date.now(),
     };
 
-    store.actions.appendMessage(sid, userMsg);
+    if (userMsg) store.actions.appendMessage(sid, userMsg);
     store.actions.appendMessage(sid, assistantShell);
     store.actions.setStreaming(sid, {
       streamingMessageId: assistantId,
@@ -569,7 +629,8 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
   // message's content + last text content-block.
   const inner = payload.assistantMessageEvent;
   const isTextDelta =
-    (t === "text_delta" || (t === "message_update" && inner?.type === "text_delta")) &&
+    (t === "text_delta" ||
+      (t === "message_update" && inner?.type === "text_delta")) &&
     typeof (payload.delta ?? inner?.delta) === "string";
   if (isTextDelta) {
     const delta = (payload.delta ?? inner?.delta) as string;
@@ -611,7 +672,10 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
       isRunning: true,
       startedAtMs: Date.now(),
     };
-    const blocks = [...((cur.contentBlocks as any[]) ?? []), { type: "tool", toolCall: tool }];
+    const blocks = [
+      ...((cur.contentBlocks as any[]) ?? []),
+      { type: "tool", toolCall: tool },
+    ];
     store.actions.setStreaming(sid, { contentBlocks: blocks });
     store.actions.patchMessage(sid, msgId, (m: any) => ({
       ...m,
@@ -645,7 +709,7 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
               endedAtMs: Date.now(),
             },
           }
-        : b
+        : b,
     );
     store.actions.setStreaming(sid, { contentBlocks: blocks });
     store.actions.patchMessage(sid, msgId, (m: any) => ({
@@ -747,9 +811,11 @@ async function persistBackgroundSession(sid: string): Promise<void> {
       );
 
       const firstUserMsg = messages.find(
-        (m: any) => m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
+        (m: any) =>
+          m.role === "user" && !isInjectedTitleSourcePrompt(m.content),
       ) as any;
-      const derivedTitle: string = deriveFallbackConversationTitle(firstUserMsg);
+      const derivedTitle: string =
+        deriveFallbackConversationTitle(firstUserMsg);
 
       // Background saves use fallback titles; AI titles generated in foreground
       const title = existing?.title || derivedTitle;
@@ -757,8 +823,12 @@ async function persistBackgroundSession(sid: string): Promise<void> {
       const storeSession = useChatStore.getState().sessions[sid];
       let computedLastUserMessageAt: number | undefined;
       for (const message of messages as any[]) {
-        if (message?.role !== "user" || typeof message.timestamp !== "number") continue;
-        if (computedLastUserMessageAt == null || message.timestamp > computedLastUserMessageAt) {
+        if (message?.role !== "user" || typeof message.timestamp !== "number")
+          continue;
+        if (
+          computedLastUserMessageAt == null ||
+          message.timestamp > computedLastUserMessageAt
+        ) {
           computedLastUserMessageAt = message.timestamp;
         }
       }
@@ -769,8 +839,7 @@ async function persistBackgroundSession(sid: string): Promise<void> {
         existing?.lastUserMessageAt;
 
       const lastContentAt =
-        storeSession?.lastContentAt ??
-        existing?.lastContentAt;
+        storeSession?.lastContentAt ?? existing?.lastContentAt;
       const lastViewedAt =
         getPersistedViewedAt(storeSession) ??
         (typeof existing?.lastViewedAt === "number"
@@ -825,6 +894,10 @@ async function persistBackgroundSession(sid: string): Promise<void> {
             ...(m.displayContent ? { displayContent: m.displayContent } : {}),
             ...(blocks?.length ? { contentBlocks: blocks } : {}),
             ...(m.images?.length ? { images: m.images } : {}),
+            ...(m.hostedTurnId ? { hostedTurnId: m.hostedTurnId } : {}),
+            ...(m.hostedTurnPrompt
+              ? { hostedTurnPrompt: m.hostedTurnPrompt }
+              : {}),
             ...(m.model ? { model: m.model } : {}),
             ...(m.provider ? { provider: m.provider } : {}),
             ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
@@ -841,9 +914,19 @@ async function persistBackgroundSession(sid: string): Promise<void> {
         // doesn't silently demote to "chat" on its first router-side
         // save. Existing chats default to no `kind` field on disk
         // (back-compat).
-        ...(session.kind ? { kind: session.kind } : existing?.kind ? { kind: existing.kind } : {}),
-        ...(session.pipeContext ? { pipeContext: session.pipeContext } : existing?.pipeContext ? { pipeContext: existing.pipeContext } : {}),
-        ...(existing?.sidebarGroup ? { sidebarGroup: existing.sidebarGroup } : {}),
+        ...(session.kind
+          ? { kind: session.kind }
+          : existing?.kind
+            ? { kind: existing.kind }
+            : {}),
+        ...(session.pipeContext
+          ? { pipeContext: session.pipeContext }
+          : existing?.pipeContext
+            ? { pipeContext: existing.pipeContext }
+            : {}),
+        ...(existing?.sidebarGroup
+          ? { sidebarGroup: existing.sidebarGroup }
+          : {}),
         ...(browserState ? { browserState } : {}),
       };
 

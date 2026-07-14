@@ -6,8 +6,9 @@
 //!
 //! The Clerk session JWT used as the Bearer for screenpipe cloud used to live
 //! in **plaintext** in two on-disk files — `store.bin` (`settings.user.token`)
-//! and `auth.json` — plus the recovery snapshot `store.bin.last-good`. The
-//! `encryptStore` setting that should have protected it was a silent no-op (the
+//! and `auth.json` — plus the recovery snapshots `store.bin.last-good` and
+//! `store.bin.last-good.prev`. The `encryptStore` setting that should have
+//! protected it was a silent no-op (the
 //! keychain key is only minted on explicit opt-in, so `encrypt_store_file`
 //! skipped). A ~10-year-lifetime credential sat readable by any local process,
 //! backup, or cloud-sync folder.
@@ -126,15 +127,42 @@ async fn load_session_token_at(data_dir: &Path, key: Option<[u8; 32]>) -> Option
 pub async fn store_cloud_token(token: Option<&str>) -> anyhow::Result<()> {
     let normalized = normalize_cloud_token(token.map(str::to_string));
     let token = normalized.as_deref();
-    seed_cloud_token(normalized.clone());
     let dir = screenpipe_core::paths::default_screenpipe_data_dir();
     match token {
-        Some(t) => store_token_at(&dir, write_encryption_key()?, Some(t)).await,
+        Some(t) => {
+            // A failed keychain/SecretStore write must not make an uncommitted
+            // account visible through the in-process cache. Keep the prior row
+            // so a failed legacy-file scrub can roll the durable write back;
+            // otherwise a later keychain denial could resurrect account A
+            // from auth.json after B had partially committed.
+            let key = write_encryption_key()?;
+            let store = secret_store_at(&dir, key).await.ok_or_else(|| {
+                anyhow::anyhow!("could not open secret store at {}", dir.display())
+            })?;
+            let previous = store.get(AUTH_TOKEN_KEY).await?;
+            store.set(AUTH_TOKEN_KEY, t.as_bytes()).await?;
+            if let Err(scrub_error) = scrub_cloud_token_from_auth_json(&dir.join("auth.json")) {
+                let rollback = match previous {
+                    Some(bytes) => store.set(AUTH_TOKEN_KEY, &bytes).await,
+                    None => store.delete(AUTH_TOKEN_KEY).await,
+                };
+                return match rollback {
+                    Ok(()) => Err(scrub_error),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "{scrub_error}; failed to roll back cloud token: {rollback_error}"
+                    )),
+                };
+            }
+            seed_cloud_token(normalized);
+            Ok(())
+        }
         None => {
             // Sign-out. Deleting the row needs no key, and the on-disk
             // fallbacks `get_cloud_token` reads must go too — a stale copy
             // would resurrect the session at the next settings hydration
             // (the zz-logout-resurrect bug class).
+            // Runtime sign-out is fail-closed even if durable deletion fails.
+            seed_cloud_token(None);
             let result = store_token_at(&dir, None, None).await;
             scrub_signout_fallbacks(&dir);
             result
@@ -198,11 +226,18 @@ async fn migrate_at(data_dir: &Path, key: Option<[u8; 32]>) -> Option<String> {
     seed_cloud_token(token.clone());
 
     // Safe to scrub now: the token is in the SecretStore (or there was nothing
-    // to protect). auth.json is intentionally left — it's a pi-agent subprocess
-    // cache that gets rewritten from the SecretStore; closing it needs a
-    // pi-side change (tracked separately).
+    // to protect). Keep a historical local `sp-*` API key in auth.json, but
+    // remove JWT-shaped cloud credentials so a temporary keychain denial on a
+    // later launch cannot resurrect a stale account from this fallback.
     scrub_store_bin_token(&store_path);
     scrub_store_bin_token(&store_path.with_extension("bin.last-good"));
+    scrub_store_bin_token(&store_path.with_extension("bin.last-good.prev"));
+    if let Err(error) = scrub_cloud_token_from_auth_json(&data_dir.join("auth.json")) {
+        tracing::warn!(
+            "auth-token migration: failed to scrub legacy auth.json, preserving it for retry: {}",
+            error
+        );
+    }
 
     token
 }
@@ -242,8 +277,7 @@ pub(crate) fn looks_like_jwt(s: &str) -> bool {
 /// existing desktop upgrade/logout specs can exercise persistence without a
 /// live identity provider. Production accepts JWT-shaped values only.
 pub(crate) fn is_cloud_session_token(value: &str) -> bool {
-    looks_like_jwt(value)
-        || (crate::config::is_e2e_mode() && value.starts_with("e2e-fake-token-"))
+    looks_like_jwt(value) || (crate::config::is_e2e_mode() && value.starts_with("e2e-fake-token-"))
 }
 
 /// Public account identifiers are not bearer credentials. Normalize every
@@ -320,8 +354,8 @@ pub fn redact_token_in_store_json(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Rewrite a `store.bin`-shaped file in place with the token fields nulled.
 /// No-op if the file is missing, isn't plain JSON (encrypted), or has no token.
-/// Used for both `store.bin` and `store.bin.last-good`. Atomic (tmp + rename)
-/// so a crash mid-write can't corrupt the file.
+/// Used for `store.bin` and every retained last-good generation. Atomic (tmp +
+/// rename) so a crash mid-write can't corrupt the file.
 fn scrub_store_bin_token(path: &Path) {
     let Ok(data) = std::fs::read(path) else {
         return;
@@ -351,22 +385,19 @@ fn scrub_store_bin_token(path: &Path) {
 /// On sign-out, clear every on-disk fallback a stale token could be read back
 /// from (`get_cloud_token`'s auth.json fallback, pi's provider config) —
 /// otherwise the session resurrects at the next settings hydration:
-/// - `<data_dir>/auth.json` — the CLI credential file; the engine's own
-///   `auth logout` removes it outright (auth_key.rs), so match that.
-/// - `~/.pi/agent/auth.json` — drop only the `screenpipe` provider entry,
-///   other providers' credentials stay.
-/// - `~/.pi/agent/models.json` — reset the screenpipe provider's `apiKey`
-///   back to the `SCREENPIPE_API_KEY` placeholder (`build_models_json` embeds
-///   the raw JWT there while signed in).
-/// Best-effort: a pipe that is mid-run can rewrite the pi files until the
-/// engine receives the cleared settings; fully closing that is the tracked
-/// pi-side follow-up (#3943).
+/// - `<data_dir>/auth.json` — remove only a JWT-shaped cloud token. Preserve a
+///   local `sp-*` API key so signing out of Screenpipe Cloud never disables
+///   the permanent free local API/MCP surface.
+/// Pi's private `~/.screenpipe/pi-config` files are scrubbed by the serialized
+/// account-transition command. Never mutate the user's standalone
+/// `~/.pi/agent` directory: it is only a one-time migration source and may be
+/// edited concurrently by an unrelated Pi CLI.
 fn scrub_signout_fallbacks(data_dir: &Path) {
-    let _ = std::fs::remove_file(data_dir.join("auth.json"));
-    if let Some(home) = dirs::home_dir() {
-        let pi_dir = home.join(".pi").join("agent");
-        scrub_pi_auth_json(&pi_dir.join("auth.json"));
-        scrub_pi_models_json(&pi_dir.join("models.json"));
+    if let Err(error) = scrub_cloud_token_from_auth_json(&data_dir.join("auth.json")) {
+        tracing::warn!(
+            "cloud sign-out preserved unreadable auth.json for retry: {}",
+            error
+        );
     }
 }
 
@@ -391,26 +422,82 @@ fn scrub_pi_models_json(path: &Path) {
     });
 }
 
+/// Remove only a JWT-shaped cloud session token from the historical
+/// `<data_dir>/auth.json` fallback. The same field can contain the local
+/// `sp-*` engine API key, which must remain untouched.
+fn scrub_cloud_token_from_auth_json(path: &Path) -> anyhow::Result<()> {
+    rewrite_json_file_checked(path, |json| {
+        let object = json.as_object_mut()?;
+        let should_remove = object
+            .get("token")
+            .and_then(|value| value.as_str())
+            .is_some_and(is_cloud_session_token);
+        if !should_remove {
+            return None;
+        }
+        object.remove("token");
+        Some(())
+    })
+}
+
 /// Parse `path` as JSON, apply `edit` (return `None` to skip the write), and
 /// atomically rewrite the file (tmp + rename, with the same Windows
 /// rename-failure handling as `scrub_store_bin_token`).
 fn rewrite_json_file(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> Option<()>) {
-    let Ok(data) = std::fs::read(path) else {
-        return;
+    let _ = rewrite_json_file_checked(path, edit);
+}
+
+fn rewrite_json_file_checked(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Value) -> Option<()>,
+) -> anyhow::Result<()> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
-    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&data) else {
-        return;
-    };
+    let mut json = serde_json::from_slice::<serde_json::Value>(&data)
+        .map_err(|error| anyhow::anyhow!("malformed {}: {error}", path.display()))?;
     if edit(&mut json).is_none() {
-        return;
+        return Ok(());
     }
-    let Ok(bytes) = serde_json::to_vec_pretty(&json) else {
-        return;
-    };
+    let bytes = serde_json::to_vec_pretty(&json)?;
     let tmp = path.with_extension("scrub.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, &bytes)?;
+    if let Err(first_error) = std::fs::rename(&tmp, path) {
+        #[cfg(windows)]
+        {
+            // std::fs::rename does not replace an existing destination on
+            // Windows. Remove + rename is the narrow fallback; if the file is
+            // locked, removal fails and the caller rolls the SecretStore
+            // identity back rather than committing a split account.
+            std::fs::remove_file(path).map_err(|remove_error| {
+                let _ = std::fs::remove_file(&tmp);
+                anyhow::anyhow!(
+                    "failed to replace {} ({first_error}); remove failed: {remove_error}",
+                    path.display()
+                )
+            })?;
+            if let Err(rename_error) = std::fs::rename(&tmp, path) {
+                return Err(anyhow::anyhow!(
+                    "failed to install scrubbed {} after removal: {rename_error}; recovery file: {}",
+                    path.display(),
+                    tmp.display()
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(first_error.into());
+        }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -470,6 +557,51 @@ mod tests {
     fn extracts_token_from_auth_json() {
         let data = format!(r#"{{"token":"{JWT}","account_id":"acc"}}"#);
         assert_eq!(token_from_auth_json(data.as_bytes()), Some(JWT.to_string()));
+    }
+
+    #[test]
+    fn scrub_default_auth_removes_cloud_jwt_but_preserves_local_key_and_metadata() {
+        let dir = unique_dir("default_auth_scrub");
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"token":"{JWT}","account_id":"old-account"}}"#),
+        )
+        .unwrap();
+        scrub_cloud_token_from_auth_json(&path).expect("scrub cloud token");
+        let scrubbed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(scrubbed.get("token").is_none());
+        assert_eq!(
+            scrubbed.get("account_id").and_then(|value| value.as_str()),
+            Some("old-account")
+        );
+
+        std::fs::write(&path, br#"{"token":"sp-1a2b3c4d","local":true}"#).unwrap();
+        scrub_cloud_token_from_auth_json(&path).expect("preserve local token");
+        let local: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            local.get("token").and_then(|value| value.as_str()),
+            Some("sp-1a2b3c4d")
+        );
+        assert_eq!(
+            local.get("local").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn malformed_default_auth_is_preserved_and_scrub_fails_closed() {
+        let dir = unique_dir("malformed_default_auth_scrub");
+        let path = dir.join("auth.json");
+        let malformed = format!(r#"{{"token":"{JWT}""#);
+        std::fs::write(&path, &malformed).unwrap();
+
+        let error = scrub_cloud_token_from_auth_json(&path)
+            .expect_err("malformed legacy auth must abort account rotation");
+        assert!(error.to_string().contains("malformed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
     }
 
     #[test]
@@ -798,24 +930,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_scrubs_last_good_snapshot() {
-        let dir = unique_dir("mig_lastgood");
-        std::fs::write(
+    async fn migrate_scrubs_all_store_backup_generations_without_corrupting_settings() {
+        let dir = unique_dir("mig_all_lastgood_generations");
+        let store_paths = [
             dir.join("store.bin"),
-            br#"{"settings":{"user":{"token":"jwt"},"aiPresets":[{"id":"x"}]}}"#,
-        )
-        .unwrap();
-        std::fs::write(
             dir.join("store.bin.last-good"),
-            br#"{"settings":{"user":{"token":"jwt"},"aiPresets":[{"id":"x"}]}}"#,
-        )
-        .unwrap();
-        migrate_at(&dir, None).await;
-        assert_eq!(
-            token_from_store_bytes(&std::fs::read(dir.join("store.bin.last-good")).unwrap()),
-            None,
-            ".last-good snapshot must also be scrubbed"
-        );
+            dir.join("store.bin.last-good.prev"),
+        ];
+
+        for (generation, path) in store_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!(
+                    r#"{{"settings":{{"user":{{"token":"{JWT}","email":"person@example.com"}},"aiPresets":[{{"id":"preset-{generation}","provider":"ollama"}}],"fps":1.0,"unrelated":{{"generation":{generation},"enabled":true}}}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(migrate_at(&dir, None).await, Some(JWT.to_string()));
+
+        for (generation, path) in store_paths.iter().enumerate() {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(
+                !bytes
+                    .windows(JWT.len())
+                    .any(|window| window == JWT.as_bytes()),
+                "raw JWT must be absent from {}",
+                path.display()
+            );
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(json.pointer("/settings/user/token").unwrap().is_null());
+            assert_eq!(
+                json.pointer("/settings/user/email").unwrap().as_str(),
+                Some("person@example.com")
+            );
+            let expected_preset_id = format!("preset-{generation}");
+            assert_eq!(
+                json.pointer("/settings/aiPresets/0/id").unwrap().as_str(),
+                Some(expected_preset_id.as_str())
+            );
+            assert_eq!(json.pointer("/settings/fps").unwrap().as_f64(), Some(1.0));
+            assert_eq!(
+                json.pointer("/settings/unrelated/generation")
+                    .unwrap()
+                    .as_u64(),
+                Some(generation as u64)
+            );
+            assert_eq!(
+                json.pointer("/settings/unrelated/enabled")
+                    .unwrap()
+                    .as_bool(),
+                Some(true)
+            );
+        }
     }
 
     #[tokio::test]

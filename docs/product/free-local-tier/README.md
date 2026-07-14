@@ -17,7 +17,7 @@ The 30-day PostHog snapshot ending July 13, 2026 used for this decision showed:
 - The plan-attributed known-free sample was only 78 identifiers, and only 46% were at 2 or fewer sends. That subgroup is too small and points in a different direction, so it cannot validate 2 as the ideal allowance.
 - Image sends were 1.81% of sends. For launch, the funded preview is text-only; Business and user-owned providers retain multimodal support.
 
-The query counts `chat_message_sent` events for the `screenpipe-cloud` and legacy `pi` provider labels by PostHog `distinct_id`. It measures attempted sends, not successful answers; response telemetry is too incomplete to infer completion. Person-property cohorts can also overlap or change over time.
+The query counts `chat_message_sent` events for the `screenpipe-cloud` and legacy `pi` provider labels by PostHog `distinct_id`. It measures attempted sends, not successful answers; response telemetry is too incomplete to infer completion. Person-property cohorts can also overlap or change over time. The exact aggregate queries, frozen bucket counts, and sensitivity checks are in [the PostHog snapshot](./posthog-analysis.md).
 
 This evidence says a two-turn launch reaches a majority of observed light usage while tightly limiting exposure. It does not say two turns maximize retention, comprehension, or upgrades. Re-evaluate only after measuring successful first answers, second-turn completion, provider selection, upgrade conversion, support complaints, day-1 recording retention, and retail shadow cost.
 
@@ -42,6 +42,18 @@ External Claude or Codex agents may query screenpipe through its local API or MC
 
 A selected user-owned provider is a payer and privacy boundary. If Ollama, Anthropic, OpenAI, ChatGPT, or a custom endpoint fails setup, screenpipe must surface that provider's error. It must not silently fall through to a different provider, credential, or cloud boundary.
 
+The Screenpipe Cloud agent never receives the raw Clerk account token. Its model entry points to an authenticated loopback proxy and the child receives only the ordinary local API key plus domain-separated, account-rotating capabilities. Foreground sessions receive distinct interactive and background capabilities: the managed model entry can use only the interactive route, while media-analysis `curl` calls to `/v1/chat/completions` can use only the background route. This also lets a paid foreground BYOK/local session invoke hosted media analysis without giving its main model a cloud credential. Background pipes receive only the background capability and can never call the interactive preview route. The bash shim chooses the capability from the exact loopback route and omits both for a mixed-route invocation. The Rust proxy validates both locally, forces the route-owned interactive/background latency class, and adds the raw account token only to the upstream request. A missing, wrong-scope, incorrect, or previous-account capability returns `403`; free accounts are still rejected by the hosted background gate. Foreground Pi sessions using different provider endpoints or credential fingerprints cannot coexist: starting the new boundary synchronously stops each conflicting process tree before its config or child is created. Sessions on the exact same provider and credential boundary may coexist.
+
+Pi extensions and installed pipes are trusted code running as the same operating-system user as screenpipe; this PR does **not** turn them into an OS sandbox. A hostile same-user process can inspect sibling processes, local files, or the full local API bearer. The isolated auth/config directories, selected-provider-only environment, loopback capability, prompt redaction, and process eviction prevent accidental credential inheritance, stale-account reuse, and silent provider fallback; they are not a claim that secrets are safe from malicious local code. The financial boundary remains the server-side authenticated lifetime ledger plus network, global, request, model, input/output, and retail-shadow circuit breakers. Sandboxing third-party pipes and issuing least-privilege local API capabilities are separate follow-up work.
+
+Codex MCP onboarding and Settings write `SCREENPIPE_LOCAL_API_KEY` into the nested screenpipe MCP environment table while preserving unrelated TOML tables. The hosted-limit dialog routes ChatGPT and Ollama choices directly into the corresponding setup form; the broader provider screen also exposes user-owned Anthropic and OpenAI API-key options. None of those local/MCP/BYOK paths consume a hosted preview turn.
+
+The authenticated account is also a payer and privacy boundary. Explicit logout, token invalidation, and account changes stop every legacy and UUID Pi subprocess, discard its native and frontend prompt queues, mint a blank conversation session so the next account cannot upload the prior account's visible history, and scrub the Screenpipe Cloud credential from Pi auth files. Credential refresh for the same stable account restarts native work without erasing local chat history. Local and user-owned providers remain free and start a fresh process on the next message. A trusted auto-prefill may bridge ordinary React startup lag, but it can never bypass the hosted sign-in requirement.
+
+Chat files and drafts remain local-device data scoped to the operating-system user, not a cloud-account vault. An account switch never auto-carries or auto-sends the previous account's active conversation, attachments, prefills, or retries, but someone with the same OS login can deliberately reopen local chat history. Use separate OS accounts or data directories when local history itself must be isolated between people.
+
+Those guarantees cover interactive Pi sessions. A paid background pipe whose provider request was already dispatched is not synchronously joined by the foreground logout command and may finish that already-authorized in-flight request. The raw Clerk token still remains Rust-side: after rotation/logout, the local proxy rejects subsequent calls carrying the old capability, and new background starts read the rotated/null token. Free accounts cannot start hosted background work, and gateway account/global limits still bound the already-dispatched residual. Treat process-wide cancellation of an already-running background provider request as a follow-up hardening item, not as a launch claim.
+
 An active Business or enterprise entitlement bypasses the free-preview ledger. A positive prepaid-credit balance by itself does **not** bypass it: the current Auto lane can have zero query weight, so merely checking a balance would permit hosted inference without atomically deducting a credit. Credits may extend normal cost ceilings where they are actually charged, but they are not an entitlement to this preview path.
 
 ## Hosted preview accounting and request bounds
@@ -52,11 +64,12 @@ Launch defaults:
 
 - `FREE_CHAT_TURN_LIMIT=2`: two accepted, distinct lifetime turns per authenticated free account. The configured value is clamped to 10; `0` stops all preview inference, including follow-ups to an existing marker.
 - Every visible user message gets an opaque client turn marker. Two messages with identical visible text still receive different markers.
+- A retry of the same failed assistant response reuses the original user's marker and therefore cannot spend a second lifetime slot. Editing that user message or submitting a new message deliberately mints a new marker.
 - Agent/tool requests carrying the same marker reuse the same turn. The fixed follow-up window is 30 minutes, the request budget is 8 gateway calls, and only one lease may be in flight. Activity does not extend the deadline.
-- `FREE_CHAT_MAX_INPUT_BYTES=80000` bounds the full serialized request in UTF-8 bytes, including tools. Every message must be a string or an array of valid text parts; all image, file, malformed, and non-text parts are rejected before inference.
+- `FREE_CHAT_MAX_INPUT_BYTES=80000` bounds the raw HTTP request body in UTF-8 bytes, including JSON whitespace, tools, and fields that the gateway later discards. Eligible preview bodies are streamed only up to that ceiling and rejected before JSON parsing; every message must then be a string or an array of valid text parts, and all image, file, malformed, and non-text parts are rejected before inference.
 - `FREE_CHAT_MAX_OUTPUT_TOKENS=4096` bounds requested output. The preview accepts only the cost-routed `auto` model and cannot opt into a frontier model.
 - Every allowed preview gateway call atomically reserves a fixed `$1.00` (1,000,000 micro-USD) retail shadow allowance before inference. At the provider-dispatch boundary it is settled and becomes non-refundable. `FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD=50` therefore admits at most 50 calls per UTC day by default, independently of promotional credits and `cost_log`; `0` stops all preview calls and the configured budget is clamped to `$1,000`.
-- A new turn is reserved atomically in D1 before inference. Only a failure proven to occur before provider dispatch may release the unused lifetime slot, daily counters, and exact shadow reservation. Immediately before `handleChatCompletions`, the gateway marks the lifetime turn accepted, clears its network digest, and settles the shadow dollar. A later throw, timeout, final non-2xx, exhausted fallback cascade, client disconnect, or broken response body releases only the exact in-flight lease.
+- A new turn is reserved atomically in D1 before inference. Only a failure proven to occur before provider dispatch may release the unused lifetime slot, daily counters, and exact shadow reservation. Immediately before `handleChatCompletions`, one transactional D1 batch marks the lifetime turn accepted, clears its network digest, and settles the exact shadow dollar. If either statement fails, the batch rolls back and no provider runs; the failure cannot burn one of two lifetime turns while leaving inference unstarted. A later throw, timeout, final non-2xx, exhausted fallback cascade, client disconnect, or broken response body releases only the exact in-flight lease.
 - A concurrent duplicate receives a retryable in-flight error. It cannot start a second upstream inference.
 - Missing network identity, missing/mismatched D1 schema, or a counter update failure fails closed before inference and does not burn a new lifetime slot.
 - The gateway strips any client-supplied internal preview-routing field and re-adds it only after authentication and preview validation.
@@ -72,7 +85,7 @@ Hosted background automation, cloud transcription, sync, team features, alternat
 | Network daily | `FREE_CHAT_NETWORK_DAILY_TURN_LIMIT=20` | Atomic UTC-day cap across accounts on one normalized network; configurable maximum 100 |
 | Global daily turns | `FREE_CHAT_GLOBAL_DAILY_TURN_LIMIT=100` | Atomic UTC-day cap on new preview turns; configurable maximum 10,000 |
 | Global daily retail shadow budget | `FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD=50` | Atomic `$1` reservation for every preview gateway call, including tool follow-ups; works when provider credits make reported cash cost `$0` and covers unlogged fallback attempts |
-| Per turn | 8 requests, 30-minute fixed window, 1 lease, 80,000 UTF-8 serialized input bytes, 4,096 output tokens | Bounds the worst case hidden inside either lifetime turn |
+| Per turn | 8 requests, 30-minute fixed window, 1 lease, 80,000 raw HTTP input bytes, 4,096 output tokens | Bounds the worst case hidden inside either lifetime turn |
 
 There is intentionally no separate per-account daily turn variable: two lifetime turns are stricter. Do not raise the lifetime limit or make it renewable without first adding and testing an atomic per-account daily counter.
 
@@ -131,24 +144,50 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 |---|---|
 | Signed-out consumer | App, recorder, search, timeline, meetings, local API/MCP, local AI, and BYOK remain available |
 | Signed-out request to Screenpipe Cloud | `401 hosted_ai_sign_in_required`; no rate-limit call, reservation, or inference |
+| Logout or token invalidation while a UUID Pi turn is running/queued | Every interactive Pi subprocess is stopped, pending native/frontend work is dropped, and Pi auth files are scrubbed before another account can use chat |
+| Late first-call retry, rate-limit timer, crash restart, reauth event, or queue snapshot crosses an account, conversation, or provider switch | Dropped by the original auth generation + session + operation epoch + exact provider-config check; native compare-and-set also rejects a stale start/clear |
+| Direct switch from account A to account B | All old-token Pi subprocesses and queues are invalidated; a blank conversation/session is minted so B's first prompt contains none of A's visible history |
+| Delayed prefill created by account A arrives under account B | Dropped by the non-secret origin-account owner; no composer mutation or send |
+| Auto-prefill starts a new conversation while the old composer has a PDF/image | Old extraction is invalidated and every staged document/image ref is cleared before the new turn is minted |
+| Invalid/unknown custom provider or failed provider switch | Chat stays disabled or fails visibly; no nullable start, old-provider send, hosted fallback, upload, or charge |
+| Inspect Screenpipe Cloud Pi parent/tool environments or managed models/auth files | No raw Clerk JWT is present; the child has a loopback-only rotating capability and local API key, while Rust alone injects the account token upstream |
+| Same-user malicious pipe/extension/process inspects local files, sibling processes, or the local API bearer | Outside this PR's sandbox boundary; Pi/pipes are trusted local code. Server-side authenticated ledgers and circuit breakers still bound Screenpipe-funded inference |
+| Missing, wrong, or previous-account cloud proxy capability | Local proxy returns `403`; no upstream request is sent |
+| Interactive route called with a background capability, background route called with an interactive capability, or background pipe calls the interactive path | Route-specific capability validation returns `403`; route-owned latency classification wins over agent headers, and background work receives no free-preview allowance |
+| Start foreground cloud, Ollama, or BYOK sessions with a different endpoint/key while another credential boundary is live | Every conflicting foreground process tree is synchronously evicted with reason `provider_boundary`; exact same-boundary sessions may coexist |
+| Account B deliberately opens an old local chat file | Allowed within the documented same-OS-user local-device boundary; its next hosted send still uses only B's active credentials and a freshly validated provider/session boundary |
+| Same-account cloud token refresh | Deferred/native work tied to the old credential is invalidated, but local conversation history remains available to the same stable account id |
+| Paid background pipe already in flight when the account logs out | May finish the already-authorized call; no new hosted background start inherits the old token, and this bounded residual is not advertised as synchronous cancellation |
+| Hosted auto-prefill while signed out | Login boundary wins even if the prefill startup bypass is set; no Pi dispatch or hosted inference |
 | Authenticated free account, marked hosted turn 1–2 | Allowed and recorded once per explicit user message |
 | Free old client without the turn marker while preview is on | `426 free_chat_client_update_required` before rate limits, D1 reservation, or inference; never silently metered |
 | Free old client while enforcement is on and preview is off | `402 hosted_ai_subscription_required`; local/user-owned AI remains available |
 | Active Business/enterprise on an old client | Paid hosted route continues without requiring the free-preview marker |
 | Positive prepaid-credit balance without Business/enterprise | Does not bypass enforcement or the two-turn ledger |
 | Enterprise build requiring sign-in | Enterprise gate shown; recorder stopped until mandatory policy is satisfied |
+| Enterprise policy is loading, unavailable without a validated cache, missing a required key, or has an invalid key | Global gate remains closed and recording does not resume; a cached policy is trusted only for the same saved key/device after a successful seat heartbeat within the 30-day offline grace |
+| New/manual enterprise activation while heartbeat is offline or returns `5xx` | Retryable activation error; no key, policy cache, or seat proof is persisted and recording remains stopped |
+| New/manual enterprise activation passes policy validation and heartbeat | The already validated policy is applied locally before success; no second policy fetch can turn the accepted seat into a transient global lockout |
+| Previously accepted enterprise device receives heartbeat `401`, `402`, or `403` | Cached policy and seat proof are cleared, durable local admin/license authorization is revoked, polling stops, and the global gate closes immediately |
+| Previously accepted enterprise device has a transient heartbeat outage | The last validated policy may continue only for the same key/device until its 30-day seat proof expires; after that the global gate fails closed |
 | Consumer account requiring enterprise app | Enterprise download gate remains |
 | Same marked turn with agent/tool calls | One slot; at most 8 requests within the original 30-minute window |
 | Identical visible text sent again | New marker and new turn |
+| Manual retry of the same failed assistant response | Reuses the original stored marker; no second lifetime slot |
+| Edit-and-resubmit of an earlier user message | Mints a new marker and counts as a new explicit turn |
 | Concurrent same-turn calls | One upstream request; duplicate receives retryable `409` |
 | Same turn after its fixed window or request cap | Rejected; the deadline is not refreshed and a new slot is not created |
 | Non-`auto` model on the preview | Rejected before upstream inference |
 | Serialized input over 80,000 UTF-8 bytes | Rejected before upstream inference |
 | Image, file, malformed text part, or non-array object content | Rejected; the funded preview is text-only |
+| Image paste/drop/picker, queued image, or steering image while free hosted preview is selected | Blocked before a native prompt command; composer or queue state is preserved so the user can remove it, choose their own provider, or upgrade |
 | Requested output above 4,096 tokens | Clamped to 4,096 |
 | Third distinct hosted turn | `402 free_chat_limit_exhausted`; provider-choice modal |
+| Authenticated free usage-status read | Returns the authoritative lifetime `used/limit/remaining` count without reserving a turn or touching abuse/shadow ledgers; UI refreshes after completion and clears immediately on account-token change |
+| Usage-status preview ledger unavailable | Structured `503`; no inference and no guessed/stale cross-account counter |
 | `FREE_CHAT_TURN_LIMIT=0`, including an existing marker | Rejected before upstream inference |
 | Safety/ledger failure before provider dispatch | Exact unused shadow reservation and pending turn/counters may be released; no provider inference starts |
+| Dispatch-guard batch statement 2 fails after statement 1 is attempted | D1 rolls back both statements; no provider call, lifetime turn, daily counter, or shadow dollar remains consumed |
 | Provider throws, times out, returns final non-2xx, or exhausts its fallback cascade | Lifetime turn, network/global counters, and `$1` shadow reservation remain consumed; only the exact lease is released |
 | Upstream fails after returning a response | Lifetime turn and shadow reservation remain consumed; only the exact lease is released |
 | Missing network identity | Fail closed; no lifetime slot or inference |
@@ -159,16 +198,18 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 | Provider call throws or returns non-2xx after dispatch begins | Shadow reservation remains settled because provider work or earlier fallback attempts may still be billable |
 | Upstream returns 2xx but its body later breaks | Shadow reservation and lifetime turn remain settled; only the exact in-flight lease is released |
 | Missing ledger table or counter update failure | Structured `503`; never infer unmetered |
-| Subscription lookup unavailable | Structured `503`; never downgrade a potentially paying account to free or consume a preview turn |
+| Subscription lookup unavailable, including legacy Screenpipe-token `/api/user` `5xx` or network failure | Hosted routes plus entitlement-sensitive usage/model metadata return structured `503`; never downgrade a potentially paying account to anonymous/free or consume a preview turn |
 | Raw IPv4/IPv6 variants in one subnet | Normalize to one HMAC bucket; raw address never stored |
 | Completed preview turn | Network digest cleared immediately; daily counters and abandoned pending rows older than 7 days are removed by the scheduled/off-path cleanup |
 | Business/enterprise entitlement | Preview ledger bypassed; paid model, rate, and usage limits still apply |
 | External Claude/Codex using local API/MCP | Never reaches or consumes the hosted preview; user's provider charges may apply |
+| Codex MCP setup over an existing multi-table config | Replaces only screenpipe plus its nested env table, writes `SCREENPIPE_LOCAL_API_KEY`, and preserves every unrelated TOML table |
+| Hosted-limit ChatGPT or Ollama action | Opens the matching actionable setup form rather than a generic dead-end settings page |
 | Ollama setup/request fails | Surface Ollama error; never fall through to Anthropic, OpenAI, ChatGPT, or a custom cloud endpoint |
 | Anthropic setup/request fails | Surface Anthropic error; never fall through to OpenAI/ChatGPT or another credential boundary |
 | App title, onboarding summary, region OCR, retry, background work | Does not silently consume a hosted preview turn |
 | Free hosted background automation, transcription, sync, alternate hosted route, or team feature | Rejected; choose Business, BYOK, or local execution where supported |
-| Client supplies the internal preview-routing field | Field is stripped; gateway alone decides preview routing after authentication |
+| Client supplies a huge internal preview-routing field or raw JSON whitespace | Raw bytes are capped before parsing or stripping; the field is then stripped and the gateway alone decides preview routing after authentication |
 | `enforcement=true`, `preview=false` | Free hosted route fails closed without touching the preview ledger; paid and local routes remain available |
 | `preview=true` with `enforcement!=true` | Deploy preflight rejects the expected state; post-deploy live-header verification independently rejects the actual state |
 | Invalid state reaches runtime despite deploy checks | Every hosted inference route returns `503 free_tier_rollout_misconfigured`; no provider handler runs, while `/test` keeps raw headers observable |

@@ -213,7 +213,11 @@ describe.skip("Account never shows an active plan card under a not-logged-in hea
       await loginAsSubscriber();
       const btn = await $('[data-testid="account-logout-button"]');
       if (await btn.isExisting()) await btn.click();
-      await invoke("set_cloud_token", { token: null });
+      await invoke("set_cloud_token", {
+        token: null,
+        expectedCurrentToken: null,
+        forceClear: true,
+      });
     } catch {
       // best-effort
     }
@@ -240,7 +244,11 @@ describe.skip("Account never shows an active plan card under a not-logged-in hea
     // here, so the user is never nulled — store.bin keeps cloud_subscribed:true.
     let staleShell = false;
     for (let attempt = 0; attempt < 4 && !staleShell; attempt++) {
-      const res = await invoke("set_cloud_token", { token: null });
+      const res = await invoke("set_cloud_token", {
+        token: null,
+        expectedCurrentToken: null,
+        forceClear: true,
+      });
       expect(res.ok).toBe(true);
       await reloadHomeToAccount();
       if ((await loginStatusText()).includes("not logged in")) {

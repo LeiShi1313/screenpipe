@@ -64,7 +64,11 @@ describe('Free/Local app access', () => {
   after(async () => {
     await seedUser(null).catch(() => {});
     await setForceGate(false).catch(() => {});
-    await invoke('set_cloud_token', { token: null }).catch(() => {});
+    await invoke("set_cloud_token", {
+      token: null,
+      expectedCurrentToken: null,
+      forceClear: true,
+    }).catch(() => {});
   });
 
   it('keeps signed-out local capture available with production billing policy', async () => {

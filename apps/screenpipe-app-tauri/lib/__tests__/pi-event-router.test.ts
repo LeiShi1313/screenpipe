@@ -45,7 +45,11 @@ function piEvt(sessionId: string, event: AgentInnerEvent): AgentEventEnvelope {
 function reset() {
   vi.clearAllMocks();
   deleteCachedBrowserState("A");
-  useChatStore.setState({ sessions: {}, currentId: null, panelSessionId: null });
+  useChatStore.setState({
+    sessions: {},
+    currentId: null,
+    panelSessionId: null,
+  });
 }
 
 function seed(id: string, overrides: Partial<SessionRecord> = {}) {
@@ -78,7 +82,10 @@ describe("pi-event-router: envelope destructuring (the actual day-1 bug)", () =>
   it("ignores envelopes missing sessionId", async () => {
     seed("A");
     // No sessionId → must not touch any session record.
-    await handlePiEvent({ source: "pi", event: { type: "agent_start" } } as any);
+    await handlePiEvent({
+      source: "pi",
+      event: { type: "agent_start" },
+    } as any);
     expect(useChatStore.getState().sessions.A.status).toBe("idle");
   });
 
@@ -282,13 +289,17 @@ describe("pi-event-router: background content accumulation (the parallel-chat re
   it("materializes queued background user turns before the assistant reply", async () => {
     seed("A");
     useChatStore.setState({ currentId: "B" });
+    const hostedTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const nativePrompt =
+      "<connections_context>\nlive connector state\n</connections_context>\n\n" +
+      "<conversation_history>\nuser: x\nassistant: y\n</conversation_history>\n\n" +
+      `queued follow-up\n\n<!-- screenpipe-cloud-turn:${hostedTurnId} -->`;
     await handlePiEvent(
       piEvt("A", {
         type: "message_start",
         message: {
           role: "user",
-          content:
-            "<conversation_history>\nuser: x\nassistant: y\n</conversation_history>\n\nqueued follow-up",
+          content: nativePrompt,
         },
       }),
     );
@@ -296,8 +307,90 @@ describe("pi-event-router: background content accumulation (the parallel-chat re
     expect(session.messages).toHaveLength(2);
     expect((session.messages![0] as any).role).toBe("user");
     expect((session.messages![0] as any).content).toBe("queued follow-up");
+    expect((session.messages![0] as any).hostedTurnId).toBe(hostedTurnId);
+    expect((session.messages![0] as any).hostedTurnPrompt).toBe(nativePrompt);
     expect((session.messages![1] as any).role).toBe("assistant");
     expect(session.streamingMessageId).toBe((session.messages![1] as any).id);
+
+    await handlePiEvent(piEvt("A", { type: "agent_end" }));
+    await flushPendingSaves();
+    expect(saveConversationFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "A",
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            content: "queued follow-up",
+            hostedTurnId,
+            hostedTurnPrompt: nativePrompt,
+          }),
+        ]),
+      }),
+    );
+  });
+
+  it("updates an optimistic hosted row instead of duplicating it after switch-away", async () => {
+    const hostedTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const provisionalPrompt = `hello\n\n<!-- screenpipe-cloud-turn:${hostedTurnId} -->`;
+    const nativePrompt =
+      "<connections_context>\nrefreshed connector state\n</connections_context>\n\n" +
+      provisionalPrompt;
+    seed("A", {
+      status: "streaming",
+      isLoading: true,
+      isStreaming: true,
+      streamingMessageId: "assistant-1",
+      messages: [
+        {
+          id: "user-1",
+          role: "user",
+          content: "hello",
+          hostedTurnId,
+          hostedTurnPrompt: provisionalPrompt,
+          timestamp: 1,
+        },
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "Processing...",
+          timestamp: 2,
+        },
+      ] as any,
+    });
+    useChatStore.setState({ currentId: "B" });
+
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_start",
+        message: { role: "user", content: nativePrompt },
+      }),
+    );
+
+    const session = useChatStore.getState().sessions.A;
+    expect(session.messages).toHaveLength(2);
+    expect(session.messages?.map((message: any) => message.id)).toEqual([
+      "user-1",
+      "assistant-1",
+    ]);
+    expect(session.messages?.[0]).toMatchObject({
+      content: "hello",
+      hostedTurnId,
+      hostedTurnPrompt: nativePrompt,
+    });
+    expect(session.streamingMessageId).toBe("assistant-1");
+
+    await handlePiEvent(piEvt("A", { type: "agent_end" }));
+    await flushPendingSaves();
+    expect(saveConversationFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "A",
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            id: "user-1",
+            hostedTurnPrompt: nativePrompt,
+          }),
+        ]),
+      }),
+    );
   });
 
   it("keeps one assistant message across turn_end + assistant restart after switch-away", async () => {
@@ -389,7 +482,9 @@ describe("pi-event-router: background content accumulation (the parallel-chat re
     const session = useChatStore.getState().sessions.A;
     expect(session.messages).toHaveLength(2);
     expect((session.messages![0] as any).role).toBe("user");
-    expect((session.messages![0] as any).content).toBe("queued while switching back");
+    expect((session.messages![0] as any).content).toBe(
+      "queued while switching back",
+    );
     expect((session.messages![1] as any).role).toBe("assistant");
     expect((session.messages![1] as any).content).toBe("still here");
   });
@@ -454,7 +549,7 @@ describe("pi-event-router: agent_terminated", () => {
             displayContent: "Summarize meeting: Design Review",
           }),
         ],
-      })
+      }),
     );
   });
 });

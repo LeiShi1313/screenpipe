@@ -17,13 +17,14 @@
 // header and the active-plan card can never contradict each other.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
   state: { user: null as any },
   updateSettings: vi.fn().mockResolvedValue(undefined),
   loadUser: vi.fn().mockResolvedValue(undefined),
   openLoginWindow: vi.fn().mockResolvedValue(undefined),
+  setCloudToken: vi.fn().mockResolvedValue(undefined),
   piUpdateConfig: vi.fn().mockResolvedValue(undefined),
   capture: vi.fn(),
   openUrl: vi.fn().mockResolvedValue(undefined),
@@ -52,6 +53,7 @@ vi.mock("@/lib/hooks/use-health-check", () => ({
 vi.mock("@/lib/utils/tauri", () => ({
   commands: {
     openLoginWindow: mocks.openLoginWindow,
+    setCloudToken: mocks.setCloudToken,
     piUpdateConfig: mocks.piUpdateConfig,
   },
 }));
@@ -180,5 +182,83 @@ describe("AccountSection subscription/login gating", () => {
     expect(loginStatus()).toContain("not logged in");
     expect(screen.queryByTestId(ACTIVE_CARD)).not.toBeInTheDocument();
     expect(screen.getByText(/sign in to screenpipe/i)).toBeInTheDocument();
+  });
+
+  it("invalidates every Pi credential session when the account logs out", async () => {
+    mocks.state.user = {
+      id: "u1",
+      email: "pro@screenpipe.test",
+      token: "old-account-jwt",
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+    };
+
+    render(<AccountSection />);
+    fireEvent.click(screen.getByTestId("account-logout-button"));
+
+    await waitFor(() => {
+      expect(mocks.updateSettings).toHaveBeenCalledWith({ user: null });
+      expect(mocks.setCloudToken).toHaveBeenCalledWith(null, "old-account-jwt", true);
+      // Native null/null is deliberately the session-wide account reset, not
+      // a restart of the obsolete singleton `chat` process.
+      expect(mocks.piUpdateConfig).toHaveBeenCalledWith(null, null);
+    });
+    expect(mocks.setCloudToken.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.updateSettings.mock.invocationCallOrder[0],
+    );
+    expect(mocks.piUpdateConfig.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.updateSettings.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps the visible account when the native logout boundary is unavailable", async () => {
+    mocks.state.user = {
+      id: "u1",
+      email: "pro@screenpipe.test",
+      token: "old-account-jwt",
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+    };
+    mocks.setCloudToken.mockRejectedValueOnce(new Error("invoke unavailable"));
+
+    render(<AccountSection />);
+    fireEvent.click(screen.getByTestId("account-logout-button"));
+
+    await waitFor(() =>
+      expect(mocks.setCloudToken).toHaveBeenCalledWith(
+        null,
+        "old-account-jwt",
+        true,
+      ),
+    );
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(mocks.piUpdateConfig).not.toHaveBeenCalled();
+  });
+
+  it("keeps the visible account when native logout returns an error", async () => {
+    mocks.state.user = {
+      id: "u1",
+      email: "pro@screenpipe.test",
+      token: "old-account-jwt",
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+    };
+    mocks.setCloudToken.mockResolvedValueOnce({
+      status: "error",
+      error: "secret_store_unavailable",
+    });
+
+    render(<AccountSection />);
+    fireEvent.click(screen.getByTestId("account-logout-button"));
+
+    await waitFor(() =>
+      expect(mocks.setCloudToken).toHaveBeenCalledWith(
+        null,
+        "old-account-jwt",
+        true,
+      ),
+    );
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(mocks.piUpdateConfig).not.toHaveBeenCalled();
   });
 });

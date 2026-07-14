@@ -24,26 +24,12 @@ jobs:
         shell: pwsh
         run: |
           $unsignedSource = "$env:RUNNER_TEMP\unsigned-source.exe"
-          Copy-Item "C:\Windows\System32\notepad.exe" $unsignedSource
-
-          # Clear the PE certificate-table directory so the test starts with a
-          # genuinely unsigned executable instead of trusting Notepad's existing
-          # Microsoft signature. The certificate bytes can remain as ignored
-          # overlay data; a zero directory entry makes the PE unsigned.
-          $bytes = [System.IO.File]::ReadAllBytes($unsignedSource)
-          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
-          $optionalHeaderOffset = $peOffset + 24
-          $optionalHeaderMagic = [BitConverter]::ToUInt16($bytes, $optionalHeaderOffset)
-          $dataDirectoryOffset = if ($optionalHeaderMagic -eq 0x10b) {
-            $optionalHeaderOffset + 96
-          } elseif ($optionalHeaderMagic -eq 0x20b) {
-            $optionalHeaderOffset + 112
-          } else {
-            throw "Unexpected PE optional-header magic: $optionalHeaderMagic"
+          Add-Type -TypeDefinition @'
+          public static class Program
+          {
+              public static void Main() { }
           }
-          $certificateDirectoryOffset = $dataDirectoryOffset + (4 * 8)
-          0..7 | ForEach-Object { $bytes[$certificateDirectoryOffset + $_] = 0 }
-          [System.IO.File]::WriteAllBytes($unsignedSource, $bytes)
+          '@ -OutputAssembly $unsignedSource -OutputType ConsoleApplication
 
           if ((Get-AuthenticodeSignature $unsignedSource).Status -ne 'NotSigned') {
             throw 'Test source is still signed'

@@ -40,7 +40,10 @@ import { FeedbackSection } from "@/components/settings/feedback-section";
 import { PipeStoreView } from "@/components/pipe-store";
 import { BrainSection } from "@/components/settings/brain-section";
 import { ConnectionsSection } from "@/components/settings/connections-section";
-import { MeetingNotesSection } from "@/components/meeting-notes";
+import {
+  MeetingNotesSection,
+  type OpenMeetingRequest,
+} from "@/components/meeting-notes";
 import { StandaloneChat } from "@/components/standalone-chat";
 import { ChatSidebar } from "@/components/chat-sidebar";
 import { ChatHistoryView } from "@/components/chat/chat-history-view";
@@ -120,6 +123,13 @@ function HomeContent() {
     serialize: (value) => value,
   });
   const [connectionFocusRequest, setConnectionFocusRequest] = useState<ConnectionFocusRequest | null>(null);
+  const [openMeetingRequest, setOpenMeetingRequest] = useState<OpenMeetingRequest | null>(null);
+  const openMeetingRequestIdRef = useRef(0);
+  const clearOpenMeetingRequest = useCallback((requestId: number) => {
+    setOpenMeetingRequest((current) =>
+      current?.requestId === requestId ? null : current,
+    );
+  }, []);
 
   const { settings } = useSettings();
   const { isTranslucent } = useSidebarContext();
@@ -297,6 +307,25 @@ function HomeContent() {
     if (!shouldActivateHomeSectionForChatLoadConversation(event.payload)) return;
     setActiveSection("home");
   });
+
+  // Keep meeting notification clicks at the always-mounted page level. The
+  // old listener lived inside MeetingNotesSection, so an open event emitted
+  // while switching from Chat/Timeline to Meetings could arrive before that
+  // component mounted and strand the user on the meeting list. Buffer the
+  // request here, switch sections, then hand it to the mounted section.
+  useTauriEvent<{ meetingId: number; transcript?: boolean }>(
+    "open-meeting-note",
+    (event) => {
+      const meetingId = Number(event.payload?.meetingId);
+      if (!Number.isFinite(meetingId)) return;
+      setOpenMeetingRequest({
+        meetingId,
+        transcript: event.payload.transcript,
+        requestId: ++openMeetingRequestIdRef.current,
+      });
+      setActiveSection("meetings");
+    },
+  );
 
   // Clear the sidebar's "current" highlight when leaving the chat
   // view. The chat panel stays mounted (display:none) and keeps streaming.
@@ -837,6 +866,8 @@ function HomeContent() {
             onFocusModeChange={handleMeetingFocusModeChange}
             captureDevices={recordingDevices}
             onCaptureDevicesRefresh={refreshRecordingDevices}
+            openMeetingRequest={openMeetingRequest}
+            onOpenMeetingRequestConsumed={clearOpenMeetingRequest}
           />
         );
       case "help":

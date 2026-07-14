@@ -11,7 +11,6 @@ import React, {
   useState,
 } from "react";
 import { Loader2 } from "lucide-react";
-import { listen } from "@tauri-apps/api/event";
 import { Skeleton } from "@/components/ui/skeleton";
 import { localFetch } from "@/lib/api";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
@@ -54,6 +53,19 @@ interface MeetingNotesSectionProps {
    * canvas while editing notes, then their normal layout back.
    */
   onFocusModeChange?: (focused: boolean) => void;
+  /**
+   * A meeting open requested before this section mounted (for example from a
+   * notification click). The Home page owns the Tauri listener so the request
+   * is not lost while it switches from another section to Meetings.
+   */
+  openMeetingRequest?: OpenMeetingRequest | null;
+  onOpenMeetingRequestConsumed?: (requestId: number) => void;
+}
+
+export interface OpenMeetingRequest {
+  meetingId: number;
+  transcript?: boolean;
+  requestId: number;
 }
 
 export function MeetingNotesSection({
@@ -63,6 +75,8 @@ export function MeetingNotesSection({
   captureDevices = [],
   onCaptureDevicesRefresh,
   onFocusModeChange,
+  openMeetingRequest,
+  onOpenMeetingRequestConsumed,
 }: MeetingNotesSectionProps) {
   const { health } = useHealthCheck();
   const [meetings, setMeetings] = useState<MeetingRecord[]>([]);
@@ -159,61 +173,60 @@ export function MeetingNotesSection({
   // so this also dedupes the burst — same meeting within 5s is a no-op.
   const pendingOpenRef = useRef<{ id: number; at: number } | null>(null);
 
-  useEffect(() => {
-    const unlisten = listen<{ meetingId: number; transcript?: boolean }>(
-      "open-meeting-note",
-      async (event) => {
-        const id = Number(event.payload.meetingId);
-        if (!Number.isFinite(id)) return;
+  const openMeeting = useCallback(
+    async (request: Pick<OpenMeetingRequest, "meetingId" | "transcript">) => {
+      const id = Number(request.meetingId);
+      if (!Number.isFinite(id)) return;
 
-        const now = Date.now();
-        if (
-          pendingOpenRef.current?.id === id &&
-          now - pendingOpenRef.current.at < 5000
-        ) {
-          return;
-        }
-        pendingOpenRef.current = { id, at: now };
+      const now = Date.now();
+      if (
+        pendingOpenRef.current?.id === id &&
+        now - pendingOpenRef.current.at < 5000
+      ) {
+        return;
+      }
+      pendingOpenRef.current = { id, at: now };
 
-        // Fetch and insert into `meetings` BEFORE selecting. The
-        // "selection vanished" effect below resets selectedId to null
-        // whenever the id isn't in the list — if we set selectedId first
-        // and await the fetch after, that effect fires in the gap and
-        // drops the selection, leaving the user on the list view instead
-        // of the note. Notification-triggered opens (a freshly-started
-        // meeting) hit this every time because the new row isn't in the
-        // initial page yet.
-        try {
-          const res = await localFetch(`/meetings/${id}`);
-          if (res.ok) {
-            const meeting: MeetingRecord = await res.json();
-            setMeetings((prev) => {
-              const exists = prev.some((m) => m.id === meeting.id);
-              return exists
-                ? prev.map((m) => (m.id === meeting.id ? meeting : m))
-                : [meeting, ...prev];
-            });
-          } else {
-            await fetchPage(0, false, appliedQueryRef.current);
-          }
-        } catch (err) {
-          console.warn(
-            "meeting notes: failed to open deep-linked meeting",
-            err,
-          );
+      // Fetch and insert into `meetings` BEFORE selecting. The
+      // "selection vanished" effect below resets selectedId to null
+      // whenever the id isn't in the list — if we set selectedId first
+      // and await the fetch after, that effect fires in the gap and
+      // drops the selection, leaving the user on the list view instead
+      // of the note. Notification-triggered opens (a freshly-started
+      // meeting) hit this every time because the new row isn't in the
+      // initial page yet.
+      try {
+        const res = await localFetch(`/meetings/${id}`);
+        if (res.ok) {
+          const meeting: MeetingRecord = await res.json();
+          setMeetings((prev) => {
+            const exists = prev.some((m) => m.id === meeting.id);
+            return exists
+              ? prev.map((m) => (m.id === meeting.id ? meeting : m))
+              : [meeting, ...prev];
+          });
+        } else {
           await fetchPage(0, false, appliedQueryRef.current);
         }
+      } catch (err) {
+        console.warn("meeting notes: failed to open deep-linked meeting", err);
+        await fetchPage(0, false, appliedQueryRef.current);
+      }
 
-        if (event.payload.transcript !== false) {
-          setOpenTranscriptRequest({ id, token: Date.now() });
-        }
-        setSelectedId(id);
-      },
-    );
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [fetchPage]);
+      if (request.transcript !== false) {
+        setOpenTranscriptRequest({ id, token: Date.now() });
+      }
+      setSelectedId(id);
+    },
+    [fetchPage],
+  );
+
+  useEffect(() => {
+    if (!openMeetingRequest) return;
+    void openMeeting(openMeetingRequest).finally(() => {
+      onOpenMeetingRequestConsumed?.(openMeetingRequest.requestId);
+    });
+  }, [openMeeting, openMeetingRequest, onOpenMeetingRequestConsumed]);
 
   // Refetch on visibility change — picks up changes made elsewhere.
   // Skip the meetings list refetch when the user is inside a note: a Mac

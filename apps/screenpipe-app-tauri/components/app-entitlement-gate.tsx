@@ -4,11 +4,26 @@
 
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Building2, CreditCard, Download, LogIn, RefreshCw } from "lucide-react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Building2,
+  CreditCard,
+  Download,
+  LogIn,
+  RefreshCw,
+} from "lucide-react";
 import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import { arch as getOsArch, platform as getOsPlatform } from "@tauri-apps/plugin-os";
+import {
+  arch as getOsArch,
+  platform as getOsPlatform,
+} from "@tauri-apps/plugin-os";
 import { Button } from "@/components/ui/button";
 import {
   AppUser,
@@ -57,8 +72,10 @@ function isPrimaryWindow(): boolean {
 function getDownloadPlatform(): string | null {
   try {
     const os = getOsPlatform();
-    if (os === "windows") return getOsArch() === "aarch64" ? "windows-arm" : "windows";
-    if (os === "macos") return getOsArch() === "aarch64" ? "macos-arm" : "macos-intel";
+    if (os === "windows")
+      return getOsArch() === "aarch64" ? "windows-arm" : "windows";
+    if (os === "macos")
+      return getOsArch() === "aarch64" ? "macos-arm" : "macos-intel";
     if (os === "linux") return "linux";
   } catch {}
   return null;
@@ -93,8 +110,12 @@ function EntitlementShell({
           <p className="font-mono text-[10px] uppercase tracking-[0.28em] text-muted-foreground">
             screenpipe
           </p>
-          <h1 className="mt-3 text-2xl font-semibold tracking-tight">{title}</h1>
-          <p className="mt-3 text-sm leading-6 text-muted-foreground">{description}</p>
+          <h1 className="mt-3 text-2xl font-semibold tracking-tight">
+            {title}
+          </h1>
+          <p className="mt-3 text-sm leading-6 text-muted-foreground">
+            {description}
+          </p>
         </div>
         {children}
       </div>
@@ -102,8 +123,13 @@ function EntitlementShell({
   );
 }
 
-export function AppEntitlementGate({ children }: { children: React.ReactNode }) {
-  const { settings, updateSettings, loadUser, isSettingsLoaded } = useSettings();
+export function AppEntitlementGate({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const { settings, updateSettings, loadUser, isSettingsLoaded } =
+    useSettings();
   const {
     isEnterprise,
     isSectionHidden,
@@ -116,7 +142,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const [devSubmitting, setDevSubmitting] = useState(false);
   const [devError, setDevError] = useState<string | null>(null);
   const stoppedForGateRef = useRef(false);
-  const prevEntitledRef = useRef<boolean | null>(null);
+  const prevGateRef = useRef<boolean | null>(null);
   const skipNextResumeForE2ESeedRef = useRef(false);
   const resumingRef = useRef(false);
   const everEntitledRef = useRef(false);
@@ -168,6 +194,8 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     !needsLicenseKey &&
     !isSectionHidden("account");
   const shouldGateForEnterpriseLogin = enterpriseRequiresLogin && !user?.token;
+  const shouldGateForConsumerLogin =
+    !devBypass && !isEnterprise && !user?.token && !tokenPending;
   const shouldGateForEnterpriseApp =
     !devBypass &&
     !isEnterprise &&
@@ -176,10 +204,13 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     enterpriseAccount?.requires_enterprise_app === true;
   const shouldGateForEntitlement =
     !devBypass && !isEntitled && !failOpenForTransientAccessLoss;
+  const shouldGateForEnterpriseEntitlement =
+    isEnterprise && shouldGateForEntitlement;
   const shouldGate =
     shouldGateForEnterpriseApp ||
     shouldGateForEnterpriseLogin ||
-    shouldGateForEntitlement;
+    shouldGateForConsumerLogin ||
+    shouldGateForEnterpriseEntitlement;
   const email = user?.email || "this account";
   const enterpriseOrgName = enterpriseAccount?.org_name || "your workspace";
   const planLabel = useMemo(
@@ -221,7 +252,13 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     gateReportedRef.current = true;
     posthog.capture("app_entitlement_gate_shown", {
       logged_in: Boolean(user?.token),
-      reason: shouldGateForEnterpriseLogin ? "enterprise_login_required" : "app_entitlement",
+      reason: shouldGateForEnterpriseLogin
+        ? "enterprise_login_required"
+        : shouldGateForConsumerLogin
+          ? "consumer_login_required"
+          : shouldGateForEnterpriseEntitlement
+            ? "app_entitlement"
+            : "enterprise_app_required",
       plan: user?.subscription_plan ?? null,
       app_entitled: user?.app_entitled ?? null,
       // Diagnostics for the enterprise post-update loop (SCR-132): tell a
@@ -237,7 +274,20 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
           ? "enterprise_app"
           : "entitlement",
     });
-  }, [isSettingsLoaded, shouldGate, shouldGateForEnterpriseLogin, shouldGateForEnterpriseApp, isEnterprise, tokenPending, failOpenForTransientAccessLoss, user?.app_entitled, user?.subscription_plan, user?.token]);
+  }, [
+    isSettingsLoaded,
+    shouldGate,
+    shouldGateForEnterpriseLogin,
+    shouldGateForConsumerLogin,
+    shouldGateForEnterpriseEntitlement,
+    shouldGateForEnterpriseApp,
+    isEnterprise,
+    tokenPending,
+    failOpenForTransientAccessLoss,
+    user?.app_entitled,
+    user?.subscription_plan,
+    user?.token,
+  ]);
 
   // When failing open on a pending token, keep trying to re-read it from the
   // secret store. Once the store heals (the periodic WAL checkpoint clears the
@@ -379,7 +429,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     // signed in, and gated *specifically* on a missing entitlement — not on a
     // required enterprise login (no token), and not while failing open on a
     // transient token loss (that path has its own re-hydration loop above).
-    if (!isSettingsLoaded || devBypass || isEntitled) return;
+    if (!isSettingsLoaded || devBypass || !shouldGate || isEntitled) return;
     if (!user?.token || !shouldGateForEntitlement) return;
     const token = user.token;
 
@@ -421,12 +471,17 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     // so a poll tick that writes settings doesn't restart the poll. When the
     // grant lands, isEntitled flips → this effect tears down and stops.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSettingsLoaded, devBypass, isEntitled, user?.token, shouldGateForEntitlement]);
+  }, [
+    isSettingsLoaded,
+    devBypass,
+    shouldGate,
+    isEntitled,
+    user?.token,
+    shouldGateForEntitlement,
+  ]);
 
-  // Resume capture when access transitions to entitled within a session (after
-  // sign-in, purchase, or a successful refresh). Native autostart only runs once
-  // at launch, so without this a freshly-paid user would see the app but get no
-  // recording until they restarted it.
+  // Resume capture when a mandatory login/app-routing gate clears. Consumer
+  // billing changes no longer affect local recording on the free plan.
   //
   // This must use the SAME recipe as the reliable settings restart
   // (display-section / recording-settings): one owner, guarded against
@@ -437,16 +492,13 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   useEffect(() => {
     if (!isSettingsLoaded || devBypass) return;
     if (skipNextResumeForE2ESeedRef.current) {
-      prevEntitledRef.current = isEntitled;
-      if (isEntitled) skipNextResumeForE2ESeedRef.current = false;
+      prevGateRef.current = shouldGate;
+      if (!shouldGate) skipNextResumeForE2ESeedRef.current = false;
       return;
     }
-    const previouslyEntitled = prevEntitledRef.current;
-    prevEntitledRef.current = isEntitled;
-    if (previouslyEntitled !== false || !isEntitled) return;
-    // Access was restored in-session (auto-verify poll, manual refresh, sign-in,
-    // or purchase). Tracked so we can confirm gated members actually escape the
-    // wall on their own rather than churning at sign-in (issue #4161).
+    const previouslyGated = prevGateRef.current;
+    prevGateRef.current = shouldGate;
+    if (previouslyGated !== true || shouldGate) return;
     posthog.capture("app_entitlement_restored", {
       plan: user?.subscription_plan ?? null,
     });
@@ -462,12 +514,15 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
         await new Promise((r) => setTimeout(r, 500));
         await commands.spawnScreenpipe(null);
       } catch (err) {
-        console.warn("failed to restart screenpipe after entitlement restored:", err);
+        console.warn(
+          "failed to restart screenpipe after entitlement restored:",
+          err,
+        );
       } finally {
         resumingRef.current = false;
       }
     })();
-  }, [devBypass, isEntitled, isSettingsLoaded]);
+  }, [devBypass, shouldGate, isSettingsLoaded, user?.subscription_plan]);
 
   const devLoginBlock = isDevLoginEnabled() ? (
     <div className="mt-5 border-t border-border pt-4">
@@ -493,7 +548,9 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
         {devSubmitting ? "signing in…" : "dev sign in"}
       </Button>
       {devError && (
-        <p className="mt-1 font-mono text-[11px] leading-5 text-destructive">{devError}</p>
+        <p className="mt-1 font-mono text-[11px] leading-5 text-destructive">
+          {devError}
+        </p>
       )}
     </div>
   ) : null;
@@ -525,14 +582,22 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
             download enterprise app
           </Button>
           <Button
-            onClick={() => openUrl(ENTERPRISE_BUILDS_URL).catch(() => window.open(ENTERPRISE_BUILDS_URL, "_blank"))}
+            onClick={() =>
+              openUrl(ENTERPRISE_BUILDS_URL).catch(() =>
+                window.open(ENTERPRISE_BUILDS_URL, "_blank"),
+              )
+            }
             variant="outline"
             className="w-full gap-2"
           >
             <Building2 className="h-4 w-4" />
             open enterprise builds
           </Button>
-          <Button onClick={useDifferentAccount} variant="ghost" className="w-full">
+          <Button
+            onClick={useDifferentAccount}
+            variant="ghost"
+            className="w-full"
+          >
             use different account
           </Button>
         </div>
@@ -562,16 +627,12 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     return (
       <EntitlementShell
         title="sign in required"
-        description="screenpipe now needs an account with an active plan before recording starts."
+        description="create or sign in to a screenpipe account to start the free plan."
       >
         <div className="flex flex-col gap-3">
           <Button onClick={openLogin} className="w-full gap-2">
             <LogIn className="h-4 w-4" />
             sign in
-          </Button>
-          <Button onClick={openPricing} variant="outline" className="w-full gap-2">
-            <CreditCard className="h-4 w-4" />
-            choose plan
           </Button>
         </div>
         {devLoginBlock}
@@ -595,7 +656,9 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
           disabled={needsRefresh && isRefreshing}
         >
           {needsRefresh ? (
-            <RefreshCw className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} />
+            <RefreshCw
+              className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+            />
           ) : (
             <CreditCard className="h-4 w-4" />
           )}
@@ -610,11 +673,17 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
           {needsRefresh ? (
             <CreditCard className="h-4 w-4" />
           ) : (
-            <RefreshCw className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} />
+            <RefreshCw
+              className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+            />
           )}
           {needsRefresh ? "choose plan" : "refresh access"}
         </Button>
-        <Button onClick={useDifferentAccount} variant="ghost" className="w-full">
+        <Button
+          onClick={useDifferentAccount}
+          variant="ghost"
+          className="w-full"
+        >
           use different account
         </Button>
         {refreshError && (

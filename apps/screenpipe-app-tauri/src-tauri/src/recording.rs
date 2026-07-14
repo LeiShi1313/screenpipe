@@ -71,13 +71,45 @@ fn build_config(app: &tauri::AppHandle) -> Result<RecordingConfig, String> {
     Ok(store.to_recording_config(data_dir))
 }
 
-fn require_app_entitlement(store: &SettingsStore) -> Result<(), String> {
-    if store.app_entitled_or_dev() {
+fn recording_access_policy(
+    is_enterprise_build: bool,
+    dev_bypass: bool,
+    has_account: bool,
+    app_entitled: bool,
+    consumer_requires_enterprise_app: bool,
+) -> bool {
+    if dev_bypass {
+        return true;
+    }
+    if !is_enterprise_build && consumer_requires_enterprise_app {
+        return false;
+    }
+    if is_enterprise_build {
+        return app_entitled;
+    }
+    has_account
+}
+
+/// Consumer builds allow signed-in accounts to record on the free plan.
+/// Enterprise builds keep their native entitlement guard, and consumer builds
+/// still reject accounts that are required to use an enterprise binary.
+pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
+    recording_access_policy(
+        cfg!(feature = "enterprise-build"),
+        cfg!(debug_assertions),
+        store.has_account_identity(),
+        store.app_entitled_or_dev(),
+        !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
+    )
+}
+
+fn require_recording_access(store: &SettingsStore) -> Result<(), String> {
+    if recording_access_allowed(store) {
         return Ok(());
     }
 
     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
-    Err("subscription_required: active screenpipe plan required to start recording".to_string())
+    Err("account_required: sign in to start screenpipe recording".to_string())
 }
 
 pub fn notify_audio_engine_fallback(store: &SettingsStore) {
@@ -516,7 +548,7 @@ pub async fn start_capture(
 ) -> Result<(), String> {
     info!("Starting capture session");
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    require_app_entitlement(&store)?;
+    require_recording_access(&store)?;
 
     // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
     // — record it so the health watchdog will respawn a crashed engine instead
@@ -773,7 +805,7 @@ async fn spawn_screenpipe_inner(
     }
 
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    if let Err(err) = require_app_entitlement(&store) {
+    if let Err(err) = require_recording_access(&store) {
         state.is_starting.store(false, Ordering::SeqCst);
         state.is_starting_capture.store(false, Ordering::SeqCst);
         return Err(err);
@@ -1191,6 +1223,14 @@ async fn spawn_screenpipe_inner(
                 .unwrap_or_default()
                 .as_secs();
             state.last_spawn_epoch.store(spawn_epoch, Ordering::SeqCst);
+            // A first-time free user may sign in after the one-shot launch
+            // timer already ran. Re-apply persisted retention policy whenever
+            // a server becomes ready so the 7-day rule cannot be skipped by
+            // that startup race.
+            let retention_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::sync::auto_start_retention(&retention_app).await;
+            });
             Ok(())
         }
         Ok(Err(e)) => {
@@ -1218,7 +1258,7 @@ async fn start_capture_internal(
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
-    require_app_entitlement(&store)?;
+    require_recording_access(&store)?;
 
     let mut capture_guard = state.capture.lock().await;
     if capture_guard.is_some() {
@@ -1375,6 +1415,32 @@ mod capture_intent_tests {
         wants_recording.store(false, Ordering::SeqCst);
 
         assert!(!capture_intended_now(&wants_recording));
+    }
+}
+
+#[cfg(test)]
+mod recording_access_tests {
+    use super::recording_access_policy;
+
+    #[test]
+    fn signed_in_consumer_can_record_without_a_paid_entitlement() {
+        assert!(recording_access_policy(false, false, true, false, false));
+    }
+
+    #[test]
+    fn signed_out_consumer_cannot_start_recording() {
+        assert!(!recording_access_policy(false, false, false, false, false));
+    }
+
+    #[test]
+    fn enterprise_build_still_requires_entitlement() {
+        assert!(!recording_access_policy(true, false, true, false, false));
+        assert!(recording_access_policy(true, false, true, true, false));
+    }
+
+    #[test]
+    fn mandatory_enterprise_org_cannot_record_from_consumer_binary() {
+        assert!(!recording_access_policy(false, false, true, true, true));
     }
 }
 

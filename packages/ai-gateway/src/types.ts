@@ -217,10 +217,23 @@ export interface Env {
 // User tier for rate limiting and model access
 export type UserTier = 'anonymous' | 'logged_in' | 'subscribed';
 
+// Server-verified commercial plan. This is intentionally separate from
+// UserTier: Free and paid Basic both keep the existing `logged_in` model/rate
+// tier, but only Free receives the two-message hosted-AI preview.
+export type AccountPlan =
+	| 'free'
+	| 'basic'
+	| 'business'
+	| 'team'
+	| 'enterprise'
+	| 'lifetime'
+	| 'unknown';
+
 // Auth result with tier information
 export interface AuthResult {
 	isValid: boolean;
 	tier: UserTier;
+	accountPlan: AccountPlan;
 	deviceId: string;
 	userId?: string;
 	error?: string;

@@ -14,7 +14,16 @@ import { cacheAnalyticsId } from "@/lib/analytics-id";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor, stripSessionToken } from "../auth-guard";
-import { hasAppEntitlement, normalizeAppUser } from "@/lib/app-entitlement";
+import {
+	hasAppEntitlement,
+	hasVerifiedPaidPlan,
+	isAuthenticatedFreeUser,
+	normalizeAppUser,
+} from "@/lib/app-entitlement";
+import {
+	resolveFreePlanRetentionTransition,
+	type LocalRetentionPreference,
+} from "@/lib/free-plan-retention";
 import { screenpipeWebUrl } from "@/lib/web-url";
 import type { SourceCitation } from "@/lib/source-citations";
 import type {
@@ -211,6 +220,9 @@ export interface ChatHistoryStore {
 
 // Extend SettingsStore with fields added before Rust types are regenerated
 export type Settings = SettingsStore & {
+	/** Internal marker/snapshot used to unwind the forced free-plan policy. */
+	_freePlanRetentionApplied?: boolean;
+	_preFreePlanRetention?: LocalRetentionPreference | null;
 	deviceId?: string;
 	/** Device-key values enforced by the current enterprise policy. */
 	enterpriseManagedSettings?: Record<string, ManagedSettingValue>;
@@ -547,6 +559,30 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 const DEFAULT_CLOUD_PRESET: AIPreset = makeDefaultPresets(false)[0];
 
 const DEFAULT_AUDIO_ENGINE = "whisper-large-v3-turbo-quantized";
+
+async function configureLocalRetention(
+	policy: LocalRetentionPreference,
+): Promise<void> {
+	try {
+		const { localFetch } = await import("@/lib/api");
+		const response = await localFetch("/retention/configure", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				enabled: policy.enabled,
+				retention_days: policy.days,
+				mode: policy.mode,
+			}),
+		});
+		if (!response.ok) {
+			console.warn(`failed to configure local retention (${response.status})`);
+		}
+	} catch (error) {
+		// Persisted settings are still applied by the native startup path on the
+		// next launch. A temporarily unavailable local server must not fail login.
+		console.warn("failed to configure local retention", error);
+	}
+}
 
 // "Paid" = any active app entitlement (Basic / Business / Enterprise / Lifetime)
 // OR the legacy cloud-sync subscription. Broadened from `cloud_subscribed`-only so
@@ -1531,7 +1567,37 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				}
 			}
 
-			await updateSettings({ user: userData });
+			const isFreePlan = isAuthenticatedFreeUser(userData as any);
+			const isPaidPlan = !isFreePlan && hasVerifiedPaidPlan(userData as any);
+			if (!isFreePlan && !isPaidPlan) {
+				throw new Error(
+					"account response did not contain verified free or paid plan truth",
+				);
+			}
+
+			const retentionTransition = resolveFreePlanRetentionTransition(
+				settingsRef.current,
+				isFreePlan,
+				isPaidPlan,
+			);
+			const retentionUpdates =
+				retentionTransition.kind === "enforce"
+					? {
+							_freePlanRetentionApplied: true,
+							_preFreePlanRetention: retentionTransition.previous,
+							localRetentionEnabled: retentionTransition.policy.enabled,
+							localRetentionDays: retentionTransition.policy.days,
+							localRetentionMode: retentionTransition.policy.mode,
+						}
+					: retentionTransition.kind === "restore"
+						? {
+								_freePlanRetentionApplied: false,
+								localRetentionEnabled: retentionTransition.policy.enabled,
+								localRetentionDays: retentionTransition.policy.days,
+								localRetentionMode: retentionTransition.policy.mode,
+							}
+						: {};
+			await updateSettings({ user: userData, ...retentionUpdates } as any);
 
 			// Push the fresh token into the running sidecar so the
 			// `Server.cloud_token` (used by /v1/chat/completions proxy) and
@@ -1544,6 +1610,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				await commands.setCloudToken(token);
 			} catch (e) {
 				console.warn("failed to push cloud token to sidecar:", e);
+			}
+
+			if (retentionTransition.kind !== "none") {
+				// setCloudToken updates native enforcement first. Then apply the
+				// policy to the already-running retention task.
+				await configureLocalRetention(retentionTransition.policy);
 			}
 		} catch (err) {
 			console.error("failed to load user:", err instanceof Error ? err.message : err);

@@ -78,6 +78,7 @@ describe('validateAuth — verified identities only', () => {
     expect(await validateAuth(requestFor(), env)).toEqual({
       isValid: true,
       tier: 'anonymous',
+      accountPlan: 'unknown',
       deviceId: 'device-from-header',
     });
   });
@@ -92,6 +93,7 @@ describe('validateAuth — verified identities only', () => {
     )).toEqual({
       isValid: true,
       tier: 'anonymous',
+      accountPlan: 'unknown',
       deviceId: 'device-from-header',
     });
     expect(fetchMock).toHaveBeenCalledTimes(0);
@@ -101,14 +103,27 @@ describe('validateAuth — verified identities only', () => {
     expect(await validateAuth(requestFor('user_attackerchosen'), env)).toEqual({
       isValid: true,
       tier: 'anonymous',
+      accountPlan: 'unknown',
       deviceId: 'device-from-header',
     });
   });
 
-  it('keeps a verified Clerk JWT logged in without a subscription', async () => {
+  it('classifies an explicitly verified Free Clerk account', async () => {
     verifyTokenMock.mockImplementation(async () => ({ sub: 'user_verified' }) as any);
     globalThis.fetch = mock(async (input: RequestInfo | URL) => {
       const url = String(input);
+	  if (url === 'https://screenpipe.com/api/user') {
+		return new Response(JSON.stringify({
+		  success: true,
+			  user: {
+				clerk_id: 'user_verified',
+				cloud_subscribed: false,
+				app_entitled: false,
+				subscription_plan: 'none',
+				entitlement: null,
+		  },
+		}), { status: 200 });
+	  }
       if (url.includes('/rest/v1/users?')) {
         return new Response(JSON.stringify([{ id: '11111111-1111-4111-8111-111111111111' }]), { status: 200 });
       }
@@ -121,8 +136,99 @@ describe('validateAuth — verified identities only', () => {
     expect(await validateAuth(requestFor('eyJ.verified.clerk'), env)).toEqual({
       isValid: true,
       tier: 'logged_in',
+      accountPlan: 'free',
       deviceId: 'user_verified',
       userId: 'user_verified',
+    });
+  });
+
+  it('treats an explicit app denial as Free even when users.plan is stale', async () => {
+    verifyTokenMock.mockImplementation(async () => ({ sub: 'user_refunded' }) as any);
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({
+          success: true,
+          user: {
+            clerk_id: 'user_refunded',
+            cloud_subscribed: false,
+            app_entitled: false,
+            subscription_plan: 'pro',
+            entitlement: null,
+          },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.refunded.clerk'), env)).toEqual({
+      isValid: true,
+      tier: 'logged_in',
+      accountPlan: 'free',
+      deviceId: 'user_refunded',
+      userId: 'user_refunded',
+    });
+  });
+
+  it('keeps paid Basic in the logged_in model tier with paid plan truth', async () => {
+    verifyTokenMock.mockImplementation(async () => ({ sub: 'user_basic' }) as any);
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({
+          success: true,
+          user: {
+            clerk_id: 'user_basic',
+            cloud_subscribed: false,
+			app_entitled: true,
+            subscription_plan: 'standard',
+			entitlement: { active: true, plan: 'standard', features: { app: true } },
+          },
+        }), { status: 200 });
+      }
+      if (url.includes('/rest/v1/users?')) {
+        return new Response(JSON.stringify([{ id: '33333333-3333-4333-8333-333333333333' }]), { status: 200 });
+      }
+      if (url.includes('/rest/v1/cloud_subscriptions?')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.basic.clerk'), env)).toEqual({
+      isValid: true,
+      tier: 'logged_in',
+      accountPlan: 'basic',
+      deviceId: 'user_basic',
+      userId: 'user_basic',
+    });
+  });
+
+  it('keeps a verified identity but marks missing plan truth unknown', async () => {
+    verifyTokenMock.mockImplementation(async () => ({ sub: 'user_unknown' }) as any);
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({
+          success: true,
+          user: { clerk_id: 'user_unknown', cloud_subscribed: false },
+        }), { status: 200 });
+      }
+      if (url.includes('/rest/v1/users?')) {
+        return new Response(JSON.stringify([{ id: '44444444-4444-4444-8444-444444444444' }]), { status: 200 });
+      }
+      if (url.includes('/rest/v1/cloud_subscriptions?')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.unknown.clerk'), env)).toEqual({
+      isValid: true,
+      tier: 'logged_in',
+      accountPlan: 'unknown',
+      deviceId: 'user_unknown',
+      userId: 'user_unknown',
     });
   });
 
@@ -130,6 +236,18 @@ describe('validateAuth — verified identities only', () => {
     verifyTokenMock.mockImplementation(async () => ({ sub: 'user_subscribed' }) as any);
     globalThis.fetch = mock(async (input: RequestInfo | URL) => {
       const url = String(input);
+	  if (url === 'https://screenpipe.com/api/user') {
+		return new Response(JSON.stringify({
+		  success: true,
+			  user: {
+				clerk_id: 'user_subscribed',
+				cloud_subscribed: true,
+				app_entitled: true,
+				subscription_plan: 'pro',
+				entitlement: { active: true, plan: 'pro', features: { app: true } },
+		  },
+		}), { status: 200 });
+	  }
       if (url.includes('/rest/v1/users?')) {
         return new Response(JSON.stringify([{ id: '22222222-2222-4222-8222-222222222222' }]), { status: 200 });
       }
@@ -142,6 +260,7 @@ describe('validateAuth — verified identities only', () => {
     expect(await validateAuth(requestFor('eyJ.subscribed.clerk'), env)).toEqual({
       isValid: true,
       tier: 'subscribed',
+      accountPlan: 'business',
       deviceId: 'user_subscribed',
       userId: 'user_subscribed',
     });
@@ -152,13 +271,20 @@ describe('validateAuth — verified identities only', () => {
       expect(String(input)).toBe('https://screenpipe.com/api/user');
       return new Response(JSON.stringify({
         success: true,
-        user: { clerk_id: 'user_legacy', cloud_subscribed: true },
+		user: {
+		  clerk_id: 'user_legacy',
+		  cloud_subscribed: true,
+		  app_entitled: true,
+		  subscription_plan: 'pro',
+		  entitlement: { active: true, plan: 'pro', features: { app: true } },
+		},
       }), { status: 200 });
     }) as typeof fetch;
 
     expect(await validateAuth(requestFor('eyJ.legacy.screenpipe'), env)).toEqual({
       isValid: true,
       tier: 'subscribed',
+      accountPlan: 'business',
       deviceId: 'user_legacy',
       userId: 'user_legacy',
     });
@@ -172,6 +298,7 @@ describe('validateAuth — verified identities only', () => {
     expect(await validateAuth(requestFor('eyJ.invalid.screenpipe'), env)).toEqual({
       isValid: true,
       tier: 'anonymous',
+      accountPlan: 'unknown',
       deviceId: 'device-from-header',
     });
   });

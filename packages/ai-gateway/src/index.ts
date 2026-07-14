@@ -21,9 +21,50 @@ import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { pruneModelHealth } from './services/model-health';
 import { resolveLatencyClass, isBackgroundRequest } from './utils/latency';
 import { enforceDailyCostCap } from './services/cost-cap';
+import {
+	FREE_CHAT_MAX_PROVIDER_CALLS_PER_MESSAGE,
+	FREE_CHAT_MAX_OUTPUT_TOKENS,
+	FREE_CHAT_MESSAGE_LIMIT,
+	applyFreeChatRequestLimits,
+	hasPaidHostedAiPlan,
+	prepareFreeChatTurn,
+	reserveFreeChatTurn,
+	type FreeChatLimitError,
+} from './services/free-chat-limit';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
 export { RateLimiter };
+
+function freeChatErrorResponse(error: FreeChatLimitError): Response {
+	return addCorsHeaders(createErrorResponse(error.status, JSON.stringify({
+		error: error.code,
+		message: error.message,
+		limit: FREE_CHAT_MESSAGE_LIMIT,
+		max_provider_calls_per_message: FREE_CHAT_MAX_PROVIDER_CALLS_PER_MESSAGE,
+		max_output_tokens: FREE_CHAT_MAX_OUTPUT_TOKENS,
+		upgrade_url: 'https://screenpi.pe/onboarding',
+	})));
+}
+
+function paidHostedAiRouteError(auth: AuthResult): Response | null {
+	if (hasPaidHostedAiPlan(auth)) return null;
+	if (auth.tier !== 'anonymous' && auth.accountPlan !== 'free') {
+		return freeChatErrorResponse({
+			status: 503,
+			code: 'account_plan_unavailable',
+			message: 'Unable to verify your screenpipe plan. Try again shortly.',
+		});
+	}
+	return freeChatErrorResponse({
+		status: auth.tier === 'anonymous' ? 401 : 403,
+		code: auth.tier === 'anonymous'
+			? 'authentication_required'
+			: 'free_plan_alternate_hosted_ai_disabled',
+		message: auth.tier === 'anonymous'
+			? 'Sign in to use screenpipe hosted AI.'
+			: 'The two-message free preview is available in screenpipe chat. Use your own Claude, Codex, Ollama, or provider credentials for unlimited local/BYOK use.',
+	});
+}
 
 // Handler function for the worker
 export async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -119,6 +160,17 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				})));
 			}
 
+			// Paid users bypass this gate. Authenticated free users receive two
+			// account-wide logical messages; Pi's tool-loop calls for one visible
+			// message share a stable session-affinity key and are bounded separately.
+			// Anonymous and hosted background requests are blocked here before any
+			// rate-limit, usage, or provider work.
+			const freeChat = await prepareFreeChatTurn(request, body, authResult);
+			if (freeChat.mode === 'blocked') {
+				return freeChatErrorResponse(freeChat.error);
+			}
+			applyFreeChatRequestLimits(body, freeChat);
+
 			// Gate the model for this tier. Background/automation traffic (pipes,
 			// daily summaries) must never hard-fail — a scheduled pipe pinned to a
 			// now-gated model would silently break every run — so it downgrades to
@@ -188,6 +240,16 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 						},
 					},
 				})));
+			}
+
+			// Reserve only after every other request gate has passed, but before the
+			// first upstream byte can incur cost. D1 failures fail closed for free
+			// hosted chat; subscribed users never enter this branch.
+			if (freeChat.mode === 'metered') {
+				const reservation = await reserveFreeChatTurn(env, freeChat);
+				if (!reservation.allowed) {
+					return freeChatErrorResponse(reservation.error);
+				}
 			}
 
 			// Route latency-tolerant (background) traffic to the cheaper flex tier.
@@ -286,6 +348,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 		// Web search endpoint - uses Gemini's Google Search grounding
 		if (path === '/v1/web-search' && request.method === 'POST') {
+			const gate = paidHostedAiRouteError(authResult);
+			if (gate) return gate;
 			// Track usage (counts as 1 query, web search uses gemini flash)
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, 'gemini-2.5-flash');
@@ -380,9 +444,13 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			return await handleTinfoilAttestation(env);
 		}
 		if (path === '/v1/tinfoil/chat/completions' && request.method === 'POST') {
+			const gate = paidHostedAiRouteError(authResult);
+			if (gate) return gate;
 			return await handleTinfoilProxy(request, env, authResult, '/v1/chat/completions');
 		}
 		if (path === '/v1/tinfoil/responses' && request.method === 'POST') {
+			const gate = paidHostedAiRouteError(authResult);
+			if (gate) return gate;
 			return await handleTinfoilProxy(request, env, authResult, '/v1/responses');
 		}
 
@@ -391,6 +459,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		}
 
 		if (path === '/v1/voice/query' && request.method === 'POST') {
+			const gate = paidHostedAiRouteError(authResult);
+			if (gate) return gate;
 			return await handleVoiceQuery(request, env);
 		}
 
@@ -399,6 +469,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		}
 
 		if (path === '/v1/voice/chat' && request.method === 'POST') {
+			const gate = paidHostedAiRouteError(authResult);
+			if (gate) return gate;
 			return await handleVoiceChat(request, env);
 		}
 
@@ -411,6 +483,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		// The Agent SDK sends requests to ANTHROPIC_VERTEX_BASE_URL/v1/messages
 		if (path === '/v1/messages' && request.method === 'POST') {
 			console.log('Vertex AI proxy request to /v1/messages');
+			const paidGate = paidHostedAiRouteError(authResult);
+			if (paidGate) return paidGate;
 
 			// Require authentication for Agent SDK
 			if (authResult.tier === 'anonymous') {
@@ -524,6 +598,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		// Requires logged-in user (not anonymous)
 		if (path === '/anthropic/v1/messages' && request.method === 'POST') {
 			console.log('OpenCode Anthropic proxy request to /anthropic/v1/messages');
+			const paidGate = paidHostedAiRouteError(authResult);
+			if (paidGate) return paidGate;
 
 			// Require authentication for OpenCode
 			if (authResult.tier === 'anonymous') {

@@ -60,6 +60,8 @@ export type AppUser = User & {
 
 export const APP_ENTITLEMENT_MAX_STALE_MS = 72 * 60 * 60 * 1000;
 export const APP_ENTITLEMENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
+export const FREE_PLAN_RETENTION_DAYS = 7;
+export const FREE_PLAN_RETENTION_MODE = "all" as const;
 export const PRICING_URL = screenpipeWebUrl("/onboarding", "https://screenpipe.com");
 export const ENTERPRISE_BUILDS_URL = screenpipeWebUrl("/enterprise?tab=builds", "https://screenpipe.com");
 export const ENTERPRISE_DOWNLOAD_URL = screenpipeWebUrl("/api/download", "https://screenpipe.com");
@@ -138,6 +140,87 @@ function isEntitlementFresh(entitlement: AppEntitlement | null) {
     checkedAt <= now + APP_ENTITLEMENT_CLOCK_SKEW_MS &&
     now - checkedAt <= APP_ENTITLEMENT_MAX_STALE_MS
   );
+}
+
+/**
+ * True only when an authenticated account carries explicit, previously
+ * server-verified truth that it is on the free plan.
+ */
+export function hasFreePlanPolicy(user: AppUser | null | undefined): boolean {
+  const stableAccountId = user?.id || user?.clerk_id;
+  if (!stableAccountId || user?.cloud_subscribed === true) return false;
+
+  const entitlement = asEntitlement(user.entitlement);
+  // Once verified, free limits persist offline; merely waiting 72 hours must
+  // not silently unlock pipes or retention controls.
+  const checkedAt = parseEntitlementTime(entitlement?.checked_at);
+  if (
+    checkedAt === null ||
+    checkedAt > Date.now() + APP_ENTITLEMENT_CLOCK_SKEW_MS
+  ) {
+    return false;
+  }
+
+  const accountPlan = user.subscription_plan?.trim().toLowerCase();
+  const entitlementPlan =
+    typeof entitlement?.plan === "string"
+      ? entitlement.plan.trim().toLowerCase()
+      : null;
+  if (accountPlan !== "none" || entitlementPlan !== "none") return false;
+
+  const source =
+    typeof entitlement?.source === "string"
+      ? entitlement.source.trim().toLowerCase()
+      : null;
+  if (
+    source === "manual" ||
+    source === "enterprise" ||
+    source === "lifetime" ||
+    source === "dev" ||
+    hasFutureGrace(entitlement)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+export function isAuthenticatedFreeUser(
+  user: AppUser | null | undefined,
+): boolean {
+  return Boolean(user?.token) && hasFreePlanPolicy(user);
+}
+
+/** Explicit server-verified paid truth, without the debug billing bypass. */
+export function hasVerifiedPaidPlan(user: AppUser | null | undefined): boolean {
+  const stableAccountId = user?.id || user?.clerk_id;
+  const entitlement = asEntitlement(user?.entitlement);
+  if (!stableAccountId || !entitlement) return false;
+
+  const accountPlan = user.subscription_plan?.trim().toLowerCase();
+  const entitlementPlan =
+    typeof entitlement.plan === "string"
+      ? entitlement.plan.trim().toLowerCase()
+      : null;
+  if (
+    !accountPlan ||
+    !entitlementPlan ||
+    accountPlan === "none" ||
+    entitlementPlan === "none" ||
+    accountPlan !== entitlementPlan
+  ) {
+    return false;
+  }
+
+  const hasAppFeature =
+    user.app_entitled !== false &&
+    (user.app_entitled === true || entitlement.features?.app === true);
+  if (!hasAppFeature) return false;
+
+  if (isLifetimeEntitlement(entitlement) || hasFutureGrace(entitlement)) {
+    return true;
+  }
+  return isEntitlementFresh(entitlement) && isEntitlementActive(entitlement);
 }
 
 function hasFutureGrace(entitlement: AppEntitlement | null) {
@@ -320,11 +403,27 @@ export function normalizeAppUser(rawUser: any, token: string): AppUser {
       : rawEntitlement
         ? rawEntitlement.features?.app === true
         : cloudSubscribed;
-  const subscriptionPlan =
-    rawUser?.subscription_plan ??
-    (cloudSubscribed ? "pro" : appEntitled ? "standard" : null);
-  const entitlement =
-    rawEntitlement
+  // Explicit server denial is stronger than a stale users.plan label left by a
+  // canceled or refunded account.
+  const explicitlyFree = rawUser?.app_entitled === false && !cloudSubscribed;
+  const subscriptionPlan = explicitlyFree
+    ? "none"
+    : (rawUser?.subscription_plan ??
+      (cloudSubscribed ? "pro" : appEntitled ? "standard" : null));
+  const entitlement = explicitlyFree
+    ? {
+        ...(rawEntitlement ?? {}),
+        active: false,
+        plan: "none",
+        source: "none",
+        checked_at: checkedAt,
+        features: {
+          ...(rawEntitlement?.features ?? {}),
+          app: false,
+          cloud: false,
+        },
+      }
+    : rawEntitlement
       ? { ...rawEntitlement, checked_at: rawEntitlement.checked_at ?? checkedAt }
       : typeof rawUser?.app_entitled === "boolean" || cloudSubscribed
         ? {

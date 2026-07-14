@@ -443,28 +443,38 @@ pub async fn auto_start_retention(app: &AppHandle) {
     // Storage, which writes the field to the store. New installs get the
     // field written as `true` by init_store(), so retention is on by default
     // for them without affecting anyone who installed earlier.
-    let enabled = settings
-        .extra
-        .get("localRetentionEnabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_free_plan = settings.has_free_plan_policy();
+    let enabled = is_free_plan
+        || settings
+            .extra
+            .get("localRetentionEnabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
     if !enabled {
         return;
     }
 
-    let days = settings
-        .extra
-        .get("localRetentionDays")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(14) as u32;
+    let days = if is_free_plan {
+        7
+    } else {
+        settings
+            .extra
+            .get("localRetentionDays")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(14) as u32
+    };
 
-    let mode = settings
-        .extra
-        .get("localRetentionMode")
-        .and_then(|v| v.as_str())
-        .filter(|s| *s == "media" || *s == "all")
-        .unwrap_or("media");
+    let mode = if is_free_plan {
+        "all"
+    } else {
+        settings
+            .extra
+            .get("localRetentionMode")
+            .and_then(|v| v.as_str())
+            .filter(|s| *s == "media" || *s == "all")
+            .unwrap_or("media")
+    };
 
     let client = reqwest::Client::new();
     let api = local_api_context_from_app(app);

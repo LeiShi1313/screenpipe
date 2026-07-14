@@ -7,7 +7,10 @@ import {
   hasAppEntitlement,
   hasCloudEntitlement,
   hasConsumerAppSubscription,
+  hasFreePlanPolicy,
   hasPersistedEntitlementEvidence,
+  hasVerifiedPaidPlan,
+  isAuthenticatedFreeUser,
   isSignedInCloudSubscriber,
   isTokenHydrationPending,
   needsAppEntitlementRefresh,
@@ -85,9 +88,13 @@ describe("app entitlement", () => {
   });
 
   it("does not trust a stale legacy cloud_subscribed flag by itself", () => {
-    expect(hasAppEntitlement(user({ cloud_subscribed: true, entitlement: null }))).toBe(false);
     expect(
-      needsAppEntitlementRefresh(user({ cloud_subscribed: true, entitlement: null })),
+      hasAppEntitlement(user({ cloud_subscribed: true, entitlement: null })),
+    ).toBe(false);
+    expect(
+      needsAppEntitlementRefresh(
+        user({ cloud_subscribed: true, entitlement: null }),
+      ),
     ).toBe(false);
   });
 
@@ -132,7 +139,9 @@ describe("app entitlement", () => {
   });
 
   it("does not unlock new cloud features from stale entitlement data", () => {
-    expect(hasCloudEntitlement(user({ cloud_subscribed: true, entitlement: null }))).toBe(false);
+    expect(
+      hasCloudEntitlement(user({ cloud_subscribed: true, entitlement: null })),
+    ).toBe(false);
     expect(
       hasCloudEntitlement(
         user({
@@ -253,12 +262,167 @@ describe("app entitlement", () => {
   });
 });
 
+describe("isAuthenticatedFreeUser", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function explicitFree(overrides: Record<string, any> = {}) {
+    return user({
+      id: "user_free",
+      subscription_plan: "none",
+      app_entitled: true,
+      entitlement: {
+        active: true,
+        plan: "none",
+        source: "none",
+        checked_at: "2026-06-05T11:00:00.000Z",
+        features: { app: true },
+      },
+      ...overrides,
+    });
+  }
+
+  it("recognizes only a signed-in account with explicit verified free-plan truth", () => {
+    expect(isAuthenticatedFreeUser(explicitFree())).toBe(true);
+    const tokenlessCachedFreeUser = explicitFree({ token: null });
+    expect(isAuthenticatedFreeUser(tokenlessCachedFreeUser)).toBe(false);
+    expect(hasFreePlanPolicy(tokenlessCachedFreeUser)).toBe(true);
+    expect(
+      isAuthenticatedFreeUser(explicitFree({ id: null, clerk_id: null })),
+    ).toBe(false);
+    expect(
+      isAuthenticatedFreeUser(
+        explicitFree({
+          entitlement: {
+            active: true,
+            plan: "none",
+            source: "none",
+            checked_at: "2026-06-01T11:59:59.000Z",
+          },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("fails safe on missing or conflicting plan fields", () => {
+    expect(
+      isAuthenticatedFreeUser(explicitFree({ subscription_plan: null })),
+    ).toBe(false);
+    expect(
+      isAuthenticatedFreeUser(
+        explicitFree({
+          entitlement: {
+            plan: "none",
+            source: "none",
+            checked_at: "2027-01-01T00:00:00.000Z",
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isAuthenticatedFreeUser(
+        explicitFree({
+          entitlement: {
+            active: true,
+            plan: "standard",
+            source: "subscription",
+            checked_at: "2026-06-05T11:00:00.000Z",
+          },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it.each(["standard", "pro", "team", "enterprise", "lifetime"])(
+    "preserves retention choice for the paid %s plan",
+    (plan) => {
+      const paid = user({
+        id: "user_paid",
+        subscription_plan: plan,
+        app_entitled: true,
+        entitlement: {
+          active: true,
+          plan,
+          source: plan === "lifetime" ? "lifetime" : "subscription",
+          checked_at: "2026-06-05T11:00:00.000Z",
+          features: { app: true },
+        },
+      });
+      expect(isAuthenticatedFreeUser(paid)).toBe(false);
+      expect(hasVerifiedPaidPlan(paid)).toBe(true);
+    },
+  );
+
+  it("does not classify manual, enterprise, lifetime, dev, grace, or cloud grants as free", () => {
+    for (const source of ["manual", "enterprise", "lifetime", "dev"]) {
+      expect(
+        isAuthenticatedFreeUser(
+          explicitFree({
+            entitlement: {
+              active: true,
+              plan: "none",
+              source,
+              checked_at: "2026-06-05T11:00:00.000Z",
+            },
+          }),
+        ),
+      ).toBe(false);
+    }
+
+    expect(
+      isAuthenticatedFreeUser(
+        explicitFree({
+          entitlement: {
+            active: false,
+            plan: "none",
+            source: "subscription",
+            checked_at: "2026-06-05T11:00:00.000Z",
+            grace_until: "2026-06-06T12:00:00.000Z",
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isAuthenticatedFreeUser(explicitFree({ cloud_subscribed: true })),
+    ).toBe(false);
+  });
+
+  it("normalizes explicit denial as free even when the legacy plan label is stale", () => {
+    const normalized = normalizeAppUser(
+      {
+        id: "user_free",
+        app_entitled: false,
+        subscription_plan: "standard",
+        cloud_subscribed: false,
+      },
+      "token",
+    );
+
+    expect(normalized.subscription_plan).toBe("none");
+    expect(normalized.entitlement).toMatchObject({
+      active: false,
+      plan: "none",
+      source: "none",
+    });
+    expect(isAuthenticatedFreeUser(normalized)).toBe(true);
+    expect(hasVerifiedPaidPlan(normalized)).toBe(false);
+  });
+});
+
 describe("isSignedInCloudSubscriber", () => {
   // Gates the account "active" plan card. Must require BOTH a token and
   // cloud_subscribed so a token-hydration failure can't render the active card
   // under the "not logged in" header.
   it("is true only with both a token and cloud_subscribed", () => {
-    expect(isSignedInCloudSubscriber(user({ token: "t", cloud_subscribed: true }))).toBe(true);
+    expect(
+      isSignedInCloudSubscriber(user({ token: "t", cloud_subscribed: true })),
+    ).toBe(true);
   });
 
   it("is false for a tokenless stale shell even when cloud_subscribed and id survive", () => {
@@ -272,7 +436,9 @@ describe("isSignedInCloudSubscriber", () => {
   });
 
   it("is false when logged in without a cloud subscription", () => {
-    expect(isSignedInCloudSubscriber(user({ token: "t", cloud_subscribed: false }))).toBe(false);
+    expect(
+      isSignedInCloudSubscriber(user({ token: "t", cloud_subscribed: false })),
+    ).toBe(false);
   });
 
   it("is false for a missing user", () => {
@@ -286,15 +452,21 @@ describe("isTokenHydrationPending", () => {
   // id behind while only the secret-store-backed token is missing.
   it("is true for a signed-in account whose token failed to hydrate", () => {
     expect(isTokenHydrationPending(user({ id: "u1", token: null }))).toBe(true);
-    expect(isTokenHydrationPending(user({ id: "u1", token: undefined }))).toBe(true);
+    expect(isTokenHydrationPending(user({ id: "u1", token: undefined }))).toBe(
+      true,
+    );
   });
 
   it("is false when the token is present", () => {
-    expect(isTokenHydrationPending(user({ id: "u1", token: "tok" }))).toBe(false);
+    expect(isTokenHydrationPending(user({ id: "u1", token: "tok" }))).toBe(
+      false,
+    );
   });
 
   it("is false without an account id (never signed in) and for a null user", () => {
-    expect(isTokenHydrationPending(user({ id: null, token: null }))).toBe(false);
+    expect(isTokenHydrationPending(user({ id: null, token: null }))).toBe(
+      false,
+    );
     expect(isTokenHydrationPending(null)).toBe(false);
     expect(isTokenHydrationPending(undefined)).toBe(false);
   });
@@ -302,18 +474,30 @@ describe("isTokenHydrationPending", () => {
 
 describe("hasPersistedEntitlementEvidence", () => {
   it("trusts store.bin signals that survive a token-hydration failure", () => {
-    expect(hasPersistedEntitlementEvidence(user({ app_entitled: true }))).toBe(true);
+    expect(hasPersistedEntitlementEvidence(user({ app_entitled: true }))).toBe(
+      true,
+    );
     expect(
-      hasPersistedEntitlementEvidence(user({ entitlement: { features: { app: true } } })),
+      hasPersistedEntitlementEvidence(
+        user({ entitlement: { features: { app: true } } }),
+      ),
     ).toBe(true);
-    expect(hasPersistedEntitlementEvidence(user({ entitlement: { active: true } }))).toBe(true);
+    expect(
+      hasPersistedEntitlementEvidence(user({ entitlement: { active: true } })),
+    ).toBe(true);
   });
 
   it("is false for an account with no entitlement evidence", () => {
-    expect(hasPersistedEntitlementEvidence(user({ cloud_subscribed: true }))).toBe(false);
+    expect(
+      hasPersistedEntitlementEvidence(user({ cloud_subscribed: true })),
+    ).toBe(false);
     expect(
       hasPersistedEntitlementEvidence(
-        user({ cloud_subscribed: false, app_entitled: false, entitlement: null }),
+        user({
+          cloud_subscribed: false,
+          app_entitled: false,
+          entitlement: null,
+        }),
       ),
     ).toBe(false);
     expect(hasPersistedEntitlementEvidence(null)).toBe(false);

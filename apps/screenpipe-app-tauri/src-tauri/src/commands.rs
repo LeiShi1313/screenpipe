@@ -570,6 +570,7 @@ pub fn get_cloud_token() -> Option<String> {
 #[specta::specta]
 pub async fn set_cloud_token(
     token: Option<String>,
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::recording::RecordingState>,
 ) -> Result<(), String> {
     let supplied_non_empty = token.as_ref().is_some_and(|value| !value.is_empty());
@@ -592,6 +593,32 @@ pub async fn set_cloud_token(
         if let Err(e) = crate::pi::clear_screenpipe_auth_token_files() {
             warn!("failed to clear pi screenpipe auth token: {}", e);
         }
+    }
+
+    // `loadUser` writes the fresh plan before calling this command. Refresh the
+    // already-running manager before any fallible persistence, so a keychain
+    // error cannot leave a paid→free transition temporarily unlimited.
+    let is_free_plan = crate::store::SettingsStore::get(&app)
+        .ok()
+        .flatten()
+        .is_some_and(|settings| settings.has_free_plan_policy());
+    let server_handles = {
+        let server = state.server.lock().await;
+        server.as_ref().map(|core| {
+            (
+                core.pipe_manager.clone(),
+                core.enforce_free_plan_retention.clone(),
+            )
+        })
+    };
+    if let Some((pipe_manager, enforce_free_plan_retention)) = server_handles {
+        enforce_free_plan_retention.store(is_free_plan, std::sync::atomic::Ordering::SeqCst);
+        let mut pipe_manager = pipe_manager.lock().await;
+        pipe_manager.set_max_non_template_pipes(is_free_plan.then_some(2));
+        pipe_manager
+            .load_pipes()
+            .await
+            .map_err(|e| format!("failed to reload pipes after plan change: {e}"))?;
     }
 
     // #3943: persist to the encrypted secret store (authoritative at-rest copy)

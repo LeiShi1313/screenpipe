@@ -94,6 +94,13 @@ export interface RequestBody {
 	 * for background (pipe/summary) traffic where no user is waiting.
 	 */
 	serviceTier?: 'flex' | 'standard';
+	/**
+	 * Gateway-internal marker for the two-turn server-funded preview. The HTTP
+	 * router always deletes any client-supplied value before setting it from
+	 * verified entitlement state. It selects a bounded cheap/free waterfall and
+	 * disables difficulty promotion to frontier models.
+	 */
+	freePreview?: boolean;
 }
 
 type InputSchema = Anthropic.Tool.InputSchema;
@@ -213,7 +220,23 @@ export interface Env {
 	LIMIT_LOGGED_IN_FREE_RPM?: string;
 	LIMIT_SUBSCRIBED_FREE_RPM?: string;
 	// Lifetime hosted-AI preview for signed-in, non-subscribed users.
+	// Enforcement is the durable post-launch policy switch. It deliberately
+	// defaults off so deploying code cannot change existing clients. Preview is
+	// independent: it may be disabled while paid-route gates stay on.
+	FREE_LOCAL_TIER_ENFORCEMENT_ENABLED?: string;
+	FREE_CHAT_PREVIEW_ENABLED?: string;
 	FREE_CHAT_TURN_LIMIT?: string;
+	FREE_CHAT_MAX_REQUESTS_PER_TURN?: string;
+	FREE_CHAT_FOLLOWUP_MINUTES?: string;
+	FREE_CHAT_LEASE_SECONDS?: string;
+	FREE_CHAT_MAX_INPUT_BYTES?: string;
+	/** @deprecated Use FREE_CHAT_MAX_INPUT_BYTES. Kept for staged-config compatibility. */
+	FREE_CHAT_MAX_INPUT_CHARS?: string;
+	FREE_CHAT_MAX_OUTPUT_TOKENS?: string;
+	FREE_CHAT_NETWORK_DAILY_TURN_LIMIT?: string;
+	FREE_CHAT_GLOBAL_DAILY_TURN_LIMIT?: string;
+	FREE_CHAT_GLOBAL_DAILY_SHADOW_BUDGET_USD?: string;
+	LOCAL_DEV_AUTH_TOKEN?: string;
 }
 
 // User tier for rate limiting and model access

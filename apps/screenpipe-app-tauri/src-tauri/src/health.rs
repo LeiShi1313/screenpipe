@@ -470,8 +470,9 @@ fn decide_status(
 struct EngineRespawnCheck {
     /// Capture is supposed to be running (vs a deliberate stop).
     wants_recording: bool,
-    /// Active subscription / dev build — don't respawn a lapsed install.
-    entitled: bool,
+    /// Consumer builds always pass; enterprise builds retain native access
+    /// enforcement even if the frontend gate has not hydrated yet.
+    access_allowed: bool,
     /// The server was up at some point → this is a crash, not a boot failure.
     ever_connected: bool,
     past_startup_grace: bool,
@@ -501,7 +502,7 @@ impl EngineRespawnCheck {
     /// server — and the per-window respawn budget isn't spent.
     fn should_respawn(&self) -> bool {
         self.wants_recording
-            && self.entitled
+            && self.access_allowed
             && self.ever_connected
             && self.past_startup_grace
             && !self.in_restart_grace
@@ -546,11 +547,11 @@ fn respawn_engine_if_crashed(
             .try_state::<crate::recording::RecordingState>()
             .map(|s| s.capture_intended())
             .unwrap_or(false),
-        entitled: crate::store::SettingsStore::get(app)
+        access_allowed: crate::store::SettingsStore::get(app)
             .ok()
             .flatten()
-            .map(|s| s.app_entitled_or_dev())
-            .unwrap_or(false),
+            .map(|s| crate::recording::recording_access_allowed(&s))
+            .unwrap_or(!cfg!(feature = "enterprise-build")),
         ever_connected,
         past_startup_grace: start_elapsed > STARTUP_GRACE_PERIOD,
         in_restart_grace: last_restart_triggered
@@ -2332,7 +2333,7 @@ mod tests {
     fn crash_baseline() -> EngineRespawnCheck {
         EngineRespawnCheck {
             wants_recording: true,
-            entitled: true,
+            access_allowed: true,
             ever_connected: true,
             past_startup_grace: true,
             in_restart_grace: false,
@@ -2357,8 +2358,8 @@ mod tests {
     }
 
     #[test]
-    fn never_respawns_when_not_entitled() {
-        assert!(!EngineRespawnCheck { entitled: false, ..crash_baseline() }.should_respawn());
+    fn never_respawns_when_enterprise_access_is_blocked() {
+        assert!(!EngineRespawnCheck { access_allowed: false, ..crash_baseline() }.should_respawn());
     }
 
     #[test]

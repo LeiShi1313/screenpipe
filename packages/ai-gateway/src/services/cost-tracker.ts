@@ -76,10 +76,12 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
   // Screenpipe internal models (self-hosted, zero cost)
   'screenpipe-event-classifier': { input: 0.00, output: 0.00 },
   // Google Gemini
-  // Gemini 3.x cache pricing unverified — no discount applied (conservative)
+  // Gemini 3.x standard/flex rates verified against Google Cloud pricing
+  // (2026-07-13). Cache stays at full input price here, conservatively.
   'gemini-2.5-flash': { input: 0.15, output: 0.60, ...GEMINI25_CACHE },
   'gemini-2.5-pro': { input: 1.25, output: 10.00, ...GEMINI25_CACHE },
-  'gemini-3-flash': { input: 0.10, output: 0.40 },
+  'gemini-3-flash': { input: 0.50, output: 3.00 },
+  'gemini-3-flash:flex': { input: 0.25, output: 1.50 },
   'gemini-3-pro': { input: 1.25, output: 10.00 },
   // 3.5-flash routes through Vertex global endpoint (see gemini.ts
   // requiresGlobalEndpoint), so we pay the cheaper global tier — $1.50/$9

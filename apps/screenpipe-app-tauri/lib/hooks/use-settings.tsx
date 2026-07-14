@@ -14,7 +14,7 @@ import { cacheAnalyticsId } from "@/lib/analytics-id";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor, stripSessionToken } from "../auth-guard";
-import { hasAppEntitlement, normalizeAppUser } from "@/lib/app-entitlement";
+import { hasCloudEntitlement, normalizeAppUser } from "@/lib/app-entitlement";
 import { screenpipeWebUrl } from "@/lib/web-url";
 import type { SourceCitation } from "@/lib/source-citations";
 import type {
@@ -548,16 +548,15 @@ const DEFAULT_CLOUD_PRESET: AIPreset = makeDefaultPresets(false)[0];
 
 const DEFAULT_AUDIO_ENGINE = "whisper-large-v3-turbo-quantized";
 
-// "Paid" = any active app entitlement (Basic / Business / Enterprise / Lifetime)
-// OR the legacy cloud-sync subscription. Broadened from `cloud_subscribed`-only so
-// every paying user — not just Cloud Sync subscribers — gets Screenpipe Cloud
-// transcription on by default. A database ID identifies an account but is not
-// a credential, so cloud defaults require the verified session token.
-const isLoggedInProUser = (user: User | null | undefined) =>
-	hasAppEntitlement(user as any) && Boolean(user?.token);
+// Hosted transcription is a cloud entitlement, not a generic app entitlement.
+// App-only lifetime/manual grants keep local recording available but must never
+// opt themselves into a recurring server-cost path. A database ID identifies an
+// account but is not a credential, so cloud defaults also require the session token.
+const isLoggedInCloudUser = (user: User | null | undefined) =>
+	hasCloudEntitlement(user as any) && Boolean(user?.token);
 
 const applyProCloudAudioDefaults = (settings: Settings): Settings => {
-	if (!isLoggedInProUser(settings.user)) return settings;
+	if (!isLoggedInCloudUser(settings.user)) return settings;
 	if ((settings as any)._proCloudAudioDefaultsAppliedV2) return settings;
 
 	// If the user picked a non-default, non-cloud engine, they've configured audio
@@ -658,7 +657,8 @@ let DEFAULT_SETTINGS: Settings = {
 				credits_balance: null,
 				app_entitled: null,
 				subscription_plan: null,
-				entitlement: null
+				entitlement: null,
+				enterprise_account: null,
 			},
 			showScreenpipeShortcut: "Control+Super+S",
 			startRecordingShortcut: "Super+Alt+U",
@@ -1024,7 +1024,7 @@ function createSettingsStore() {
 		// Post-migration: when a logged-in Pro user is first confirmed, default
 		// both background and live transcription to Screenpipe Cloud. The marker
 		// prevents future user refreshes from overriding a manual engine choice.
-		if (isLoggedInProUser(settings.user) && !(settings as any)._proCloudAudioDefaultsAppliedV2) {
+		if (isLoggedInCloudUser(settings.user) && !(settings as any)._proCloudAudioDefaultsAppliedV2) {
 			applyProCloudAudioDefaults(settings);
 			needsUpdate = true;
 		}
@@ -1098,7 +1098,7 @@ function createSettingsStore() {
 		if ("user" in value) {
 			// On logout / Pro→non-Pro transition, clear the V2 marker so a future
 			// Pro login re-evaluates cloud defaults (handles account switching).
-			if (!isLoggedInProUser(newSettings.user)) {
+			if (!isLoggedInCloudUser(newSettings.user)) {
 				delete (newSettings as any)._proCloudAudioDefaultsAppliedV2;
 			}
 			newSettings = applyProCloudAudioDefaults(newSettings);

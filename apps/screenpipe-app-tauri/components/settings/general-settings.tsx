@@ -20,6 +20,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "@/lib/utils/tauri";
 import { UpdateBanner } from "@/components/update-banner";
 import type { SettingsField } from "./settings-search";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
@@ -109,10 +110,23 @@ export default function GeneralSettings() {
   // Cloud media analysis (Gemma 4 E4B inside our Tinfoil enclave) —
   // toggling this also rewrites the screenpipe-api skill markdown so
   // agents see the capability iff the toggle is on. Defaults to true.
-  const cloudMediaAnalysisEnabled = settings?.cloudMediaAnalysisEnabled ?? true;
+  const cloudMediaAnalysisRequested = settings?.cloudMediaAnalysisEnabled ?? true;
+  const hasCloudMediaAccess = hasCloudEntitlement(settings?.user);
+  const cloudMediaAnalysisEnabled =
+    cloudMediaAnalysisRequested && hasCloudMediaAccess;
+  const enhancedAIEnabled =
+    (settings?.enhancedAI ?? false) && hasCloudMediaAccess;
 
   const handleCloudMediaAnalysisChange = useCallback(
     async (checked: boolean) => {
+      if (checked && !hasCloudMediaAccess) {
+        toast({
+          title: "Screenpipe Business required",
+          description:
+            "Hosted audio and video analysis is not part of the two-turn preview. Local capture, search, and MCP stay free.",
+        });
+        return;
+      }
       handleSettingsChange({ cloudMediaAnalysisEnabled: checked });
       try {
         const res = await commands.setCloudMediaAnalysisSkill(checked);
@@ -127,13 +141,13 @@ export default function GeneralSettings() {
     // handleSettingsChange is a stable inline wrapper over updateSettings;
     // recreating the callback each render is fine and avoids a stale closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [settings],
+    [settings, hasCloudMediaAccess, toast],
   );
 
-  // On first hydrate sync the skill file with the (default-true) setting.
-  // Cheap idempotent file write; ensures fresh installs land with the
-  // block present, and that flipping settings.json from outside the app
-  // (e.g. importing a config) keeps the skill in sync.
+  // Keep the agent skill aligned with both the user's preference and their
+  // current cloud entitlement. A signed-in free account must not advertise a
+  // hosted media tool that the gateway will reject, and an upgrade should
+  // restore the requested capability without rewriting that preference.
   useEffect(() => {
     if (!settings) return;
     let cancelled = false;
@@ -148,10 +162,52 @@ export default function GeneralSettings() {
     return () => {
       cancelled = true;
     };
-    // Fire once on mount; subsequent changes flow through
-    // handleCloudMediaAnalysisChange which calls invoke directly.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [cloudMediaAnalysisEnabled, settings]);
+
+  // Enhanced suggestions are a recurring hosted-AI path, not part of the
+  // bounded two-turn chat preview. Clear both the native scheduler and the
+  // persisted preference as soon as cloud entitlement disappears so a
+  // cancellation/account switch cannot leave a noisy retry loop behind.
+  useEffect(() => {
+    if (!settings?.enhancedAI || hasCloudMediaAccess) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await commands.setEnhancedAiSuggestions(false, "");
+        if (res.status === "error") throw new Error(res.error);
+        if (!cancelled) await updateSettings({ enhancedAI: false });
+      } catch (e) {
+        console.error("failed to disable enhanced AI after cloud downgrade:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hasCloudMediaAccess, settings?.enhancedAI, updateSettings]);
+
+  const handleEnhancedAIChange = async (checked: boolean) => {
+    if (checked && !hasCloudMediaAccess) {
+      toast({
+        title: "Screenpipe Business required",
+        description:
+          "Enhanced cloud suggestions are not part of the two-turn preview. Local suggestions stay free.",
+      });
+      return;
+    }
+
+    const token = checked ? settings?.user?.token || "" : "";
+    try {
+      const res = await commands.setEnhancedAiSuggestions(checked, token);
+      if (res.status === "error") throw new Error(res.error);
+      await updateSettings({ enhancedAI: checked });
+    } catch (e) {
+      toast({
+        title: "could not update Enhanced AI",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    }
+  };
 
   const handleAutoStartChange = async (checked: boolean) => {
     handleSettingsChange({ autoStartEnabled: checked });
@@ -354,7 +410,9 @@ export default function GeneralSettings() {
                 <div>
                   <h3 className="text-sm font-medium text-foreground">Enhanced AI</h3>
                   <p className="text-xs text-muted-foreground">
-                    Use Screenpipe Cloud for smarter suggestions
+                    {hasCloudMediaAccess
+                      ? "Use Screenpipe Cloud for smarter suggestions"
+                      : "Business feature. Local suggestions remain free."}
                   </p>
                   <p className="text-[10px] text-muted-foreground/60 mt-0.5">
                     sends recent activity to screenpipe cloud for processing. we don&apos;t store your data (zero retention).
@@ -363,14 +421,9 @@ export default function GeneralSettings() {
               </div>
               <Switch
                 id="enhanced-ai-toggle"
-                checked={settings?.enhancedAI ?? false}
-                onCheckedChange={async (checked) => {
-                  handleSettingsChange({ enhancedAI: checked });
-                  const token = settings?.user?.token || "";
-                  try {
-                    await commands.setEnhancedAiSuggestions(checked, token);
-                  } catch {}
-                }}
+                checked={enhancedAIEnabled}
+                onCheckedChange={handleEnhancedAIChange}
+                disabled={!hasCloudMediaAccess}
                 className="ml-4"
               />
             </div>
@@ -394,7 +447,9 @@ export default function GeneralSettings() {
                     <HelpTooltip text="Lets Pi and Claude Code call screenpipe's confidential enclave (Gemma 4 E4B inside a Tinfoil-attested AMD SEV-SNP container, encrypted in flight + at rest, no plaintext at the provider) to transcribe meetings, describe video clips, and analyze image frames from your screenpipe data. When off, the capability is stripped from the agent skill markdown so Pi won't try to use it." />
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    Transcribe audio and understand video &amp; images in a confidential enclave.
+                    {hasCloudMediaAccess
+                      ? "Transcribe audio and understand video & images in a confidential enclave."
+                      : "Business feature. Local capture, search, and agent access remain free."}
                   </p>
                 </div>
               </div>
@@ -402,6 +457,7 @@ export default function GeneralSettings() {
                 id="cloudMediaAnalysisEnabled"
                 checked={cloudMediaAnalysisEnabled}
                 onCheckedChange={handleCloudMediaAnalysisChange}
+                disabled={!hasCloudMediaAccess}
                 className="ml-4"
               />
             </div>
@@ -498,4 +554,3 @@ export default function GeneralSettings() {
     </div>
   );
 }
-

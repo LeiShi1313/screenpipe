@@ -19,6 +19,7 @@ interface RegionOcrOverlayProps {
   } | null;
   naturalDimensions: { width: number; height: number } | null;
   userToken: string | null;
+  hasHostedSubscription: boolean;
 }
 
 interface SelectionRect {
@@ -33,6 +34,7 @@ export const RegionOcrOverlay: FC<RegionOcrOverlayProps> = ({
   renderedImageInfo,
   naturalDimensions,
   userToken,
+  hasHostedSubscription,
 }) => {
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(
@@ -97,6 +99,20 @@ export const RegionOcrOverlay: FC<RegionOcrOverlayProps> = ({
         return;
       }
 
+      // Region OCR uploads pixels and can request thousands of hosted model
+      // tokens. It is a paid cloud analysis feature, not one of the two free
+      // visible chat turns. Keep this client check for clear UX; the gateway's
+      // background-request gate remains the source-of-truth money guard.
+      if (!hasHostedSubscription) {
+        toast({
+          title: "Screenpipe Business required",
+          description: "Region OCR uses hosted image analysis. Upgrade, or use the local selectable text layer.",
+          variant: "destructive",
+        });
+        setSelectionRect(null);
+        return;
+      }
+
       setIsProcessing(true);
       toast({ title: "reading text...", description: "analyzing selected region" });
 
@@ -150,6 +166,7 @@ export const RegionOcrOverlay: FC<RegionOcrOverlayProps> = ({
             headers: {
               Authorization: `Bearer ${userToken}`,
               "Content-Type": "application/json",
+              "x-screenpipe-latency": "background",
             },
             body: JSON.stringify({
               model: "claude-haiku-4-5",
@@ -214,7 +231,7 @@ export const RegionOcrOverlay: FC<RegionOcrOverlayProps> = ({
         setSelectionRect(null);
       }
     },
-    [frameId, renderedImageInfo, naturalDimensions, userToken]
+    [frameId, renderedImageInfo, naturalDimensions, userToken, hasHostedSubscription]
   );
 
   const onMouseDown = useCallback(

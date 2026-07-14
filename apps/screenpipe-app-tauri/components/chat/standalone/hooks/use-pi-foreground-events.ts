@@ -44,6 +44,7 @@ export function usePiForegroundEvents({
   forceQueueModeRef,
   handleAgentEventDataRef,
   handleInvalidatedAuthToken,
+  lastPiDispatchPromptRef,
   lastUserMessageRef,
   markTurnIntentConsumed,
   messages,
@@ -502,6 +503,13 @@ export function usePiForegroundEvents({
                 : null;
             const queuedDisplay = pendingDisplay ?? consumeQueuedDisplayForStartedMessage(sidForStartedUser, text);
             const matchedTurnIntent = preMatchedTurnIntent ?? findTurnIntentForUserStart(sidForStartedUser, text, queuedDisplay);
+            if (matchedTurnIntent?.content) {
+              // A queued prompt can be prepared while another turn is still
+              // running. Only promote its exact marked bytes to the retry ref
+              // when Pi actually starts that queued turn; otherwise a 429 on
+              // the current turn could accidentally retry the next message.
+              lastPiDispatchPromptRef.current = matchedTurnIntent.content;
+            }
             if (matchedTurnIntent?.consumedAssistantId) {
               pendingNextPiUserIntentRef.current = null;
               if (pendingNextPiUserDisplayRef.current?.turnIntentId === matchedTurnIntent.id) {
@@ -808,10 +816,12 @@ export function usePiForegroundEvents({
             console.warn("[Pi] first-call bug hit, auto-retrying prompt:", errorStr);
             if (piMessageIdRef.current && !piFirstCallRetried.current) {
               piFirstCallRetried.current = true;
-              // Re-send the last prompt
-              const lastUserMsg = messages.findLast(m => m.role === "user");
-              if (lastUserMsg?.content) {
-                commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null, null).catch(() => {});
+              // Re-send the exact dispatched bytes. Rebuilding from the
+              // persisted user bubble would drop conversation context and the
+              // opaque hosted-turn marker, incorrectly charging another turn.
+              const retryPrompt = lastPiDispatchPromptRef.current;
+              if (retryPrompt) {
+                commands.piPrompt(piSessionIdRef.current, retryPrompt, null, null).catch(() => {});
               }
             }
             return;
@@ -825,13 +835,13 @@ export function usePiForegroundEvents({
             classifyQuotaError(errorStr) === "rate" &&
             piRateLimitRetries.current < PI_MAX_RATE_LIMIT_RETRIES &&
             piSessionIdRef.current &&
-            lastUserMessageRef.current
+            lastPiDispatchPromptRef.current
           ) {
             piRateLimitRetries.current += 1;
             const attempt = piRateLimitRetries.current;
             const waitSecs = parseRateLimitWaitSeconds(errorStr);
             const retrySession = piSessionIdRef.current;
-            const retryPrompt = lastUserMessageRef.current;
+            const retryPrompt = lastPiDispatchPromptRef.current;
             console.warn(`[Pi] rate limited, auto-retry ${attempt}/${PI_MAX_RATE_LIMIT_RETRIES} in ${waitSecs}s:`, errorStr);
             // Reset the in-flight buffers so the retried turn renders cleanly into
             // the same bubble instead of appending onto any pre-429 partial output.

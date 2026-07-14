@@ -706,11 +706,11 @@
       "spec": "zz-app-entitlement-gate.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["settings", "billing", "real-ui-e2e"],
-      "features": ["app-entitlement-gate", "billing-gate"],
+      "features": ["app-entitlement-gate", "free-local-tier"],
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Production billing gate blocks an unentitled session behind the paywall and restores access when the forced-gate flag is cleared."
+      "notes": "Production consumer policy keeps signed-out and app-denied accounts inside the local product while preserving separate enterprise-only gate coverage."
     },
     {
       "spec": "zz-enterprise-license-prompt.spec.ts",

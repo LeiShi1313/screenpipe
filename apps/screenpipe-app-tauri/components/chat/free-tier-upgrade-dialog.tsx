@@ -4,9 +4,12 @@
 
 "use client";
 
+import { useEffect, useRef } from "react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { ArrowUpRight, Cloud, KeyRound, MonitorDown } from "lucide-react";
+import posthog from "posthog-js";
 import { Button } from "@/components/ui/button";
+import { PRICING_URL } from "@/lib/app-entitlement";
 import {
   Dialog,
   DialogContent,
@@ -15,24 +18,84 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
-const UPGRADE_URL = "https://screenpi.pe/onboarding";
+export function buildFreeTierUpgradeUrl(userToken?: string | null): string {
+  if (!userToken) return PRICING_URL;
+  const separator = PRICING_URL.includes("?") ? "&" : "?";
+  return `${PRICING_URL}${separator}token=${encodeURIComponent(userToken)}`;
+}
 
 export function FreeTierUpgradeDialog({
   open,
   onOpenChange,
   onChooseOwnAI,
+  userToken,
+  limit = 2,
+  plan = null,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onChooseOwnAI: () => void;
+  onChooseOwnAI: (choice?: "provider" | "local") => void | Promise<void>;
+  userToken?: string | null;
+  limit?: number;
+  plan?: string | null;
 }) {
-  const upgrade = async () => {
-    await openUrl(UPGRADE_URL).catch(() => window.open(UPGRADE_URL, "_blank"));
+  const shownRef = useRef(false);
+  const actionRef = useRef(false);
+
+  useEffect(() => {
+    if (!open) {
+      shownRef.current = false;
+      actionRef.current = false;
+      return;
+    }
+    if (shownRef.current) return;
+    shownRef.current = true;
+    posthog.capture("free_chat_wall_shown", {
+      provider: "screenpipe-cloud",
+      plan,
+      limit,
+      remaining: 0,
+    });
+  }, [limit, open, plan]);
+
+  const closeAfterAction = () => {
+    actionRef.current = true;
     onOpenChange(false);
   };
 
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen && open && !actionRef.current) {
+      posthog.capture("free_chat_wall_dismissed", {
+        provider: "screenpipe-cloud",
+        plan,
+        limit,
+      });
+    }
+    onOpenChange(nextOpen);
+  };
+
+  const upgrade = async () => {
+    posthog.capture("free_chat_upgrade_clicked", {
+      provider: "screenpipe-cloud",
+      plan,
+      limit,
+    });
+    const upgradeUrl = buildFreeTierUpgradeUrl(userToken);
+    await openUrl(upgradeUrl).catch(() => window.open(upgradeUrl, "_blank"));
+    closeAfterAction();
+  };
+
+  const chooseOwnAI = async (choice: "provider" | "local") => {
+    posthog.capture(
+      choice === "local" ? "free_chat_local_clicked" : "free_chat_byok_clicked",
+      { provider: "screenpipe-cloud", plan, limit },
+    );
+    await onChooseOwnAI(choice);
+    closeAfterAction();
+  };
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-[520px] p-0" data-testid="free-tier-upgrade-dialog">
         <div className="border-b border-border px-6 py-5">
           <p className="font-mono text-[10px] uppercase tracking-[0.24em] text-muted-foreground">
@@ -41,7 +104,7 @@ export function FreeTierUpgradeDialog({
           <DialogHeader className="mt-3">
             <DialogTitle>keep your memory. choose your ai.</DialogTitle>
             <DialogDescription className="leading-6">
-              You used the 2 included Screenpipe Cloud chats. Recording, local search,
+              You used the {limit} included Screenpipe Cloud {limit === 1 ? "turn" : "turns"}. Recording, local search,
               meetings, timeline, MCP, and local pipes stay free.
             </DialogDescription>
           </DialogHeader>
@@ -66,7 +129,7 @@ export function FreeTierUpgradeDialog({
 
           <button
             type="button"
-            onClick={onChooseOwnAI}
+            onClick={() => void chooseOwnAI("provider")}
             className="flex w-full items-start gap-4 border border-border p-4 text-left transition-colors hover:bg-muted/60"
           >
             <KeyRound className="mt-0.5 h-5 w-5 shrink-0" />
@@ -78,7 +141,11 @@ export function FreeTierUpgradeDialog({
             </span>
           </button>
 
-          <div className="flex items-start gap-4 border border-dashed border-border p-4">
+          <button
+            type="button"
+            onClick={() => void chooseOwnAI("local")}
+            className="flex w-full items-start gap-4 border border-dashed border-border p-4 text-left transition-colors hover:bg-muted/60"
+          >
             <MonitorDown className="mt-0.5 h-5 w-5 shrink-0" />
             <div>
               <p className="text-sm font-medium">run fully local</p>
@@ -86,9 +153,9 @@ export function FreeTierUpgradeDialog({
                 Ollama keeps prompts and screen context on this computer. No Screenpipe AI bill.
               </p>
             </div>
-          </div>
+          </button>
 
-          <Button variant="ghost" onClick={() => onOpenChange(false)} className="mt-1 w-full">
+          <Button variant="ghost" onClick={() => handleOpenChange(false)} className="mt-1 w-full">
             not now
           </Button>
         </div>

@@ -5,8 +5,39 @@
 // Pure helpers for classifying and presenting AI quota / rate-limit errors.
 // Extracted verbatim from standalone-chat.tsx (no behavior change).
 
-export const FREE_CHAT_LIMIT_MESSAGE =
-  "You've used your 2 included Screenpipe Cloud chats. Upgrade for hosted AI, or connect ChatGPT/Codex, your own Claude/OpenAI key, or Ollama to keep using screenpipe free.";
+export type FreeChatLimit = {
+  used: number;
+  limit: number;
+};
+
+export function parseFreeChatLimit(errorStr: string): FreeChatLimit | null {
+  if (!isFreeChatLimitError(errorStr)) return null;
+
+  const limitMatch = errorStr.match(/["']limit["']\s*:\s*(\d+)/i);
+  const usedMatch = errorStr.match(/["']used["']\s*:\s*(\d+)/i);
+  const limit = limitMatch ? Number.parseInt(limitMatch[1], 10) : 2;
+  const used = usedMatch ? Number.parseInt(usedMatch[1], 10) : limit;
+  return {
+    limit: Number.isFinite(limit) ? Math.max(0, limit) : 2,
+    used: Number.isFinite(used) ? Math.max(0, used) : limit,
+  };
+}
+
+export function buildFreeChatLimitMessage(limit: number): string {
+  const safeLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 2;
+  const allowance = safeLimit === 1 ? "1 included Screenpipe Cloud turn" : `${safeLimit} included Screenpipe Cloud turns`;
+  return `You've used your ${allowance}. Upgrade for hosted AI, or connect ChatGPT/Codex, your own Claude/OpenAI key, or Ollama to keep using screenpipe free.`;
+}
+
+export function parseFreeChatLimitMessage(message: string): FreeChatLimit | null {
+  const match = message.match(/You've used your (\d+) included Screenpipe Cloud turn(?:s)?\./i);
+  if (!match) return null;
+  const limit = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(limit)) return null;
+  return { used: limit, limit };
+}
+
+export const FREE_CHAT_LIMIT_MESSAGE = buildFreeChatLimitMessage(2);
 
 export function isFreeChatLimitError(errorStr: string): boolean {
   return errorStr.toLowerCase().includes("free_chat_limit_exhausted");
@@ -14,7 +45,8 @@ export function isFreeChatLimitError(errorStr: string): boolean {
 
 export function buildDailyLimitMessage(errorStr: string): string {
   try {
-    if (isFreeChatLimitError(errorStr)) return FREE_CHAT_LIMIT_MESSAGE;
+    const freeChatLimit = parseFreeChatLimit(errorStr);
+    if (freeChatLimit) return buildFreeChatLimitMessage(freeChatLimit.limit);
     const isCostLimit = errorStr.includes("daily_cost_limit_exceeded");
     const isRateLimit = errorStr.includes("rate limit") || errorStr.includes("Rate limit");
 
@@ -26,21 +58,21 @@ export function buildDailyLimitMessage(errorStr: string): string {
       // Don't leak the raw dollar cap — that's our internal margin. Frame it
       // as an account-wide budget so the user understands why it fired even
       // when they "didn't use much" (background pipes consume it too).
-      return "You've hit today's AI usage limit. This is an account-wide budget — background pipes count too. Switch to a free model (gemini-3-flash, haiku) or check Settings → Pipes for chatty schedules.";
+      return "You've hit today's hosted AI usage limit. This is an account-wide budget — background pipes count too. Try again tomorrow, check Settings → Pipes for chatty schedules, or connect your own AI provider.";
     }
 
     const tierMatch = errorStr.match(/"tier":\s*"([^"]+)"/);
     const tier = tierMatch?.[1];
 
     if (tier === "subscribed") {
-      return "You've hit your daily limit. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage.";
+      return "You've hit your daily hosted AI limit. Try again tomorrow or connect your own AI provider.";
     } else if (tier === "logged_in") {
-      return "You've used your free queries for today. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage, or upgrade to Business.";
+      return "You've used your hosted AI allowance. Upgrade to Business or connect your own AI provider.";
     } else {
-      return "You've used your free queries for today. Sign in for more, or switch to a free model (Qwen3 Coder, Gemini Flash).";
+      return "Hosted AI requires sign-in. You can also connect your own AI provider.";
     }
   } catch {
-    return "You've reached your daily limit. Try a free model like Qwen3 Coder or Gemini Flash.";
+    return "You've reached your hosted AI limit. Try again later or connect your own AI provider.";
   }
 }
 

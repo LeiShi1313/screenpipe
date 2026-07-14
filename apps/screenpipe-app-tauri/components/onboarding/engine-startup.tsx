@@ -23,6 +23,8 @@ import {
   platform as osPlatform,
 } from "@tauri-apps/plugin-os";
 import { ParticleStream, ProgressSteps } from "./particle-stream";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
+import { isScreenpipeCloudProvider } from "@/lib/chat/free-tier-turn-marker";
 
 interface EngineStartupProps {
   handleNextSlide: () => void;
@@ -493,9 +495,10 @@ export default function EngineStartup({
     return parts.join(". ") + ".";
   }, []);
 
-  // Stream a warm summary using the user's default preset, falling back to
-  // their cloud token. If neither is available, leave summary empty and let
-  // the fallback timer release the continue button.
+  // Stream a warm summary using a user-funded provider. Screenpipe Cloud is
+  // only used for an active subscriber: this invisible onboarding helper must
+  // never spend one of the two visible hosted preview turns. Free users still
+  // see `buildLocalProse`, which is deterministic and stays on-device.
   // Track attempts so a transient failure (no token at first poll, network
   // blip) gets retried instead of permanently breaking the slide.
   const summaryAttemptsRef = useRef(0);
@@ -505,8 +508,6 @@ export default function EngineStartup({
     async (digest: string) => {
       if (summaryStartedRef.current) return;
       if (summaryAttemptsRef.current >= MAX_SUMMARY_ATTEMPTS) return;
-      summaryStartedRef.current = true;
-      summaryAttemptsRef.current += 1;
 
       const presets = settings.aiPresets ?? [];
       const preset =
@@ -517,8 +518,9 @@ export default function EngineStartup({
       let auth: Record<string, string> = {};
 
       const userToken = settings.user?.token;
+      const hasHostedSubscription = hasCloudEntitlement(settings.user);
 
-      if (preset?.provider === "screenpipe-cloud" && userToken) {
+      if (isScreenpipeCloudProvider(preset?.provider) && userToken && hasHostedSubscription) {
         endpoint = "https://api.screenpipe.com/v1/chat/completions";
         model = preset.model || model;
         auth = { Authorization: `Bearer ${userToken}` };
@@ -530,17 +532,15 @@ export default function EngineStartup({
         endpoint = `${preset.url.replace(/\/$/, "")}/chat/completions`;
         model = preset.model;
         auth = { Authorization: `Bearer ${preset.apiKey}` };
-      } else if (userToken) {
-        // Fall back to cloud even if preset is non-cloud but token exists.
-        endpoint = "https://api.screenpipe.com/v1/chat/completions";
-        auth = { Authorization: `Bearer ${userToken}` };
       } else {
-        // No way to call any model. Bail and reset the gate so a later poll
-        // can retry — settings.user.token can land asynchronously after the
-        // login slide completes.
-        summaryStartedRef.current = false;
+        // Signed-out/free hosted users and providers without a direct user
+        // credential use the local prose below. Do not silently fall back to
+        // Screenpipe Cloud merely because a login token exists.
         return;
       }
+
+      summaryStartedRef.current = true;
+      summaryAttemptsRef.current += 1;
 
       const controller = new AbortController();
       summaryAbortRef.current = controller;
@@ -564,7 +564,13 @@ if the input is sparse, just describe what little you have warmly. don't apologi
       try {
         const resp = await fetch(endpoint, {
           method: "POST",
-          headers: { "Content-Type": "application/json", ...auth },
+          headers: {
+            "Content-Type": "application/json",
+            ...auth,
+            ...(endpoint === "https://api.screenpipe.com/v1/chat/completions"
+              ? { "x-screenpipe-latency": "background" }
+              : {}),
+          },
           signal: controller.signal,
           body: JSON.stringify({
             model,
@@ -641,7 +647,7 @@ if the input is sparse, just describe what little you have warmly. don't apologi
         setSummaryStreaming(false);
       }
     },
-    [settings.aiPresets, settings.user?.token]
+    [settings.aiPresets, settings.user]
   );
 
   // Kick off the summary once we have enough signals.

@@ -837,7 +837,7 @@ export function AIProviderConfig({
                     <span className="flex items-center gap-1.5">
                       {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title="overloaded" />}
                       {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title="degraded" />}
-                      {m.name}{m.free ? " (free)" : ""}
+                      {m.name}{m.free ? (selectedProvider === "screenpipe-cloud" ? " (included)" : " (free)") : ""}
                       {locked && <span className="text-[9px] font-medium text-muted-foreground border rounded px-1">business</span>}
                       {!locked && costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
                       {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">pipes</span>}

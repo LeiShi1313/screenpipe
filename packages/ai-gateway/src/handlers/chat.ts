@@ -45,6 +45,18 @@ export const AUTO_WATERFALL_BACKGROUND = [
   'gemini-3-flash',   // near-free safety net
 ];
 
+// The server-funded two-turn preview must never inherit the normal Auto head
+// (currently paid Luna) or the difficulty router's frontier promotion. Start
+// with $0 Vertex MaaS models and retain only cheap flash fallbacks for outage
+// resilience. Preview validation is text-only, so this route never enters a
+// separately priced or weakly bounded vision lane.
+export const FREE_PREVIEW_WATERFALL = [
+  'glm-5',
+  'kimi-k2.5',
+  'glm-4.7',
+  'gemini-3-flash',
+];
+
 /** Gemini is the only lane with a Vertex flex tier; glm/claude/etc. ignore it. */
 function isGeminiModel(model: string): boolean {
   return model.toLowerCase().includes('gemini');
@@ -169,6 +181,24 @@ function hasImages(body: RequestBody): boolean {
           (part.type === 'file' && part.mimeType?.startsWith('image/'))
       )
   );
+}
+
+export function selectAutoWaterfall(
+  body: RequestBody,
+  latency: 'interactive' | 'background',
+): string[] {
+  if (body.freePreview) {
+    return FREE_PREVIEW_WATERFALL;
+  }
+  if (hasImages(body)) return AUTO_WATERFALL_VISION;
+  return latency === 'background' ? AUTO_WATERFALL_BACKGROUND : AUTO_WATERFALL;
+}
+
+export function shouldUseDifficultyRouter(
+  body: RequestBody,
+  latency: 'interactive' | 'background',
+): boolean {
+  return body.freePreview !== true && latency === 'interactive' && !hasImages(body);
 }
 
 function addModelHeader(response: Response, model: string): Response {
@@ -494,18 +524,14 @@ export async function handleChatCompletions(
   // smart reasoning model — latency-tolerant lane, OpenAI credits). Flex applies
   // to Gemini entries only when flexEligible — background always, interactive only
   // if GEMINI_FLEX_INTERACTIVE is "true" (set "false" to keep interactive snappy).
-  const useBackgroundChain = latency === 'background';
-
   if (body.model === 'auto') {
-    let chain = hasImages(body)
-      ? AUTO_WATERFALL_VISION
-      : (useBackgroundChain ? AUTO_WATERFALL_BACKGROUND : AUTO_WATERFALL);
+    let chain = selectAutoWaterfall(body, latency);
     // Difficulty router (interactive text only). A/B by device: arm 'on' runs the
     // router and promotes a tier head (opus for hard, gpt-5-nano for trivial), arm
     // 'off' is the control baseline (chain unchanged = today's behavior). We tag
     // router_tier on the response so the cost log can measure ON vs control.
     let routerTier: string | null = null;
-    if (!hasImages(body) && !useBackgroundChain) {
+    if (shouldUseDifficultyRouter(body, latency)) {
       if (routerArm(deviceId, env) === 'on') {
         const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
         const tier = await routeTier(body.messages, env, { hasTools });

@@ -8,6 +8,10 @@ import { commands } from "@/lib/utils/tauri";
 import { imageDataUrlsToPiImages } from "@/lib/chat/image-content";
 import { queuedPreviewForText } from "@/lib/chat/queued-display";
 import { withConversationHistory } from "@/lib/chat/conversation-history";
+import {
+  markScreenpipeCloudTurn,
+  resolvePiDispatchProvider,
+} from "@/lib/chat/free-tier-turn-marker";
 import type {
   PiSendCommand,
   PiSendTransportOptions,
@@ -19,12 +23,14 @@ export function createPiMessageQueueTransport(
 ) {
   const {
     activePreset,
+    activePresetRef,
     consumePendingAttachments,
     input,
     inputRef,
     messages,
     pastedImages,
     piInfo,
+    piRunningConfigRef,
     piSessionIdRef,
     queuedPrompts,
     registerTurnIntent,
@@ -57,8 +63,16 @@ export function createPiMessageQueueTransport(
     if (inputRef.current) inputRef.current.style.height = "auto";
     if (hadPastedImages) setPastedImages([]);
 
-    const queuedPrompt = withConversationHistory(userMessage, messages);
-
+    const queuedPrompt = markScreenpipeCloudTurn(
+      withConversationHistory(userMessage, messages),
+      {
+        provider: resolvePiDispatchProvider(
+          piRunningConfigRef.current?.provider,
+          (activePresetRef?.current ?? activePreset)?.provider,
+          Boolean(piInfo?.running),
+        ),
+      },
+    );
     {
       const windowWithCaptures = window as unknown as {
         __e2ePiPromptCaptures?: Array<{ sessionId: string; message: string; at: number }>;
@@ -91,7 +105,10 @@ export function createPiMessageQueueTransport(
         id: queuedTurnIntentId,
         sessionId: piSessionIdRef.current,
         kind: "queued",
-        content: userMessage,
+        // Pi emits the exact queued prompt when this turn begins. Keep the
+        // marked bytes in the intent ledger for matching, while `preview` and
+        // queued display remain the clean user-visible text.
+        content: queuedPrompt,
         preview: queuedPreviewForText(userMessage),
         queueId: result.data,
         createdAt: Date.now(),

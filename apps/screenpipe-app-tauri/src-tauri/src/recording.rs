@@ -71,13 +71,35 @@ fn build_config(app: &tauri::AppHandle) -> Result<RecordingConfig, String> {
     Ok(store.to_recording_config(data_dir))
 }
 
-fn require_app_entitlement(store: &SettingsStore) -> Result<(), String> {
-    if store.app_entitled_or_dev() {
+fn recording_access_policy(
+    is_enterprise_build: bool,
+    app_entitled: bool,
+    consumer_requires_enterprise_app: bool,
+) -> bool {
+    if !is_enterprise_build && consumer_requires_enterprise_app {
+        return false;
+    }
+    !is_enterprise_build || app_entitled
+}
+
+/// Consumer builds have a permanent local recording tier. Enterprise builds
+/// retain their existing native entitlement guard so capture cannot start in
+/// the short window before the frontend policy/login gate hydrates.
+pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
+    recording_access_policy(
+        cfg!(feature = "enterprise-build"),
+        store.app_entitled_or_dev(),
+        !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
+    )
+}
+
+fn require_recording_access(store: &SettingsStore) -> Result<(), String> {
+    if recording_access_allowed(store) {
         return Ok(());
     }
 
     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
-    Err("subscription_required: active screenpipe plan required to start recording".to_string())
+    Err("subscription_required: active enterprise screenpipe plan required to start recording".to_string())
 }
 
 pub fn notify_audio_engine_fallback(store: &SettingsStore) {
@@ -516,7 +538,7 @@ pub async fn start_capture(
 ) -> Result<(), String> {
     info!("Starting capture session");
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    require_app_entitlement(&store)?;
+    require_recording_access(&store)?;
 
     // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
     // — record it so the health watchdog will respawn a crashed engine instead
@@ -773,7 +795,7 @@ async fn spawn_screenpipe_inner(
     }
 
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    if let Err(err) = require_app_entitlement(&store) {
+    if let Err(err) = require_recording_access(&store) {
         state.is_starting.store(false, Ordering::SeqCst);
         state.is_starting_capture.store(false, Ordering::SeqCst);
         return Err(err);
@@ -1218,7 +1240,7 @@ async fn start_capture_internal(
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
-    require_app_entitlement(&store)?;
+    require_recording_access(&store)?;
 
     let mut capture_guard = state.capture.lock().await;
     if capture_guard.is_some() {
@@ -1375,6 +1397,28 @@ mod capture_intent_tests {
         wants_recording.store(false, Ordering::SeqCst);
 
         assert!(!capture_intended_now(&wants_recording));
+    }
+}
+
+#[cfg(test)]
+mod recording_access_tests {
+    use super::recording_access_policy;
+
+    #[test]
+    fn consumer_recording_is_free_without_an_entitlement() {
+        assert!(recording_access_policy(false, false, false));
+    }
+
+    #[test]
+    fn enterprise_recording_still_requires_native_access() {
+        assert!(!recording_access_policy(true, false, false));
+        assert!(recording_access_policy(true, true, false));
+    }
+
+    #[test]
+    fn mandatory_enterprise_org_cannot_record_from_consumer_binary() {
+        assert!(!recording_access_policy(false, true, true));
+        assert!(recording_access_policy(true, true, true));
     }
 }
 

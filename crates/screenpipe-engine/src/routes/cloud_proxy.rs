@@ -41,6 +41,10 @@ pub async fn chat_completions(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
+        // Agent-driven media analysis can run without a new visible user
+        // message. Mark it paid/background so it cannot consume or replay the
+        // two-turn hosted preview through the local proxy.
+        .header("x-screenpipe-latency", "background")
         .body(body)
         .send()
         .await

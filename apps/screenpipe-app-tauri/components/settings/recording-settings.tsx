@@ -113,7 +113,7 @@ import {
   useSettings,
   Settings,
 } from "@/lib/hooks/use-settings";
-import { hasAppEntitlement } from "@/lib/app-entitlement";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
 import { useToast } from "@/components/ui/use-toast";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { localFetch } from "@/lib/api";
@@ -277,7 +277,7 @@ const getAudioEngineResolution = (
     };
   }
 
-  if (requested === "screenpipe-cloud" && !hasAppEntitlement(settings.user as any)) {
+  if (requested === "screenpipe-cloud" && !hasCloudEntitlement(settings.user as any)) {
     return {
       requested,
       active: fallback,
@@ -1949,7 +1949,12 @@ export function RecordingSettings() {
       settings.user?.token,
     ]
   );
-  const hasCloudTranscriptionAccess = hasAppEntitlement(settings.user as any);
+  const hasCloudTranscriptionAccess = hasCloudEntitlement(settings.user as any);
+  const meetingLiveProvider = settings.meetingLiveTranscriptionProvider ?? "selected-engine";
+  const displayedMeetingLiveProvider =
+    !hasCloudTranscriptionAccess && meetingLiveProvider === "screenpipe-cloud"
+      ? "selected-engine"
+      : meetingLiveProvider;
   const languageSupportEngine = audioEngineResolution.active;
   const languageSupportKey =
     getTranscriptionEngineLanguageSupportKey(languageSupportEngine);
@@ -3250,19 +3255,22 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               <div className="flex items-center gap-2 shrink-0">
                 {(settings.meetingLiveTranscriptionEnabled ?? true) && (
                   <Select
-                    value={settings.meetingLiveTranscriptionProvider ?? "selected-engine"}
-                    onValueChange={(value) =>
+                    value={displayedMeetingLiveProvider}
+                    onValueChange={(value) => {
+                      if (value === "screenpipe-cloud" && !hasCloudTranscriptionAccess) return;
                       handleSettingsChange({
                         meetingLiveTranscriptionProvider: value as Settings["meetingLiveTranscriptionProvider"],
-                      }, true)
-                    }
+                      }, true);
+                    }}
                   >
                     <SelectTrigger className="h-7 w-[190px] text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="selected-engine">Current transcription engine</SelectItem>
-                      <SelectItem value="screenpipe-cloud">screenpipe cloud live</SelectItem>
+                      <SelectItem value="screenpipe-cloud" disabled={!hasCloudTranscriptionAccess}>
+                        screenpipe cloud live {!hasCloudTranscriptionAccess && "(Business)"}
+                      </SelectItem>
                       <SelectItem value="deepgram-live">Direct Deepgram live</SelectItem>
                     </SelectContent>
                   </Select>
@@ -3285,9 +3293,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             </div>
             {(settings.meetingLiveTranscriptionEnabled ?? true) &&
               (settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "screenpipe-cloud" &&
-              !settings.user?.token && (
+              (!settings.user?.token || !hasCloudTranscriptionAccess) && (
               <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
-                Log in to screenpipe cloud to use the cloud live provider.
+                {!settings.user?.token
+                  ? "Log in to screenpipe cloud to use the cloud live provider."
+                  : "Screenpipe cloud live requires an active Business subscription; meetings will use your current transcription engine."}
               </p>
             )}
             {(settings.meetingLiveTranscriptionEnabled ?? true) &&

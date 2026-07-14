@@ -75,6 +75,10 @@ type PiTransportRefs = {
   abortControllerRef: React.MutableRefObject<AbortController | null>;
   autoSendBypassRef: React.MutableRefObject<boolean>;
   forceQueueModeRef: React.MutableRefObject<boolean>;
+  /** Exact bytes sent to Pi for the current visible user turn. Automatic
+   * retries must reuse this value so Screenpipe Cloud sees the same opaque
+   * turn marker, while `lastUserMessageRef` stays clean for retry UI. */
+  lastPiDispatchPromptRef: React.MutableRefObject<string>;
   lastUserMessageRef: React.MutableRefObject<string>;
   sendDispatchInFlightRef: React.MutableRefObject<boolean>;
   sendMessageRef: React.MutableRefObject<((
@@ -175,6 +179,7 @@ export type PiSendTransportOptions = {
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
   isLoading: boolean;
   isStreaming: boolean;
+  lastPiDispatchPromptRef: PiTransportRefs["lastPiDispatchPromptRef"];
   lastUserMessageRef: PiTransportRefs["lastUserMessageRef"];
   messages: Message[];
   optimisticSteerRef: SteeringRefs["optimisticSteerRef"];
@@ -190,6 +195,7 @@ export type PiSendTransportOptions = {
   piMessageIdRef: PiSessionRefs["piMessageIdRef"];
   piPresetSwitchPromiseRef: NonNullable<PiSessionRefs["piPresetSwitchPromiseRef"]>;
   piRateLimitRetries: PiSessionRefs["piRateLimitRetries"];
+  piRunningConfigRef: NonNullable<PiSessionRefs["piRunningConfigRef"]>;
   piSessionIdRef: PiSessionRefs["piSessionIdRef"];
   piSessionSyncedRef: PiSessionRefs["piSessionSyncedRef"];
   piStartInFlightRef: PiSessionRefs["piStartInFlightRef"];
@@ -239,6 +245,7 @@ export type PiForegroundEventsOptions = {
   forceQueueModeRef: PiTransportRefs["forceQueueModeRef"];
   handleAgentEventDataRef: React.MutableRefObject<((data: unknown) => void) | null>;
   handleInvalidatedAuthToken: () => Promise<void> | void;
+  lastPiDispatchPromptRef: PiTransportRefs["lastPiDispatchPromptRef"];
   lastUserMessageRef: PiTransportRefs["lastUserMessageRef"];
   markTurnIntentConsumed: TurnIntentActions["markTurnIntentConsumed"];
   messages: Message[];

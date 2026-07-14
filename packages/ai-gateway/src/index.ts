@@ -21,10 +21,63 @@ import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { pruneModelHealth } from './services/model-health';
 import { resolveLatencyClass, isBackgroundRequest } from './utils/latency';
 import { enforceDailyCostCap } from './services/cost-cap';
-import { completeFreeChatTurn, releaseFreeChatTurn, reserveFreeChatTurn } from './services/free-chat-turns';
+import {
+	acceptFreeChatTurn,
+	hashFreeChatNetwork,
+	isFreeChatPreviewEnabled,
+	isFreeLocalTierEnforcementEnabled,
+	prepareFreeChatRequest,
+	pruneFreeChatNetworkDaily,
+	refundFreeChatShadowBudget,
+	releaseFreeChatTurn,
+	reserveFreeChatShadowBudget,
+	reserveFreeChatTurn,
+	settleFreeChatShadowBudget,
+	settleFreeChatTurnResponse,
+} from './services/free-chat-turns';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
 export { RateLimiter };
+
+function freeTierRolloutConfigurationError(env: Env): Response | null {
+	if (isFreeChatPreviewEnabled(env) && !isFreeLocalTierEnforcementEnabled(env)) {
+		return addCorsHeaders(createErrorResponse(503, JSON.stringify({
+			error: 'free_tier_rollout_misconfigured',
+			message: 'Hosted inference is temporarily unavailable because its free-tier safety controls are misconfigured. Local and user-provided AI remain available.',
+		})));
+	}
+	return null;
+}
+
+function hostedBusinessGate(env: Env, auth: AuthResult, capability: 'hosted_ai' | 'cloud_transcription'): Response | null {
+	const configurationError = freeTierRolloutConfigurationError(env);
+	if (configurationError) return configurationError;
+	if (!isFreeLocalTierEnforcementEnabled(env)) return null;
+	if (auth.error === 'subscription_lookup_unavailable') {
+		return addCorsHeaders(createErrorResponse(503, JSON.stringify({
+			error: 'subscription_status_unavailable',
+			message: 'We could not verify your Business access right now. Please retry; your account was not downgraded.',
+		})));
+	}
+	if (auth.tier === 'anonymous' || !auth.userId) {
+		return addCorsHeaders(createErrorResponse(401, JSON.stringify({
+			error: 'hosted_ai_sign_in_required',
+			message: 'Sign in to a screenpipe account to use hosted AI. Local and user-provided AI remain free.',
+			free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+		})));
+	}
+	if (auth.tier === 'subscribed') return null;
+	return addCorsHeaders(createErrorResponse(402, JSON.stringify({
+		error: capability === 'cloud_transcription'
+			? 'cloud_transcription_subscription_required'
+			: 'hosted_ai_subscription_required',
+		message: capability === 'cloud_transcription'
+			? 'Screenpipe Cloud transcription requires Business. Local transcription remains free.'
+			: 'This hosted AI feature requires Business. Local and user-provided AI remain free.',
+		upgrade_url: 'https://screenpi.pe/onboarding',
+		free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+	})));
+}
 
 // Handler function for the worker
 export async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -33,7 +86,13 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 	// Early test endpoint - before any initialization
 	if (path === '/test') {
-		return new Response('ai proxy is working!', { status: 200 });
+		return new Response('ai proxy is working!', {
+			status: 200,
+			headers: {
+				'X-Free-Local-Tier-Enforcement': String(isFreeLocalTierEnforcementEnabled(env)),
+				'X-Free-Chat-Preview': String(isFreeChatPreviewEnabled(env)),
+			},
+		});
 	}
 
 	try {
@@ -100,6 +159,9 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 		// Chat completions - main AI endpoint
 		if (path === '/v1/chat/completions' && request.method === 'POST') {
+			const configurationError = freeTierRolloutConfigurationError(env);
+			if (configurationError) return configurationError;
+
 			let body: RequestBody;
 			try {
 				body = (await request.json()) as RequestBody;
@@ -113,11 +175,60 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// Reject requests with no usable model up-front — every downstream
 			// model.toLowerCase() (createProvider, isModelAllowed, cost tracking)
 			// assumes a non-empty string. SCREENPIPE-AI-PROXY-1J.
-			if (typeof body.model !== 'string' || body.model.length === 0) {
+			if (!body || typeof body !== 'object' || typeof body.model !== 'string' || body.model.length === 0) {
 				return addCorsHeaders(createErrorResponse(400, JSON.stringify({
 					error: 'missing_model',
 					message: 'Request body must include a non-empty "model" string.',
 				})));
+			}
+			// Never trust the internal preview-routing marker from an HTTP client.
+			// It is re-added below only after verified auth and preview validation.
+			delete (body as Partial<RequestBody>).freePreview;
+
+			const enforcementEnabled = isFreeLocalTierEnforcementEnabled(env);
+			const previewEnabled = enforcementEnabled && isFreeChatPreviewEnabled(env);
+			let freePreviewNetworkHash: string | null = null;
+			const backgroundRequest = isBackgroundRequest(request);
+			if (enforcementEnabled && authResult.error === 'subscription_lookup_unavailable') {
+				return addCorsHeaders(createErrorResponse(503, JSON.stringify({
+					error: 'subscription_status_unavailable',
+					message: 'We could not verify your Business access right now. Please retry; your account was not downgraded and no preview turn was used.',
+				})));
+			}
+			if (enforcementEnabled && (authResult.tier === 'anonymous' || !authResult.userId)) {
+				return addCorsHeaders(createErrorResponse(401, JSON.stringify({
+					error: 'hosted_ai_sign_in_required',
+					message: 'Sign in to a screenpipe account to use the included hosted AI preview. Local and user-provided AI remain free.',
+					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				})));
+			}
+			if (enforcementEnabled && authResult.tier === 'logged_in' && backgroundRequest) {
+				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
+					error: 'hosted_automation_subscription_required',
+					message: 'Hosted AI automations require Business. Local and user-provided pipes remain free.',
+					upgrade_url: 'https://screenpi.pe/onboarding',
+					free_options: ['anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				})));
+			}
+			if (enforcementEnabled && !previewEnabled && authResult.tier === 'logged_in') {
+				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
+					error: 'hosted_ai_subscription_required',
+					message: 'Screenpipe Cloud AI requires Business. Local and user-provided AI remain free.',
+					upgrade_url: 'https://screenpi.pe/onboarding',
+					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				})));
+			}
+			if (previewEnabled && authResult.tier === 'logged_in') {
+				const validation = prepareFreeChatRequest(env, body);
+				if (!validation.ok) {
+					return addCorsHeaders(createErrorResponse(validation.status, JSON.stringify({
+						error: validation.error,
+						message: validation.message,
+						...(validation.limit === undefined ? {} : { limit: validation.limit }),
+					})));
+				}
+				body.freePreview = true;
+				freePreviewNetworkHash = await hashFreeChatNetwork(env, request);
 			}
 
 			// Gate the model for this tier. Background/automation traffic (pipes,
@@ -125,7 +236,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// now-gated model would silently break every run — so it downgrades to
 			// 'auto' (free, always allowed) and keeps running. Interactive requests
 			// still get the visible 403 so the app can surface the upgrade UI.
-			const gate = resolveModelGate(body.model, authResult.tier, env, isBackgroundRequest(request));
+			const gate = resolveModelGate(body.model, authResult.tier, env, backgroundRequest);
 			if (gate === 'downgrade') {
 				console.log(`background request for disallowed model "${body.model}" (${authResult.tier}) -> downgraded to auto`);
 				body.model = 'auto';
@@ -159,9 +270,141 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			const capError = await enforceDailyCostCap(env, authResult.deviceId, authResult.userId, authResult.tier, body.model);
 			if (capError) return capError;
 
-			// Track usage and check daily limit (includes IP-based abuse prevention)
+			// The Free/Local desktop tier includes two lifetime hosted-AI user
+			// turns. The feature flag defaults off so deploying this code cannot
+			// race the D1 migration or a compatible desktop release. Once enabled,
+			// D1 is the authoritative lifetime/concurrency/request-budget guard.
+			let freeTurn;
+			try {
+				freeTurn = await reserveFreeChatTurn(
+					env,
+					authResult,
+					body.messages ?? [],
+					backgroundRequest,
+					freePreviewNetworkHash,
+				);
+			} catch (error) {
+				captureException(error);
+				return addCorsHeaders(createErrorResponse(503, JSON.stringify({
+					error: 'free_chat_ledger_unavailable',
+					message: 'The hosted preview is temporarily unavailable. No turn was used. Local and user-provided AI are still available.',
+				})));
+			}
+			if (freeTurn.applies && !freeTurn.allowed) {
+				if (freeTurn.reason === 'client_update_required') {
+					return addCorsHeaders(createErrorResponse(426, JSON.stringify({
+						error: 'free_chat_client_update_required',
+						message: 'Update screenpipe to use the included hosted preview safely. Local and user-provided AI remain available on older versions.',
+					})));
+				}
+				if (freeTurn.reason === 'invalid_turn') {
+					return addCorsHeaders(createErrorResponse(400, JSON.stringify({
+						error: 'free_chat_user_turn_required',
+						message: 'The hosted preview request must include a user message.',
+					})));
+				}
+				if (freeTurn.reason === 'in_flight') {
+					const response = addCorsHeaders(createErrorResponse(409, JSON.stringify({
+						error: 'free_chat_turn_in_flight',
+						message: 'This hosted turn already has a request in progress. Retry shortly.',
+					})));
+					response.headers.set('Retry-After', '3');
+					return response;
+				}
+				if (freeTurn.reason === 'request_budget' || freeTurn.reason === 'followup_expired') {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'free_chat_turn_request_limit',
+						message: 'This included hosted turn reached its bounded tool-loop limit. Start a new message, upgrade, or use your own AI provider.',
+						reason: freeTurn.reason,
+					})));
+				}
+				if (freeTurn.reason === 'global_limit') {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'free_chat_global_daily_limit',
+						message: 'The included hosted preview has reached its global safety limit for today. Upgrade, retry tomorrow, or use local/user-provided AI.',
+						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+					})));
+				}
+				if (freeTurn.reason === 'network_limit') {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'free_chat_network_daily_limit',
+						message: 'The included hosted preview has reached its abuse-protection limit for this network today. Upgrade, retry tomorrow, or use local/user-provided AI.',
+						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+					})));
+				}
+				if (freeTurn.reason === 'network_identity') {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'free_chat_network_identity_unavailable',
+						message: 'The included hosted preview cannot verify its network abuse-protection key. Retry, upgrade, or use local/user-provided AI.',
+						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+					})));
+				}
+				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
+					error: 'free_chat_limit_exhausted',
+					message: `You've used your ${freeTurn.limit} included Screenpipe Cloud AI turns. Upgrade, or keep using local/user-provided AI at no charge.`,
+					used: freeTurn.used,
+					limit: freeTurn.limit,
+					upgrade_url: 'https://screenpi.pe/onboarding',
+					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				})));
+			}
+			if (freeTurn.applies && freeTurn.allowed && freeTurn.isNew) {
+				// Retention cleanup is deliberately off the response path. Network
+				// counters are conservative: a failed upstream may still consume the
+				// daily abuse slot, which favors financial safety over availability.
+				ctx.waitUntil(pruneFreeChatNetworkDaily(env).catch(captureException));
+			}
+
+			// Promotional provider credits can make the ordinary cash ledger report
+			// $0, and served-model logging cannot see failed fallback attempts. Reserve
+			// a conservative retail dollar for every allowed preview gateway call
+			// before inference. The reservation belongs to this exact turn lease.
+			let freeShadowReserved = false;
+			if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
+				let shadowBudget;
+				try {
+					shadowBudget = await reserveFreeChatShadowBudget(
+						env,
+						authResult.userId,
+						freeTurn.turnHash,
+						freeTurn.leaseToken,
+					);
+				} catch (error) {
+					captureException(error);
+					await releaseFreeChatTurn(
+						env,
+						authResult.userId,
+						freeTurn.turnHash,
+						freeTurn.leaseToken,
+					).catch(captureException);
+					return addCorsHeaders(createErrorResponse(503, JSON.stringify({
+						error: 'free_chat_shadow_ledger_unavailable',
+						message: 'The hosted preview cost guard is temporarily unavailable. No inference was started. Local and user-provided AI are still available.',
+					})));
+				}
+				if (!shadowBudget.allowed) {
+					await releaseFreeChatTurn(
+						env,
+						authResult.userId,
+						freeTurn.turnHash,
+						freeTurn.leaseToken,
+					).catch(captureException);
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'free_chat_shadow_budget_exhausted',
+						message: 'The included hosted preview reached its independent retail-cost safety budget for today. Upgrade, retry tomorrow, or use local/user-provided AI.',
+						free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+					})));
+				}
+				freeShadowReserved = true;
+			}
+
+			// Preview turns are lifetime-limited in the ledger, so do not also
+			// mutate the legacy daily usage/credit system. This prevents a rejected
+			// third turn from deducting a prepaid credit before the preview gate.
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
-			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, body.model);
+			const usage = freeTurn.applies
+				? { used: freeTurn.used, limit: freeTurn.limit, remaining: freeTurn.remaining, allowed: true, resetsAt: '', paidVia: 'free' as const }
+				: await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, body.model);
 			if (!usage.allowed) {
 				const creditsExhausted = (usage.creditsRemaining ?? 0) <= 0;
 				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
@@ -191,9 +434,10 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				})));
 			}
 
-			const backgroundRequest = isBackgroundRequest(request);
+			// Preserve the pre-launch behavior while the staged flag is off. Once
+			// enabled, the earlier Business-only check handles background traffic.
 			const hasPaidCredits = (usage.creditsRemaining ?? 0) > 0;
-			if (authResult.tier === 'logged_in' && backgroundRequest && !hasPaidCredits) {
+			if (!enforcementEnabled && authResult.tier === 'logged_in' && backgroundRequest && !hasPaidCredits) {
 				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
 					error: 'hosted_automation_subscription_required',
 					message: 'Hosted AI automations require Business or prepaid credits. Local and BYOK pipes remain free.',
@@ -202,45 +446,78 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				})));
 			}
 
-			// The Free/Local desktop tier includes two lifetime hosted-AI user
-			// turns. This is intentionally separate from daily model/rate limits:
-			// a Pi tool loop can make many requests for one user message, while a
-			// new user turn must consume exactly one preview slot. Run this after
-			// all other preflights so rejected requests never reserve a turn.
-			// Subscribers, anonymous API traffic, and background automation keep
-			// their existing policies. BYOK/ChatGPT/Claude/Ollama never reach here.
-			const freeTurn = await reserveFreeChatTurn(
-				env,
-				authResult,
-				body.messages ?? [],
-				backgroundRequest,
-				hasPaidCredits,
-			);
-			if (freeTurn.applies && !freeTurn.allowed) {
-				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
-					error: 'free_chat_limit_exhausted',
-					message: `You've used your ${freeTurn.limit} included Screenpipe Cloud chat turns. Upgrade, or keep using local/BYOK AI at no charge.`,
-					used: freeTurn.used,
-					limit: freeTurn.limit,
-					upgrade_url: 'https://screenpi.pe/onboarding',
-					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
-				})));
-			}
-
 			// Route latency-tolerant (background) traffic to the cheaper flex tier.
 			const latency = resolveLatencyClass(request, body, env);
+
+			// Commit every preview allowance at the provider-dispatch boundary, not
+			// after an HTTP response. A timeout, terminal 5xx, or exhausted fallback
+			// chain can consume paid provider work without ever producing a 2xx. Once
+			// this block succeeds, only the exact lease may be released; the lifetime
+			// turn, global/network counters, and retail dollar are non-refundable.
+			if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
+				try {
+					await acceptFreeChatTurn(
+						env,
+						authResult.userId,
+						freeTurn.turnHash,
+						freeTurn.leaseToken,
+					);
+					if (freeShadowReserved) {
+						await settleFreeChatShadowBudget(
+							env,
+							authResult.userId,
+							freeTurn.turnHash,
+							freeTurn.leaseToken,
+						);
+					}
+				} catch (error) {
+					captureException(error);
+					// No provider dispatch happened. Refund only an exact shadow row
+					// that is provably still reserved; a successfully settled row will
+					// reject this delete and remain conservatively consumed.
+					if (freeShadowReserved) {
+						await refundFreeChatShadowBudget(
+							env,
+							authResult.userId,
+							freeTurn.turnHash,
+							freeTurn.leaseToken,
+						).catch(captureException);
+					}
+					await releaseFreeChatTurn(
+						env,
+						authResult.userId,
+						freeTurn.turnHash,
+						freeTurn.leaseToken,
+					).catch(captureException);
+					return addCorsHeaders(createErrorResponse(503, JSON.stringify({
+						error: 'free_chat_dispatch_guard_unavailable',
+						message: 'The hosted preview safety ledger could not be committed, so no inference was started. Retry, upgrade, or use local/user-provided AI.',
+					})));
+				}
+			}
 
 			// Add credit info header if paid via credits. Time it for the cost log
 			// (Date.now advances across the upstream fetch I/O) — ≈ TTFB for stream,
 			// total for non-stream. Includes any router/embed overhead.
 			const reqStart = Date.now();
-			let response = await handleChatCompletions(body, env, latency, authResult.deviceId);
-			if (freeTurn.applies && freeTurn.allowed && freeTurn.isNew && authResult.userId) {
-				if (response.ok) {
-					ctx.waitUntil(completeFreeChatTurn(env, authResult.userId, freeTurn.turnHash));
-				} else {
-					ctx.waitUntil(releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash));
+			let response: Response;
+			try {
+				response = await handleChatCompletions(body, env, latency, authResult.deviceId);
+			} catch (error) {
+				if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
+					await releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken).catch(captureException);
 				}
+				throw error;
+			}
+			if (freeTurn.applies && freeTurn.allowed && authResult.userId) {
+				await settleFreeChatTurnResponse(
+					env,
+					authResult.userId,
+					freeTurn,
+					response,
+					ctx,
+					captureException,
+				);
 			}
 			const latencyMs = Date.now() - reqStart;
 			// Difficulty-router decision (null unless the router ran) for A/B measurement.
@@ -330,6 +607,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 		// Web search endpoint - uses Gemini's Google Search grounding
 		if (path === '/v1/web-search' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			// Track usage (counts as 1 query, web search uses gemini flash)
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, 'gemini-2.5-flash');
@@ -361,6 +640,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		}
 
 		if (path === '/v1/listen' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'cloud_transcription');
+			if (businessError) return businessError;
 			// Per-user daily cost cap for transcription
 			// 2x safety margin: free=$10/day, subscribed=$50/day
 			const dailyCost = await getDailyUserCost(env, authResult.deviceId);
@@ -396,13 +677,14 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 					estimated_cost_usd: estimatedCost,
 					endpoint: '/v1/listen',
 					stream: false,
-				}));
-			}
-
+					}));
+				}
 			return response;
 		}
 
 		if (path === '/v1/realtime' && request.method === 'GET') {
+			const businessError = hostedBusinessGate(env, authResult, 'cloud_transcription');
+			if (businessError) return businessError;
 			return await handleRealtimeTranscriptionUpgrade(request, env, ctx, authResult);
 		}
 
@@ -424,25 +706,37 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			return await handleTinfoilAttestation(env);
 		}
 		if (path === '/v1/tinfoil/chat/completions' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			return await handleTinfoilProxy(request, env, authResult, '/v1/chat/completions');
 		}
 		if (path === '/v1/tinfoil/responses' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			return await handleTinfoilProxy(request, env, authResult, '/v1/responses');
 		}
 
 		if (path === '/v1/voice/transcribe' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'cloud_transcription');
+			if (businessError) return businessError;
 			return await handleVoiceTranscription(request, env);
 		}
 
 		if (path === '/v1/voice/query' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			return await handleVoiceQuery(request, env);
 		}
 
 		if (path === '/v1/text-to-speech' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			return await handleTextToSpeech(request, env);
 		}
 
 		if (path === '/v1/voice/chat' && request.method === 'POST') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			return await handleVoiceChat(request, env);
 		}
 
@@ -455,6 +749,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		// The Agent SDK sends requests to ANTHROPIC_VERTEX_BASE_URL/v1/messages
 		if (path === '/v1/messages' && request.method === 'POST') {
 			console.log('Vertex AI proxy request to /v1/messages');
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 
 			// Require authentication for Agent SDK
 			if (authResult.tier === 'anonymous') {
@@ -568,6 +864,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 		// Requires logged-in user (not anonymous)
 		if (path === '/anthropic/v1/messages' && request.method === 'POST') {
 			console.log('OpenCode Anthropic proxy request to /anthropic/v1/messages');
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 
 			// Require authentication for OpenCode
 			if (authResult.tier === 'anonymous') {
@@ -683,6 +981,8 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 
 		// Anthropic models endpoint for OpenCode
 		if (path === '/anthropic/v1/models' && request.method === 'GET') {
+			const businessError = hostedBusinessGate(env, authResult, 'hosted_ai');
+			if (businessError) return businessError;
 			// Model discovery still consumes the server-side Anthropic credential and
 			// exposes the account's available model catalog. Keep it behind the same
 			// verified-identity boundary as the OpenCode messages endpoint.
@@ -784,6 +1084,9 @@ export default {
 			},
 			() => handleRequest(request, env, ctx)
 		);
+	},
+	async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+		ctx.waitUntil(pruneFreeChatNetworkDaily(env).catch(captureException));
 	},
 } satisfies ExportedHandler<Env>;
 

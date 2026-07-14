@@ -12,6 +12,7 @@ import { SelectableTextLayer, getSelectableLayerText, clearSelectableLayerSelect
 import { RegionOcrOverlay } from "@/components/rewind/region-ocr-overlay";
 import { useSearchHighlight } from "@/lib/hooks/use-search-highlight";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
 import { ImageOff, ChevronLeft, ChevronRight, Copy, ImageIcon, Link2, MessageCircle, Type } from "lucide-react";
 import { usePipes } from "@/lib/hooks/use-pipes";
 import { toast } from "@/components/ui/use-toast";
@@ -630,6 +631,7 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 				renderedImageInfo={renderedImageInfo}
 				naturalDimensions={naturalDimensions}
 				userToken={settings.user?.token ?? null}
+				hasHostedSubscription={hasCloudEntitlement(settings.user)}
 			/>
 
 		</div>

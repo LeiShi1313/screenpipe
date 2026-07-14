@@ -10,6 +10,10 @@ import { imageDataUrlsToPiImages } from "@/lib/chat/image-content";
 import { queuedPreviewForText } from "@/lib/chat/queued-display";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { buildSteerPrompt } from "@/components/chat/standalone/hooks/pi-steering-helpers";
+import {
+  markScreenpipeCloudTurn,
+  resolvePiDispatchProvider,
+} from "@/lib/chat/free-tier-turn-marker";
 import type {
   Message,
   OptimisticSteerPayload,
@@ -43,6 +47,7 @@ export function usePiSteeringTransport(
 ) {
   const {
     activePreset,
+    activePresetRef,
     beginQueuedAction,
     consumePendingAttachments,
     currentQueueSessionId,
@@ -50,6 +55,7 @@ export function usePiSteeringTransport(
     inputRef,
     isLoading,
     isStreaming,
+    lastPiDispatchPromptRef,
     lastUserMessageRef,
     optimisticSteerRef,
     pastedImages,
@@ -62,6 +68,7 @@ export function usePiSteeringTransport(
     piInfo,
     piMessageIdRef,
     piRateLimitRetries,
+    piRunningConfigRef,
     piSessionIdRef,
     piStreamingTextRef,
     registerTurnIntent,
@@ -137,7 +144,16 @@ export function usePiSteeringTransport(
     );
 
     const latest = batch[batch.length - 1];
-    const prompt = buildSteerPrompt(batch);
+    const prompt = markScreenpipeCloudTurn(
+      buildSteerPrompt(batch),
+      {
+        provider: resolvePiDispatchProvider(
+          piRunningConfigRef.current?.provider,
+          (activePresetRef?.current ?? activePreset)?.provider,
+          Boolean(piInfo?.running),
+        ),
+      },
+    );
     const preview = queuedPreviewForText(latest.content);
     const combinedImages = imageDataUrlsToPiImages(
       batch.flatMap((item) => item.images),
@@ -268,6 +284,7 @@ export function usePiSteeringTransport(
     }
 
     lastUserMessageRef.current = latest.content;
+    lastPiDispatchPromptRef.current = prompt;
     setIsLoading(true);
     setIsStreaming(true);
 
@@ -449,6 +466,8 @@ export function usePiSteeringTransport(
         if (!prepared) return;
         const { batch, latest, prompt, combinedImages } = prepared;
 
+        lastPiDispatchPromptRef.current = prompt;
+
         piActiveStopRequestedRef.current = true;
         const interruptedAssistantId =
           latest.interruptedAssistantId ?? null;
@@ -539,7 +558,7 @@ export function usePiSteeringTransport(
     const turnIntentId = existingTurnIntent?.id ?? `queued-steer-${prompt.id}`;
     const optimisticQueuedContent = existingTurnIntent?.kind === "steer"
       ? existingTurnIntent.preview
-      : existingTurnIntent?.content ?? queuedDisplay?.preview ?? prompt.preview;
+      : queuedDisplay?.preview ?? prompt.preview;
     const optimisticQueuedUser: Message = {
       id: turnIntentId,
       role: "user",

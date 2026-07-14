@@ -62,9 +62,21 @@ export async function validateAuth(request: Request, env: Env): Promise<AuthResu
 
   const token = authHeader.split(' ')[1];
 
-  // Allow test token in development mode
-  if (env.NODE_ENV === 'development' && token === 'test-token') {
-    console.log('using test token in development mode');
+  // Development auth must be both explicitly configured and confined to a
+  // loopback URL. A public Worker accidentally carrying NODE_ENV=development
+  // must never inherit a universal, well-known bearer credential.
+  const hostname = new URL(request.url).hostname.toLowerCase();
+  const isLoopback = hostname === 'localhost'
+    || hostname === '127.0.0.1'
+    || hostname === '::1'
+    || hostname === '[::1]';
+  if (
+    env.NODE_ENV === 'development'
+    && isLoopback
+    && Boolean(env.LOCAL_DEV_AUTH_TOKEN)
+    && token === env.LOCAL_DEV_AUTH_TOKEN
+  ) {
+    console.log('using explicitly configured local development token');
     return {
       isValid: true,
       tier: 'subscribed',
@@ -83,13 +95,39 @@ export async function validateAuth(request: Request, env: Env): Promise<AuthResu
     const resolvedUserId = clerkResult.userId;
     // Subscription lookup is safe only after the Clerk token has established
     // ownership of this user ID.
-    const { isValid: hasSubscription, userId } = await validateSubscriptionWithId(env, resolvedUserId);
-    const canonicalUserId = userId || resolvedUserId;
+    const directEntitlement = await validateSubscriptionWithId(env, resolvedUserId);
+    if (directEntitlement.isValid) {
+      const canonicalUserId = directEntitlement.userId || resolvedUserId;
+      return {
+        isValid: true,
+        tier: 'subscribed',
+        deviceId: canonicalUserId,
+        userId: canonicalUserId,
+      };
+    }
+
+    // `/api/user` is the canonical app entitlement resolver: unlike the
+    // consumer-only cloud_subscriptions query above, it also recognizes active
+    // enterprise_members and legacy enterprise admin seats. Consult it only
+    // after Clerk proves token ownership and the fast personal-sub check misses.
+    const appEntitlement = await validateScreenpipeToken(token, true);
+    const canonicalUserId = appEntitlement.userId || directEntitlement.userId || resolvedUserId;
+    if (appEntitlement.isValid) {
+      return {
+        isValid: true,
+        tier: appEntitlement.hasSubscription ? 'subscribed' : 'logged_in',
+        deviceId: canonicalUserId,
+        userId: canonicalUserId,
+      };
+    }
     return {
       isValid: true,
-      tier: hasSubscription ? 'subscribed' : 'logged_in',
+      tier: 'logged_in',
       deviceId: canonicalUserId,
       userId: canonicalUserId,
+      ...(directEntitlement.unavailable || appEntitlement.unavailable
+        ? { error: 'subscription_lookup_unavailable' }
+        : {}),
     };
   }
 
@@ -140,7 +178,10 @@ export async function validateAuthLegacy(request: Request, env: Env): Promise<{ 
 /**
  * Validates subscription and returns user ID
  */
-async function validateSubscriptionWithId(env: Env, token: string): Promise<{ isValid: boolean; userId?: string }> {
+async function validateSubscriptionWithId(
+  env: Env,
+  token: string,
+): Promise<{ isValid: boolean; userId?: string; unavailable?: boolean }> {
   const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const CLERK_USER_ID_REGEX = /^user_[a-zA-Z0-9]+$/;
 
@@ -178,9 +219,11 @@ async function validateSubscriptionWithId(env: Env, token: string): Promise<{ is
         hasSub = subs.length > 0;
       } else {
         console.error('Supabase subscription check failed', subsRes.status);
+        return { isValid: false, userId: resolvedUserId, unavailable: true };
       }
     } catch {
       console.error('UUID subscription check failed');
+      return { isValid: false, userId: resolvedUserId, unavailable: true };
     }
     // Always return resolvedUserId (clerk_id when available, UUID otherwise)
     // so the non-subscribed UUID branch upstream also keys on the same id.
@@ -200,6 +243,10 @@ async function validateSubscriptionWithId(env: Env, token: string): Promise<{ is
           },
         }
       );
+      if (!userResponse.ok) {
+        console.error('Clerk user lookup failed', userResponse.status);
+        return { isValid: false, userId: token, unavailable: true };
+      }
       if (userResponse.ok) {
         const users = await userResponse.json() as Array<{ id: string }>;
         if (users.length > 0) {
@@ -215,6 +262,10 @@ async function validateSubscriptionWithId(env: Env, token: string): Promise<{ is
               },
             }
           );
+          if (!response.ok) {
+            console.error('Clerk subscription lookup failed', response.status);
+            return { isValid: false, userId: token, unavailable: true };
+          }
           if (response.ok) {
             const subs = await response.json() as Array<{ id: string }>;
             if (subs.length > 0) {
@@ -225,6 +276,7 @@ async function validateSubscriptionWithId(env: Env, token: string): Promise<{ is
       }
     } catch {
       console.error('Clerk user subscription check failed');
+      return { isValid: false, userId: token, unavailable: true };
     }
     // Not subscribed - don't auto-grant, return false so it falls through
     return { isValid: false };
@@ -241,9 +293,19 @@ interface ScreenpipeUserData {
   clerk_id?: string;
   email?: string;
   cloud_subscribed?: boolean;
+  app_entitled?: boolean;
+  entitlement?: {
+    active?: boolean;
+    features?: { cloud?: boolean; enterprise?: boolean };
+  } | null;
 }
 
-async function validateScreenpipeToken(token: string): Promise<{ isValid: boolean; userId?: string; hasSubscription?: boolean }> {
+async function validateScreenpipeToken(token: string, identityAlreadyVerified = false): Promise<{
+  isValid: boolean;
+  userId?: string;
+  hasSubscription?: boolean;
+  unavailable?: boolean;
+}> {
   if (!token.startsWith('eyJ')) {
     return { isValid: false };
   }
@@ -267,14 +329,18 @@ async function validateScreenpipeToken(token: string): Promise<{ isValid: boolea
       return {
         isValid: true,
         userId,
-        hasSubscription: userData?.cloud_subscribed === true,
+        // App-only lifetime/manual entitlements do not fund hosted inference.
+        // Only the canonical cloud bit (including enterprise cloud seats) may
+        // lift a caller to the gateway's subscribed tier.
+        hasSubscription: userData.cloud_subscribed === true
+          || (userData.entitlement?.active === true && userData.entitlement.features?.cloud === true),
       };
     } else {
-      console.log('Invalid screenpipe user token');
-      return { isValid: false };
+      console.log('Screenpipe app entitlement lookup failed', response.status);
+      return { isValid: false, unavailable: identityAlreadyVerified || response.status >= 500 };
     }
   } catch {
     console.error('screenpipe token validation failed');
-    return { isValid: false };
+    return { isValid: false, unavailable: true };
   }
 }

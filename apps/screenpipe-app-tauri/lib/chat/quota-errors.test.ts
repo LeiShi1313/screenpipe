@@ -5,9 +5,12 @@
 import { describe, expect, it } from "vitest";
 import {
   buildDailyLimitMessage,
+  buildFreeChatLimitMessage,
   classifyQuotaError,
   FREE_CHAT_LIMIT_MESSAGE,
   isFreeChatLimitError,
+  parseFreeChatLimit,
+  parseFreeChatLimitMessage,
 } from "./quota-errors";
 
 describe("Free/Local hosted chat errors", () => {
@@ -28,5 +31,26 @@ describe("Free/Local hosted chat errors", () => {
     expect(message).toContain("ChatGPT/Codex");
     expect(message).toContain("Claude/OpenAI");
     expect(message).toContain("Ollama");
+  });
+
+  it.each([
+    [0, "0 included Screenpipe Cloud turns"],
+    [1, "1 included Screenpipe Cloud turn"],
+    [2, "2 included Screenpipe Cloud turns"],
+    [3, "3 included Screenpipe Cloud turns"],
+  ])("renders a runtime limit of %i without lying", (limit, expected) => {
+    const raw = JSON.stringify({ error: "free_chat_limit_exhausted", used: limit, limit });
+    expect(parseFreeChatLimit(raw)).toEqual({ used: limit, limit });
+    expect(buildDailyLimitMessage(raw)).toContain(expected);
+    expect(buildFreeChatLimitMessage(limit)).toContain(expected);
+  });
+
+  it("falls back to the launch default when an old gateway omits counters", () => {
+    expect(parseFreeChatLimit("free_chat_limit_exhausted")).toEqual({ used: 2, limit: 2 });
+  });
+
+  it("recovers the configured limit from the safe assistant copy", () => {
+    expect(parseFreeChatLimitMessage(buildFreeChatLimitMessage(3))).toEqual({ used: 3, limit: 3 });
+    expect(parseFreeChatLimitMessage("ordinary answer")).toBeNull();
   });
 });

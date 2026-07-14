@@ -82,8 +82,10 @@ import {
 import type { ContentBlock, Message } from "@/lib/chat/types";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { AGENT_TOPICS, type AgentEventEnvelope } from "@/lib/events/types";
-import { FREE_CHAT_LIMIT_MESSAGE } from "@/lib/chat/quota-errors";
+import { parseFreeChatLimitMessage } from "@/lib/chat/quota-errors";
+import { isScreenpipeCloudProvider } from "@/lib/chat/free-tier-turn-marker";
 import { FreeTierUpgradeDialog } from "@/components/chat/free-tier-upgrade-dialog";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
 
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
@@ -91,6 +93,7 @@ import { FreeTierUpgradeDialog } from "@/components/chat/free-tier-upgrade-dialo
 const APP_SUGGESTION_LIMIT = 10;
 const TAG_SUGGESTION_LIMIT = 10;
 const STREAM_RENDER_THROTTLE_MS = 80;
+const FREE_CHAT_HANDLED_ERRORS_KEY = "screenpipe_free_chat_handled_errors_v1";
 
 const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
   { tag: "@today", description: "today's activity", category: "time" },
@@ -201,6 +204,8 @@ export function StandaloneChat({
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [freeTierDialogOpen, setFreeTierDialogOpen] = useState(false);
+  const [freeTierLimit, setFreeTierLimit] = useState(2);
+  const handledFreeLimitIdsRef = useRef<Set<string> | null>(null);
   const activePresetRef = useRef<AIPreset | undefined>(activePreset);
   activePresetRef.current = activePreset;
 
@@ -481,6 +486,7 @@ export function StandaloneChat({
   }, [updateSettings]);
 
   const lastUserMessageRef = useRef<string>("");
+  const lastPiDispatchPromptRef = useRef<string>("");
 
   // Ref to sendMessage so useEffect callbacks can call it without stale closures
   const sendMessageRef = useRef<(msg: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>>();
@@ -500,6 +506,19 @@ export function StandaloneChat({
   const [conversationId, setConversationId] = useState<string | null>(
     initialSessionIdRef.current,
   );
+  const runningConfigSessionIdRef = useRef(initialSessionIdRef.current);
+  useEffect(() => {
+    if (!conversationId || runningConfigSessionIdRef.current === conversationId) return;
+    // Pi processes are keyed by conversation. Never carry provider truth or
+    // retry bytes from the previous native session into an already-running
+    // session we are attaching to; until status is rediscovered, dispatch
+    // policy falls back to the explicit active preset only if Pi is confirmed
+    // running.
+    runningConfigSessionIdRef.current = conversationId;
+    piRunningConfigRef.current = null;
+    lastPiDispatchPromptRef.current = "";
+    setPiInfo(null);
+  }, [conversationId, lastPiDispatchPromptRef, piRunningConfigRef, setPiInfo]);
 
   // Single source of truth for the active chat id (#4719). The panel mints
   // `initialSessionIdRef` and seeds `conversationId` / `piSessionIdRef` from
@@ -534,12 +553,46 @@ export function StandaloneChat({
   const messages = (pipeWatchMessages ?? localMessages) as Message[];
 
   useEffect(() => {
-    if (activePreset?.provider !== "screenpipe-cloud") return;
-    const hitFreeLimit = messages.some(
-      (message) => message.role === "assistant" && message.content === FREE_CHAT_LIMIT_MESSAGE,
-    );
-    if (hitFreeLimit) setFreeTierDialogOpen(true);
-  }, [messages, activePreset?.provider]);
+    const runningProvider = piRunningConfigRef.current?.provider ?? activePreset?.provider;
+    if (!isScreenpipeCloudProvider(runningProvider)) return;
+
+    if (!handledFreeLimitIdsRef.current) {
+      let stored: string[] = [];
+      try {
+        const raw = window.localStorage.getItem(FREE_CHAT_HANDLED_ERRORS_KEY);
+        stored = raw ? JSON.parse(raw) : [];
+      } catch {
+        stored = [];
+      }
+      handledFreeLimitIdsRef.current = new Set(
+        stored.filter((value) => typeof value === "string"),
+      );
+    }
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "assistant" || typeof message.content !== "string") continue;
+      const quota = parseFreeChatLimitMessage(message.content);
+      if (!quota) continue;
+
+      const errorId = `${conversationId ?? "new"}:${message.id ?? index}`;
+      if (handledFreeLimitIdsRef.current.has(errorId)) return;
+      handledFreeLimitIdsRef.current.add(errorId);
+      setFreeTierLimit(quota.limit);
+      setFreeTierDialogOpen(true);
+      try {
+        const recentIds = [...handledFreeLimitIdsRef.current].slice(-100);
+        window.localStorage.setItem(
+          FREE_CHAT_HANDLED_ERRORS_KEY,
+          JSON.stringify(recentIds),
+        );
+      } catch {
+        // The in-memory set still prevents repeat walls when webview storage
+        // is unavailable.
+      }
+      return;
+    }
+  }, [messages, activePreset?.provider, conversationId, piRunningConfigRef]);
 
   const {
     consumePendingAttachments,
@@ -856,6 +909,7 @@ export function StandaloneChat({
     isSettingsLoaded,
     shouldFreezePresetSelection: Boolean(activePipeExecution),
     userToken: settings.user?.token,
+    hasHostedSubscription: hasCloudEntitlement(settings.user),
     appItems,
     allConnectionItems,
     connections,
@@ -927,6 +981,7 @@ export function StandaloneChat({
     inputRef,
     isLoading,
     isStreaming,
+    lastPiDispatchPromptRef,
     lastUserMessageRef,
     messages,
     optimisticSteerRef,
@@ -942,6 +997,7 @@ export function StandaloneChat({
     piMessageIdRef,
     piPresetSwitchPromiseRef,
     piRateLimitRetries,
+    piRunningConfigRef,
     piSessionIdRef,
     piSessionSyncedRef,
     piStartInFlightRef,
@@ -1146,6 +1202,7 @@ export function StandaloneChat({
     forceQueueModeRef,
     handleAgentEventDataRef,
     handleInvalidatedAuthToken,
+    lastPiDispatchPromptRef,
     lastUserMessageRef,
     markTurnIntentConsumed,
     messages,
@@ -1578,9 +1635,11 @@ export function StandaloneChat({
       <ImageViewerDialog {...imageViewerProps} />
       <FreeTierUpgradeDialog
         open={freeTierDialogOpen}
+        limit={freeTierLimit}
+        plan={settings.user?.subscription_plan ?? null}
+        userToken={settings.user?.token}
         onOpenChange={setFreeTierDialogOpen}
         onChooseOwnAI={async () => {
-          setFreeTierDialogOpen(false);
           await commands.showWindow({ Home: { page: "ai" } });
         }}
       />

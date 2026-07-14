@@ -1430,8 +1430,8 @@ async fn main() {
             'start_server: {
                 let store_clone = store.clone();
                 let data_dir_clone = data_dir.clone();
-                if !store_clone.app_entitled_or_dev() {
-                    info!("Skipping server auto-start: active screenpipe plan required");
+                if !crate::recording::recording_access_allowed(&store_clone) {
+                    info!("Skipping server auto-start: active enterprise screenpipe plan required");
                     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
                     let _ = app_handle.emit("app-entitlement-required", ());
                     break 'start_server;
@@ -1818,7 +1818,7 @@ async fn main() {
             // Initialize enhanced AI config from saved settings
             {
                 if let Ok(Some(store)) = crate::store::SettingsStore::get(&app_handle) {
-                    if store.enhanced_ai {
+                    if store.enhanced_ai && store.cloud_transcription_entitled() {
                         // #3943: the token no longer persists in store.bin —
                         // fall back to the secret-store-backed cache.
                         let token = store

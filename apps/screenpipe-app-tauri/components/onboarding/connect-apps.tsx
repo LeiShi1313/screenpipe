@@ -20,6 +20,7 @@ import { readTextFile, writeFile, mkdir } from "@tauri-apps/plugin-fs";
 import { homeDir, join, dirname } from "@tauri-apps/api/path";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
+import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
 
@@ -523,7 +524,7 @@ interface ConnectAppsProps {
 }
 
 export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
-  const { settings, loadUser } = useSettings();
+  const { settings, loadUser, updateSettings } = useSettings();
   const isPro = !!settings.user?.cloud_subscribed;
 
   const [cardStates, setCardStates] = useState<Record<string, CardState>>({});
@@ -678,6 +679,11 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
         if (integration.type === "chatgpt") {
           const res = await commands.chatgptOauthLogin();
           if (res.status === "ok" && res.data) {
+            await ensureChatGptPreset(
+              settings.aiPresets || [],
+              (presets) => updateSettings({ aiPresets: presets }),
+              { makeDefault: true },
+            );
             setCardState(integration.cardKey, "connected");
             setDisplayNames((prev) => ({ ...prev, [integration.cardKey]: "ChatGPT Plus" }));
             posthog.capture("onboarding_integration_connected", { integration: integration.id });
@@ -761,7 +767,7 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
         }
       }
     },
-    [isPro, setCardState]
+    [isPro, setCardState, settings.aiPresets, updateSettings]
   );
 
   const handleContinue = useCallback(() => {

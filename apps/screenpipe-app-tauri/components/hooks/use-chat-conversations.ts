@@ -43,6 +43,8 @@ import {
   type ConversationMeta,
 } from "@/lib/chat-storage";
 import type { ContentBlock, Message } from "@/lib/chat/types";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
+import { canUseProviderForAuxiliaryAI } from "@/lib/chat/free-tier-turn-marker";
 
 // --- Hook options ---
 
@@ -565,6 +567,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // Opt-out: when the user disables auto title generation (to save tokens),
     // skip the extra LLM call entirely — chats keep the fallback title.
     const autoTitleEnabled = settings?.autoGenerateChatTitles !== false;
+    const titleProviderIsFunded = canUseProviderForAuxiliaryAI(
+      currentPreset?.provider,
+      hasCloudEntitlement(settings?.user),
+    );
     // Skip AI titling for pipe executions — their title is always
     // `pipeName #executionId`, set by the recorder / watch session.
     // Only allow AI titles when the user manually renames (titleSource
@@ -572,6 +578,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const isPipeChat = existing?.kind === "pipe-run" || existing?.kind === "pipe-watch";
     if (
       autoTitleEnabled &&
+      titleProviderIsFunded &&
       !isPipeChat &&
       titleSource === "fallback" &&
       rawContent &&

@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
     status: "ok",
     data: { connected: false },
   }),
+  hasHostedSubscription: true,
+  provider: "screenpipe-cloud",
 }));
 
 vi.mock("@/lib/hooks/use-onboarding", () => ({
@@ -29,6 +31,20 @@ vi.mock("@/lib/notifications", () => ({
 
 vi.mock("@/lib/api", () => ({
   localFetch: mocks.localFetch,
+}));
+
+vi.mock("@/lib/hooks/use-settings", () => ({
+  useSettings: () => ({
+    settings: {
+      user: { hasHostedSubscription: mocks.hasHostedSubscription },
+      aiPresets: [{ id: "default", provider: mocks.provider, defaultPreset: true }],
+    },
+  }),
+}));
+
+vi.mock("@/lib/app-entitlement", () => ({
+  hasCloudEntitlement: (user: { hasHostedSubscription?: boolean } | null | undefined) =>
+    user?.hasHostedSubscription === true,
 }));
 
 vi.mock("@/lib/utils/tauri", () => ({
@@ -77,6 +93,8 @@ describe("PickPipe", () => {
       data: { connected: false },
     });
     mocks.completeOnboarding.mockResolvedValue(undefined);
+    mocks.hasHostedSubscription = true;
+    mocks.provider = "screenpipe-cloud";
   });
 
   afterEach(() => {
@@ -175,5 +193,61 @@ describe("PickPipe", () => {
     ).toBe(false);
     expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
     expect(mocks.scheduleFirstRunNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers hosted AI pipes entirely for a free account", async () => {
+    vi.useRealTimers();
+    mocks.hasHostedSubscription = false;
+    mockSuccessfulPipeEnable("personal-crm");
+
+    await act(async () => {
+      render(<PickPipe />);
+    });
+
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /your ai twin: writes and acts like you/i,
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /finish — add ai later/i }));
+    });
+
+    await waitFor(() => {
+      expect(mocks.completeOnboarding).toHaveBeenCalledTimes(1);
+    });
+    expect(
+      mocks.localFetch.mock.calls.some(([url]) => String(url).includes("/pipes/")),
+    ).toBe(false);
+    expect(
+      mocks.localFetch.mock.calls.some(([url]) => url === "/pipes/personal-crm/run"),
+    ).toBe(false);
+  });
+
+  it("enables pipes for a free user with their own local provider", async () => {
+    vi.useRealTimers();
+    mocks.hasHostedSubscription = false;
+    mocks.provider = "native-ollama";
+    mockSuccessfulPipeEnable("personal-crm");
+
+    await act(async () => {
+      render(<PickPipe />);
+    });
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /your ai twin: writes and acts like you/i,
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /turn it on/i }));
+    });
+
+    await waitFor(() => {
+      expect(mocks.localFetch).toHaveBeenCalledWith(
+        "/pipes/personal-crm/enable",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
   });
 });

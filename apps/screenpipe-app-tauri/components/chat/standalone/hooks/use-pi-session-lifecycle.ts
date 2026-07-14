@@ -9,6 +9,10 @@ import { toast } from "@/components/ui/use-toast";
 import { buildAppAwarenessContext, buildConnectionsContext, buildSystemPrompt } from "@/lib/chat/system-prompt";
 import { commands, type AIPreset, type PiInfo, type PiProviderConfig } from "@/lib/utils/tauri";
 import type { ActivityAppItem, ConnectedIntegration, ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import {
+  isScreenpipeCloudProvider,
+  resolveScreenpipeCloudModel,
+} from "@/lib/chat/free-tier-turn-marker";
 
 type PiRunningConfig = {
   provider: string;
@@ -32,6 +36,7 @@ interface UsePiSessionLifecycleOptions {
   isSettingsLoaded: boolean;
   shouldFreezePresetSelection: boolean;
   userToken: string | null | undefined;
+  hasHostedSubscription: boolean;
   appItems: ActivityAppItem[];
   allConnectionItems: ConnectionListItem[];
   connections: ConnectedIntegration[];
@@ -56,6 +61,7 @@ export function usePiSessionLifecycle({
   isSettingsLoaded,
   shouldFreezePresetSelection,
   userToken,
+  hasHostedSubscription,
   appItems,
   allConnectionItems,
   connections,
@@ -114,13 +120,14 @@ export function usePiSessionLifecycle({
 
   const hasPresets = Boolean(aiPresets && aiPresets.length > 0);
   const hasValidModel = Boolean(activePreset?.model && activePreset.model.trim() !== "");
-  const needsLogin = activePreset?.provider === "screenpipe-cloud" && !userToken;
-  const canChat = hasPresets && hasValidModel && !piStarting;
+  const needsLogin = isScreenpipeCloudProvider(activePreset?.provider) && !userToken;
+  const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
 
   const disabledReason = (() => {
     if (!hasPresets) return "No AI presets configured";
     if (!activePreset) return "No preset selected";
     if (!hasValidModel) return `No model selected in "${activePreset.id}" preset`;
+    if (needsLogin) return "Sign in for the included Screenpipe Cloud preview, or choose your own AI";
     if (piStarting) return "Starting Pi agent...";
     return null;
   })();
@@ -128,6 +135,11 @@ export function usePiSessionLifecycle({
   const buildProviderConfig = useCallback((preset?: AIPreset | null): ResolvedPiProviderConfig | null => {
     const p = preset || activePreset;
     if (!p) return null;
+    // Native Pi historically mapped a custom preset with no URL to its
+    // catch-all Screenpipe Cloud provider. Treat an incomplete custom preset
+    // as unstartable here so a user-owned-provider failure can never cross the
+    // hosted payer boundary through that native fallback.
+    if (p.provider === "custom" && !p.url?.trim()) return null;
     const presetPrompt = p.prompt || "";
     const connectionsCtx = buildConnectionsContext(connections);
     const appAwarenessCtx = buildAppAwarenessContext({
@@ -138,7 +150,11 @@ export function usePiSessionLifecycle({
     return {
       provider: p.provider,
       url: p.url || "",
-      model: p.model || "",
+      model: resolveScreenpipeCloudModel(
+        p.provider,
+        p.model,
+        hasHostedSubscription,
+      ),
       apiKey: p.apiKey || null,
       maxTokens: p.maxTokens ?? 4096,
       systemPrompt,
@@ -153,6 +169,7 @@ export function usePiSessionLifecycle({
     allConnectionItems,
     appItems,
     connections,
+    hasHostedSubscription,
   ]);
 
   const setRunningConfigFromProviderConfig = useCallback((providerConfig: ResolvedPiProviderConfig) => {

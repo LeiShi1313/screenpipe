@@ -7,7 +7,8 @@
     "deploy:no-sourcemaps": "wrangler deploy",
     "dev": "wrangler dev",
     "start": "wrangler dev",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "test:money-guards": "bun test src/services/free-chat-turns.test.ts src/test/free-tier-route-gates.unit.test.ts src/test/free-preview-routing.unit.test.ts src/test/gemini.unit.test.ts src/test/auto-cost-attribution.unit.test.ts src/utils/auth.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260307.1",

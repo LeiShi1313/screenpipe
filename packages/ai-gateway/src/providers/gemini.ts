@@ -344,6 +344,13 @@ export class GeminiProvider implements AIProvider {
 				temperature: body.temperature ?? 0.7,
 			},
 		};
+		const requestedMaxOutputTokens = body.max_completion_tokens ?? body.max_tokens;
+		if (typeof requestedMaxOutputTokens === 'number' && Number.isFinite(requestedMaxOutputTokens)) {
+			// The free preview clamps this to 4,096 before provider routing. Forward
+			// the cap to Gemini too; otherwise the final Gemini fallback can generate
+			// up to its model default and escape the retail shadow-cost bound.
+			requestBody.generationConfig.maxOutputTokens = Math.max(1, Math.floor(requestedMaxOutputTokens));
+		}
 
 		if (systemMsg) {
 			const systemText = typeof systemMsg.content === 'string' ? systemMsg.content : '';

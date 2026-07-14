@@ -67,6 +67,31 @@ describe('GeminiProvider endpoint URL routing', () => {
 	});
 });
 
+describe('GeminiProvider generation bounds', () => {
+	const provider = new GeminiProvider('fake-api-key') as any;
+
+	it('forwards the preview max_tokens cap to Gemini maxOutputTokens', () => {
+		const requestBody = provider.buildRequestBody({
+			model: 'gemini-3-flash',
+			messages: [{ role: 'user', content: 'bounded preview' }],
+			max_tokens: 4_096,
+		});
+
+		expect(requestBody.generationConfig.maxOutputTokens).toBe(4_096);
+	});
+
+	it('prefers max_completion_tokens and normalizes it to a positive integer', () => {
+		const requestBody = provider.buildRequestBody({
+			model: 'gemini-3-flash',
+			messages: [{ role: 'user', content: 'bounded preview' }],
+			max_tokens: 4_096,
+			max_completion_tokens: 123.9,
+		});
+
+		expect(requestBody.generationConfig.maxOutputTokens).toBe(123);
+	});
+});
+
 describe('GeminiProvider tool schema conversion (Sentry SCREENPIPE-AI-PROXY-9)', () => {
 	const provider = new GeminiProvider('fake-api-key') as any;
 	const convert = (p: any) => provider.convertParametersToGeminiSchema(p);

@@ -60,9 +60,44 @@ jobs:
       - name: Install deps
         run: bun install --frozen-lockfile
 
+      - name: Test hosted-AI money guards
+        run: bun run test:money-guards
+
+      - name: Verify Worker bundle
+        run: bunx wrangler deploy --dry-run --outdir /tmp/ai-gateway-dry-run
+
+      - name: Validate expected free-tier rollout invariant
+        env:
+          EXPECTED_ENFORCEMENT: ${{ vars.FREE_LOCAL_TIER_ENFORCEMENT_EXPECTED || 'false' }}
+          EXPECTED_PREVIEW: ${{ vars.FREE_CHAT_PREVIEW_EXPECTED || 'false' }}
+        run: |
+          expected_enforcement="$(printf '%s' "$EXPECTED_ENFORCEMENT" | tr '[:upper:]' '[:lower:]' | xargs)"
+          expected_preview="$(printf '%s' "$EXPECTED_PREVIEW" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [ "$expected_preview" = "true" ] && [ "$expected_enforcement" != "true" ]; then
+            echo "::error::FREE_CHAT_PREVIEW_EXPECTED=true requires FREE_LOCAL_TIER_ENFORCEMENT_EXPECTED=true"
+            exit 1
+          fi
+
       - name: Deploy worker (build + Sentry source maps + wrangler deploy)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: bun run deploy
+
+      - name: Verify effective free-tier rollout state
+        env:
+          EXPECTED_ENFORCEMENT: ${{ vars.FREE_LOCAL_TIER_ENFORCEMENT_EXPECTED || 'false' }}
+          EXPECTED_PREVIEW: ${{ vars.FREE_CHAT_PREVIEW_EXPECTED || 'false' }}
+        run: |
+          headers="$(curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 3 --dump-header - --output /dev/null https://api.screenpi.pe/test)"
+          enforcement="$(printf '%s\n' "$headers" | awk -F': *' 'tolower($1) == "x-free-local-tier-enforcement" { gsub("\\r", "", $2); print tolower($2); exit }')"
+          preview="$(printf '%s\n' "$headers" | awk -F': *' 'tolower($1) == "x-free-chat-preview" { gsub("\\r", "", $2); print tolower($2); exit }')"
+          expected_enforcement="$(printf '%s' "$EXPECTED_ENFORCEMENT" | tr '[:upper:]' '[:lower:]' | xargs)"
+          expected_preview="$(printf '%s' "$EXPECTED_PREVIEW" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [ "$preview" = "true" ] && [ "$enforcement" != "true" ]; then
+            echo "::error::deployed preview is enabled while free-tier enforcement is disabled"
+            exit 1
+          fi
+          test "$enforcement" = "$expected_enforcement"
+          test "$preview" = "$expected_preview"

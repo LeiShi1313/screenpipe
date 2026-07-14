@@ -1112,6 +1112,7 @@ pub struct User {
     pub app_entitled: Option<bool>,
     pub subscription_plan: Option<String>,
     pub entitlement: Option<serde_json::Value>,
+    pub enterprise_account: Option<serde_json::Value>,
 }
 
 impl Default for User {
@@ -1136,6 +1137,7 @@ impl Default for User {
             app_entitled: None,
             subscription_plan: None,
             entitlement: None,
+            enterprise_account: None,
         }
     }
 }
@@ -1552,7 +1554,27 @@ impl SettingsStore {
         data_dir: std::path::PathBuf,
     ) -> screenpipe_engine::RecordingConfig {
         let resolved_engine = self.audio_engine_resolution().active;
-        let settings = self.to_recording_settings();
+        let mut settings = self.to_recording_settings();
+        if !self.cloud_transcription_entitled() {
+            // A Clerk login token alone must never silently enable a paid
+            // streaming path. `MeetingStreamingConfig::from_settings` promotes
+            // `selected-engine` to Screenpipe Cloud whenever a token exists,
+            // so strip the hosted credential for free accounts and normalize
+            // an explicitly persisted cloud choice back to the local engine.
+            // Direct Deepgram remains available because it uses the user's own
+            // API key rather than this Screenpipe credential.
+            settings.user_id.clear();
+            if matches!(
+                settings
+                    .meeting_live_transcription_provider
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "screenpipe-cloud" | "screenpipe_cloud" | "screenpipe" | "cloud"
+            ) {
+                settings.meeting_live_transcription_provider = "selected-engine".to_string();
+            }
+        }
         let mut config = screenpipe_engine::RecordingConfig::from_settings(
             &settings,
             data_dir,
@@ -1617,8 +1639,50 @@ impl SettingsStore {
         entitlement_checked_recently(entitlement) && entitlement_active(entitlement)
     }
 
-    fn cloud_transcription_entitled(&self) -> bool {
-        self.has_current_app_entitlement()
+    /// Consumer binaries must not record behind an org's mandatory-enterprise-
+    /// app screen. A separate consumer subscription remains a valid opt-out,
+    /// matching the frontend policy in `hasConsumerAppSubscription`.
+    pub(crate) fn requires_enterprise_app_for_consumer(&self) -> bool {
+        let requires_enterprise_app = self
+            .user
+            .enterprise_account
+            .as_ref()
+            .and_then(|account| account.get("requires_enterprise_app"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !requires_enterprise_app {
+            return false;
+        }
+
+        let consumer_source = self
+            .user
+            .entitlement
+            .as_ref()
+            .and_then(|entitlement| entitlement.get("source"))
+            .and_then(serde_json::Value::as_str)
+            .map(|source| {
+                matches!(
+                    source.to_ascii_lowercase().as_str(),
+                    "subscription" | "manual" | "lifetime"
+                )
+            })
+            .unwrap_or(false);
+
+        !(consumer_source && self.has_current_app_entitlement())
+    }
+
+    pub(crate) fn cloud_transcription_entitled(&self) -> bool {
+        let Some(entitlement) = self.user.entitlement.as_ref() else {
+            return false;
+        };
+
+        // Hosted transcription is a cloud feature, not an app-access feature.
+        // Lifetime/manual/app-only grants keep the local recorder available but
+        // must not unlock an ongoing server-cost path. Unlike local app access,
+        // cloud access always requires a fresh entitlement snapshot.
+        entitlement_feature(entitlement, "cloud")
+            && entitlement_checked_recently(entitlement)
+            && (entitlement_active(entitlement) || entitlement_has_future_grace(entitlement))
     }
 
     pub fn audio_engine_resolution(&self) -> AudioEngineResolution {
@@ -2116,6 +2180,54 @@ mod tests {
     }
 
     #[test]
+    fn mandatory_enterprise_app_policy_is_deserialized_for_native_guards() {
+        let store: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": [],
+            "user": {
+                "enterprise_account": {
+                    "org_name": "Bungalow",
+                    "requires_enterprise_app": true
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(store.requires_enterprise_app_for_consumer());
+    }
+
+    #[test]
+    fn separate_consumer_subscription_overrides_enterprise_app_routing() {
+        let mut store = SettingsStore::default();
+        store.user.enterprise_account = Some(json!({ "requires_enterprise_app": true }));
+        store.user.app_entitled = Some(true);
+        store.user.entitlement = Some(json!({
+            "active": true,
+            "plan": "pro",
+            "source": "subscription",
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+            "features": { "app": true, "cloud": true }
+        }));
+
+        assert!(!store.requires_enterprise_app_for_consumer());
+    }
+
+    #[test]
+    fn enterprise_org_entitlement_does_not_bypass_consumer_app_routing() {
+        let mut store = SettingsStore::default();
+        store.user.enterprise_account = Some(json!({ "requires_enterprise_app": true }));
+        store.user.app_entitled = Some(true);
+        store.user.entitlement = Some(json!({
+            "active": true,
+            "plan": "enterprise",
+            "source": "enterprise",
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+            "features": { "app": true, "cloud": true }
+        }));
+
+        assert!(store.requires_enterprise_app_for_consumer());
+    }
+
+    #[test]
     fn screenpipe_cloud_falls_back_when_not_logged_in() {
         let mut store = SettingsStore::default();
         store.recording.audio_transcription_engine = "screenpipe-cloud".to_string();
@@ -2170,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn screenpipe_cloud_stays_active_for_app_entitled_users() {
+    fn screenpipe_cloud_falls_back_for_app_only_entitlement() {
         let mut store = SettingsStore::default();
         store.recording.audio_transcription_engine = "screenpipe-cloud".to_string();
         store.user.token = Some("token".to_string());
@@ -2187,8 +2299,54 @@ mod tests {
 
         let resolution = store.audio_engine_resolution();
 
+        assert_eq!(resolution.active, FALLBACK_ENGINE);
+        assert_eq!(
+            resolution.fallback_reason,
+            Some(AudioEngineFallbackReason::NotSubscribed)
+        );
+    }
+
+    #[test]
+    fn screenpipe_cloud_stays_active_for_fresh_cloud_entitlement() {
+        let mut store = SettingsStore::default();
+        store.recording.audio_transcription_engine = "screenpipe-cloud".to_string();
+        store.user.token = Some("token".to_string());
+        store.user.app_entitled = Some(true);
+        store.user.entitlement = Some(json!({
+            "active": true,
+            "plan": "pro",
+            "source": "subscription",
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+            "features": { "app": true, "cloud": true }
+        }));
+
+        let resolution = store.audio_engine_resolution();
+
         assert_eq!(resolution.active, "screenpipe-cloud");
         assert_eq!(resolution.fallback_reason, None);
+    }
+
+    #[test]
+    fn stale_cloud_entitlement_cannot_start_hosted_transcription() {
+        let mut store = SettingsStore::default();
+        store.recording.audio_transcription_engine = "screenpipe-cloud".to_string();
+        store.user.token = Some("token".to_string());
+        store.user.app_entitled = Some(true);
+        store.user.entitlement = Some(json!({
+            "active": true,
+            "plan": "pro",
+            "source": "subscription",
+            "checked_at": (chrono::Utc::now() - chrono::Duration::hours(96)).to_rfc3339(),
+            "features": { "app": true, "cloud": true }
+        }));
+
+        let resolution = store.audio_engine_resolution();
+
+        assert_eq!(resolution.active, FALLBACK_ENGINE);
+        assert_eq!(
+            resolution.fallback_reason,
+            Some(AudioEngineFallbackReason::NotSubscribed)
+        );
     }
 
     #[test]
@@ -2220,6 +2378,72 @@ mod tests {
             resolution.fallback_reason,
             Some(AudioEngineFallbackReason::MissingDeepgramKey)
         );
+    }
+
+    #[test]
+    fn free_account_cannot_auto_promote_live_meetings_to_screenpipe_cloud() {
+        let mut store = SettingsStore::default();
+        store.user.token = Some("free-token".to_string());
+        store.recording.meeting_live_transcription_enabled = true;
+        store.recording.meeting_live_transcription_provider = "selected-engine".to_string();
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = store.to_recording_config(temp.path().to_path_buf());
+
+        assert_eq!(config.meeting_streaming.provider.as_str(), "selected-engine");
+        assert!(config.meeting_streaming.auth_token.is_none());
+    }
+
+    #[test]
+    fn free_account_explicit_cloud_live_choice_falls_back_local() {
+        let mut store = SettingsStore::default();
+        store.user.token = Some("free-token".to_string());
+        store.recording.meeting_live_transcription_enabled = true;
+        store.recording.meeting_live_transcription_provider = "screenpipe-cloud".to_string();
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = store.to_recording_config(temp.path().to_path_buf());
+
+        assert_eq!(config.meeting_streaming.provider.as_str(), "selected-engine");
+        assert!(config.meeting_streaming.auth_token.is_none());
+    }
+
+    #[test]
+    fn subscribed_account_keeps_cloud_live_auto_promotion() {
+        let mut store = SettingsStore::default();
+        store.user.token = Some("paid-token".to_string());
+        store.user.app_entitled = Some(true);
+        store.user.entitlement = Some(json!({
+            "active": true,
+            "plan": "business",
+            "source": "subscription",
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+            "features": { "app": true, "cloud": true }
+        }));
+        store.recording.meeting_live_transcription_enabled = true;
+        store.recording.meeting_live_transcription_provider = "selected-engine".to_string();
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = store.to_recording_config(temp.path().to_path_buf());
+
+        assert_eq!(config.meeting_streaming.provider.as_str(), "screenpipe-cloud");
+        assert_eq!(config.meeting_streaming.auth_token.as_deref(), Some("paid-token"));
+    }
+
+    #[test]
+    fn free_account_keeps_user_funded_deepgram_live() {
+        let mut store = SettingsStore::default();
+        store.user.token = Some("free-token".to_string());
+        store.recording.meeting_live_transcription_enabled = true;
+        store.recording.meeting_live_transcription_provider = "deepgram-live".to_string();
+        store.recording.deepgram_api_key = "dg-user-key".to_string();
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = store.to_recording_config(temp.path().to_path_buf());
+
+        assert_eq!(config.meeting_streaming.provider.as_str(), "deepgram-live");
+        assert_eq!(config.meeting_streaming.api_key.as_deref(), Some("dg-user-key"));
+        assert!(config.meeting_streaming.auth_token.is_none());
     }
 
     // ---- Settings-loss recovery ----

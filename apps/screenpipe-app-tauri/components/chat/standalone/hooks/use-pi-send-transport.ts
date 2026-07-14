@@ -22,7 +22,11 @@ import {
 } from "@/components/chat/standalone/hooks/pi-message-preparation";
 import type { Message } from "@/lib/chat/types";
 import type { PiSendTransportOptions } from "@/components/chat/standalone/hooks/pi-types";
-import { markScreenpipeCloudTurn } from "@/lib/chat/free-tier-turn-marker";
+import {
+  markScreenpipeCloudTurn,
+  payerSafePiAutoStartPresets,
+  resolvePiDispatchProvider,
+} from "@/lib/chat/free-tier-turn-marker";
 
 export function usePiSendTransport(options: PiSendTransportOptions) {
   const {
@@ -40,6 +44,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     inputRef,
     isLoading,
     isStreaming,
+    lastPiDispatchPromptRef,
     lastUserMessageRef,
     messages,
     pastedImages,
@@ -50,6 +55,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     piMessageIdRef,
     piPresetSwitchPromiseRef,
     piRateLimitRetries,
+    piRunningConfigRef,
     piSessionIdRef,
     piSessionSyncedRef,
     piStartInFlightRef,
@@ -168,15 +174,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         piStartInFlightRef.current = true;
         setPiStarting(true);
 
-        // Build a list of presets to try: active first, then other available
-        // presets as fallbacks. This ensures that if the active preset fails
-        // (e.g. ChatGPT OAuth expired), we try alternatives before giving up.
+        // Try only the explicitly selected preset. A failed local/BYOK preset
+        // must not upload context or charge a different provider, and a failed
+        // hosted preset must not start charging a configured user API key.
         const activeP = getActivePreset();
         const allPresets = settings.aiPresets ?? [];
-        const fallbackPresets = allPresets.filter(
-          (p) => p.id !== activeP?.id && p.model && p.model.trim() !== "",
-        );
-        const presetsToTry = activeP ? [activeP, ...fallbackPresets] : [...fallbackPresets];
+        const presetsToTry = payerSafePiAutoStartPresets(activeP, allPresets);
 
         let started = false;
         let lastError = "";
@@ -295,6 +298,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     piContentBlocksRef.current = [];
 
     piRateLimitRetries.current = 0;
+    lastPiDispatchPromptRef.current = "";
     lastUserMessageRef.current = userMessage;
 
     // The id this turn is dispatched and streamed under — the single source of
@@ -465,10 +469,21 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       // `piSessionSyncedRef` is kept around because other code paths
       // (preset change, reauth, the conversation-load handler) still
       // toggle it for diagnostics, but it no longer gates injection.
-      const promptMessage = markScreenpipeCloudTurn(
-        promptWithConversationHistory(userMessage, messages),
-        getActivePreset(),
+      const basePromptMessage = promptWithConversationHistory(userMessage, messages);
+      let promptMessage = markScreenpipeCloudTurn(
+        basePromptMessage,
+        {
+          provider: resolvePiDispatchProvider(
+            piRunningConfigRef.current?.provider,
+            getActivePreset()?.provider,
+            Boolean(piInfo?.running),
+          ),
+        },
       );
+      // Preserve the exact dispatched prompt (including conversation history
+      // and the one opaque cloud-turn marker) for automatic first-call / 429
+      // retries. A retry must never mint a second free hosted turn.
+      lastPiDispatchPromptRef.current = promptMessage;
       piSessionSyncedRef.current = true;
 
       // E2E test hook — write to __e2ePiPromptCaptures when the recorder is installed
@@ -542,6 +557,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
             piSessionSyncedRef.current = false;
             if (providerConfig) {
               setRunningConfigFromProviderConfig(providerConfig);
+              // The first dispatch never reached Pi. Rebuild from the clean
+              // base using the provider that was actually spawned: a stale
+              // cloud marker must not leak to BYOK, and a newly spawned cloud
+              // session must receive a marker.
+              promptMessage = markScreenpipeCloudTurn(basePromptMessage, providerConfig);
+              lastPiDispatchPromptRef.current = promptMessage;
             }
             syncThinkingLevelAfterStart(piSessionIdRef.current);
             result = await commands.piPrompt(

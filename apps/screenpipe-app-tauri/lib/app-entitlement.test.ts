@@ -163,6 +163,7 @@ describe("app entitlement", () => {
       features: { app: true, cloud: false },
     });
     expect(hasAppEntitlement(normalized)).toBe(true);
+    expect(hasCloudEntitlement(normalized)).toBe(false);
   });
 
   it("normalizes fresh legacy cloud subscribers into checked app entitlements", () => {

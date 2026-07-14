@@ -36,18 +36,33 @@ export function pickBestChatGptModel(models: string[]): string {
   );
 }
 
+export function makeChatGptPresetDefault(presets: AIPreset[]): AIPreset[] {
+  const chatGpt = presets.find((preset) => preset.provider === "openai-chatgpt");
+  if (!chatGpt) return presets;
+  return presets.map((preset) => ({
+    ...preset,
+    defaultPreset: preset.id === chatGpt.id,
+  }));
+}
+
 /**
  * Auto-creates a ChatGPT preset if the user just connected their account
  * and doesn't already have one. Returns the created preset or null.
  */
 export async function ensureChatGptPreset(
   currentPresets: AIPreset[],
-  updatePresets: (presets: AIPreset[]) => Promise<void>
+  updatePresets: (presets: AIPreset[]) => Promise<void>,
+  options: { makeDefault?: boolean } = {},
 ): Promise<AIPreset | null> {
-  const hasChatGptPreset = currentPresets.some(
+  const existingChatGptPreset = currentPresets.find(
     (p) => p.provider === "openai-chatgpt"
   );
-  if (hasChatGptPreset) return null;
+  if (existingChatGptPreset) {
+    if (options.makeDefault && !existingChatGptPreset.defaultPreset) {
+      await updatePresets(makeChatGptPresetDefault(currentPresets));
+    }
+    return existingChatGptPreset;
+  }
 
   // fetch available models
   let model = DEFAULT_CHATGPT_MODEL;
@@ -66,11 +81,14 @@ export async function ensureChatGptPreset(
     provider: "openai-chatgpt",
     url: "https://api.openai.com/v1",
     model,
-    defaultPreset: false,
+    defaultPreset: options.makeDefault === true,
     apiKey: null,
     maxContextChars: 128000,
   };
 
-  await updatePresets([...currentPresets, preset]);
+  const nextPresets = options.makeDefault
+    ? makeChatGptPresetDefault([...currentPresets, preset])
+    : [...currentPresets, preset];
+  await updatePresets(nextPresets);
   return preset;
 }

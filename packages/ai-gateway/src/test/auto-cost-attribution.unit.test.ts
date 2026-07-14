@@ -69,8 +69,9 @@ describe('routing chains stay priceable (no silent $0.01 fallback rows)', () => 
 	it('served-model attribution produces real token-based costs, not the flat estimate', () => {
 		// glm-5 is free Vertex MaaS — real cost 0, not $0.01
 		expect(getModelCost('glm-5', 500_000, 10_000)).toBe(0);
-		// gemini-3-flash safety net — token-based pricing
-		expect(getModelCost('gemini-3-flash', 1_000_000, 0)).toBeCloseTo(0.10, 10);
+		// gemini-3-flash safety net — current Google standard/flex pricing.
+		expect(getModelCost('gemini-3-flash', 1_000_000, 1_000_000)).toBeCloseTo(3.50, 10);
+		expect(getModelCost('gemini-3-flash:flex', 1_000_000, 1_000_000)).toBeCloseTo(1.75, 10);
 	});
 
 	it('uses Luna as the current Auto primary for text, vision, and pipes', () => {

@@ -17,6 +17,9 @@ import { useOnboarding } from "@/lib/hooks/use-onboarding";
 import { scheduleFirstRunNotification } from "@/lib/notifications";
 import posthog from "posthog-js";
 import { localFetch } from "@/lib/api";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { hasCloudEntitlement } from "@/lib/app-entitlement";
+import { isScreenpipeCloudProvider } from "@/lib/chat/free-tier-turn-marker";
 
 type Pipe = {
   slug: string;
@@ -72,7 +75,11 @@ async function triggerImmediateRun(slug: string): Promise<void> {
   } catch {}
 }
 
-async function installAndEnable(slug: string, retries = 3): Promise<void> {
+async function installAndEnable(
+  slug: string,
+  runImmediately: boolean,
+  retries = 3,
+): Promise<void> {
   await waitForServer();
 
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -88,7 +95,7 @@ async function installAndEnable(slug: string, retries = 3): Promise<void> {
       if (enableRes.ok) {
         const enableBody = await enableRes.json().catch(() => ({}));
         if (!enableBody.error) {
-          await triggerImmediateRun(slug);
+          if (runImmediately) await triggerImmediateRun(slug);
           return;
         }
       }
@@ -114,7 +121,7 @@ async function installAndEnable(slug: string, retries = 3): Promise<void> {
       if (enable2.ok) {
         const enable2Body = await enable2.json().catch(() => ({}));
         if (!enable2Body.error) {
-          await triggerImmediateRun(slug);
+          if (runImmediately) await triggerImmediateRun(slug);
           return;
         }
         throw new Error(`enable ${slug} after install: ${enable2Body.error}`);
@@ -196,6 +203,14 @@ export default function PickPipe() {
   const [showSkip, setShowSkip] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { completeOnboarding } = useOnboarding();
+  const { settings } = useSettings();
+  const hasHostedSubscription = hasCloudEntitlement(settings.user);
+  const defaultProvider =
+    settings.aiPresets?.find((preset) => preset.defaultPreset)?.provider ??
+    settings.aiPresets?.[0]?.provider;
+  const canEnableAiPipes =
+    hasHostedSubscription ||
+    (Boolean(defaultProvider) && !isScreenpipeCloudProvider(defaultProvider));
   const isCompletingRef = useRef(false);
   const mountTimeRef = useRef(Date.now());
 
@@ -235,7 +250,19 @@ export default function PickPipe() {
     const slugs = Array.from(selected);
 
     try {
-      await Promise.all(slugs.map((slug) => installAndEnable(slug)));
+      if (canEnableAiPipes) {
+        // Business-hosted or user-funded providers may enable and run now.
+        await Promise.all(slugs.map((slug) => installAndEnable(slug, true)));
+      } else {
+        // Do not leave scheduled AI pipes enabled against the hosted preview:
+        // they would repeatedly hit the paid-only background guard and appear
+        // broken. The selections remain discoverable in the pipe store after
+        // the user connects ChatGPT/Codex, a key, Ollama, or upgrades.
+        posthog.capture("onboarding_ai_pipes_deferred", {
+          pipes: slugs,
+          provider: defaultProvider ?? null,
+        });
+      }
 
       // Keep legacy event name + path:"bundle" so existing PostHog dashboards
       // keep working alongside the new bundle-shape properties.
@@ -250,9 +277,11 @@ export default function PickPipe() {
       try {
         await completeOnboarding();
       } catch {}
-      try {
-        scheduleFirstRunNotification();
-      } catch {}
+      if (canEnableAiPipes) {
+        try {
+          scheduleFirstRunNotification();
+        } catch {}
+      }
 
       try {
         await localFetch("/notify", {
@@ -260,7 +289,9 @@ export default function PickPipe() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             title: "🚀 You're all set",
-            body: "Screenpipe is set up. Your first results arrive shortly.",
+            body: canEnableAiPipes
+              ? "Screenpipe is set up. Your first results arrive shortly."
+              : "Local capture is ready. Connect your own AI or Business to turn on AI pipes.",
           }),
         });
       } catch {}
@@ -274,7 +305,7 @@ export default function PickPipe() {
       // because onboarding completion will close the window.
       isCompletingRef.current = false;
     }
-  }, [selected, customized, completeOnboarding]);
+  }, [selected, customized, completeOnboarding, canEnableAiPipes, defaultProvider]);
 
   const handleSkip = useCallback(async () => {
     if (isCompletingRef.current) return;
@@ -344,6 +375,13 @@ export default function PickPipe() {
           We picked these for you
         </h2>
 
+        {!canEnableAiPipes && (
+          <p className="font-mono text-[11px] leading-5 text-center text-muted-foreground">
+            AI pipes need Business or your own ChatGPT, Claude/OpenAI key, or Ollama.
+            Local capture is already free.
+          </p>
+        )}
+
         <div className="flex flex-col gap-2 w-full">
           {defaultPipes.map((p, i) => (
             <PipeRow
@@ -361,7 +399,9 @@ export default function PickPipe() {
           disabled={count === 0}
           className="w-full border border-foreground p-3 font-mono text-sm font-semibold disabled:opacity-30 disabled:cursor-not-allowed hover:bg-foreground hover:text-background transition-colors"
         >
-          turn {count === 1 ? "it" : "them"} on →
+          {canEnableAiPipes
+            ? `turn ${count === 1 ? "it" : "them"} on →`
+            : "finish — add AI later →"}
         </button>
 
         <AnimatePresence>

@@ -15,6 +15,7 @@
 #![deny(clippy::string_slice)]
 
 use crate::recording::{local_api_context_from_app, LocalApiContext};
+use crate::store::SettingsStore;
 use futures::StreamExt;
 use screenpipe_core::strings::{safe_byte_prefix, truncate_string};
 use serde::{Deserialize, Serialize};
@@ -146,16 +147,32 @@ pub async fn force_regenerate_suggestions(
 #[tauri::command]
 #[specta::specta]
 pub async fn set_enhanced_ai_suggestions(
+    app: AppHandle,
     state: tauri::State<'_, SuggestionsState>,
     enabled: bool,
     token: String,
 ) -> Result<(), String> {
     let mut guard = state.enhanced_ai.lock().await;
-    if enabled && !token.is_empty() {
-        *guard = Some(EnhancedAIConfig { enabled, token });
-    } else {
+    if !enabled {
         *guard = None;
+        return Ok(());
     }
+
+    let cloud_entitled = SettingsStore::get(&app)
+        .ok()
+        .flatten()
+        .map(|settings| settings.cloud_transcription_entitled())
+        .unwrap_or(false);
+    if !cloud_entitled {
+        *guard = None;
+        return Err("Screenpipe Business is required for Enhanced AI suggestions".to_string());
+    }
+    if token.is_empty() {
+        *guard = None;
+        return Err("Sign in before enabling Enhanced AI suggestions".to_string());
+    }
+
+    *guard = Some(EnhancedAIConfig { enabled, token });
     Ok(())
 }
 

@@ -282,6 +282,10 @@ async fn classify(
         request = request.bearer_auth(token);
     }
     let response = request
+        // This autonomous polling loop is never one of the user's visible
+        // free chat turns. The gateway treats background calls as paid-only;
+        // self-hosted classifier endpoints safely ignore the extra header.
+        .header("x-screenpipe-latency", "background")
         .json(&body)
         .send()
         .await

@@ -1496,7 +1496,7 @@ const AISection = ({
                   ) : (
                     <>
                       {models?.some((m) => m.free) && (
-                        <CommandGroup heading="Free">
+                        <CommandGroup heading={settingsPreset?.provider === "screenpipe-cloud" ? "Hosted preview models" : "Free"}>
                           {models.filter((m) => m.free).map((model) => (
                             <CommandItem
                               key={model.id}
@@ -1509,7 +1509,9 @@ const AISection = ({
                               <div className="flex flex-col gap-0.5 w-full">
                                 <div className="flex items-center justify-between">
                                   <span className="font-medium">{model.name}</span>
-                                  <Badge variant="outline" className="ml-2 text-[10px] bg-green-500/10 text-green-600 border-green-500/30">free</Badge>
+                                  <Badge variant="outline" className="ml-2 text-[10px] bg-green-500/10 text-green-600 border-green-500/30">
+                                    {settingsPreset?.provider === "screenpipe-cloud" ? "included" : "free"}
+                                  </Badge>
                                 </div>
                                 {model.description && (
                                   <span className="text-xs text-muted-foreground">{model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}</span>
@@ -1519,7 +1521,7 @@ const AISection = ({
                           ))}
                         </CommandGroup>
                       )}
-                      <CommandGroup heading={showUpsell && models?.some((m) => !m.free && m.locked) ? "More models" : models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
+                      <CommandGroup heading={showUpsell && models?.some((m) => !m.free && m.locked) ? "More models" : models?.some((m) => m.free) ? (settingsPreset?.provider === "screenpipe-cloud" ? "Other hosted models" : "Included with Screenpipe") : "Available Models"}>
                         {models?.filter((m) => !m.free).slice().sort((a, b) => ((showUpsell && a.locked) ? 1 : 0) - ((showUpsell && b.locked) ? 1 : 0)).map((model) => {
                           const costLabel = model.cost_tier === 'low' ? '$' : model.cost_tier === 'medium' ? '$$' : model.cost_tier === 'high' ? '$$$' : model.cost_tier === 'very_high' ? '$$$$' : '';
                           // Effective lock = gateway said so AND we're allowed to surface it.
@@ -1621,7 +1623,7 @@ const AISection = ({
                             className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 mr-1 font-medium hover:bg-accent cursor-pointer"
                             onClick={() => updateSettingsPreset({ model: m.id })}
                           >
-                            {m.name} {m.free ? "(free)" : ""}
+                            {m.name} {m.free ? (settingsPreset?.provider === "screenpipe-cloud" ? "(included)" : "(free)") : ""}
                           </button>
                         ))}
                       </p>

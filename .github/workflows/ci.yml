@@ -133,7 +133,15 @@ jobs:
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-test-windows
+          # -v2 suffix busts a poisoned cache: the green run at 9f820f26e
+          # (7/14 19:38 UTC) saved a `ci-test-windows` cache whose restored
+          # target/.../release-dev/deps was missing onnxruntime.dll. ort's
+          # `copy-dylibs` only re-stages that DLL when ort-sys's build script
+          # re-runs, which it doesn't on a cache hit — so every run after that
+          # restored the incomplete deps/ and the screenpipe-engine
+          # pii_redaction_tests binary died at load with STATUS_DLL_NOT_FOUND
+          # (0xc0000135). Bump the key to force one cold, clean build.
+          shared-key: ci-test-windows-v2
           cache-bin: false
 
       # After rust-cache on purpose — see the action's ordering note.

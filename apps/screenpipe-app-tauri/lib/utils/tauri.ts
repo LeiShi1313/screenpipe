@@ -857,8 +857,9 @@ async installRegistrySkill(repo: string, gitRef: string, path: string, name: str
 }
 },
 /**
- * Whether capture is currently paused. The frontend polls this alongside
- * per-device status so the UI stays in sync with the tray indicator.
+ * Whether capture is currently paused. Reads `capture_intended` which is
+ * flipped immediately in stop_capture/start_capture — no health-monitor
+ * delay. The frontend polls this so the UI stays in sync with the tray.
  */
 async isCapturePaused() : Promise<boolean> {
     return await TAURI_INVOKE("is_capture_paused");
@@ -3322,7 +3323,7 @@ export type SyncDeviceInfo = { id: string; deviceId: string; deviceName: string 
  * Sync status response.
  */
 export type SyncStatusResponse = { enabled: boolean; isSyncing: boolean; lastSync: string | null; lastError: string | null; storageUsed: number | null; storageLimit: number | null; deviceCount: number | null; deviceLimit: number | null; syncTier: string | null; machineId: string }
-export type User = { id: string | null; name: string | null; email: string | null; image: string | null; token: string | null; clerk_id: string | null; api_key: string | null; credits: Credits | null; stripe_connected: boolean | null; stripe_account_status: string | null; github_username: string | null; bio: string | null; website: string | null; contact: string | null; cloud_subscribed: boolean | null; credits_balance: number | null; app_entitled: boolean | null; subscription_plan: string | null; entitlement: JsonValue | null }
+export type User = { id: string | null; name: string | null; email: string | null; image: string | null; token: string | null; clerk_id: string | null; api_key: string | null; credits: Credits | null; stripe_connected: boolean | null; stripe_account_status: string | null; github_username: string | null; bio: string | null; website: string | null; contact: string | null; cloud_subscribed: boolean | null; credits_balance: number | null; app_entitled: boolean | null; subscription_plan: string | null; entitlement: JsonValue | null; enterprise_account: JsonValue | null }
 export type ViewerContent = { kind: "text"; text: string; name: string; path: string; truncated: boolean; total_bytes: number } | { kind: "image"; data_url: string; name: string; path: string } |
 /**
  * Non-text, non-image file (random binary). The UI surfaces a

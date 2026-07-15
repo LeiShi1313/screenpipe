@@ -20,7 +20,7 @@ pub mod sync;
 pub(crate) mod trajectory;
 
 use crate::agents::{
-    pi::{PiExecutor, SCREENPIPE_API_URL},
+    pi::{pi_package_enabled, PiExecutor, SCREENPIPE_API_URL},
     AgentExecutor, ExecutionHandle, SharedPid, STOP_REQUESTED_PID,
 };
 use crate::pipes::connections::parse_mcp_connection_id;
@@ -2901,6 +2901,7 @@ impl PipeManager {
             preset_prompt.as_deref(),
             self.connections_context.as_deref(),
             self.local_api_key.as_deref(),
+            config.agent == "pi" && pi_package_enabled("pi-subagents"),
         );
         let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
         let pipe_name = name.to_string();
@@ -3448,6 +3449,7 @@ impl PipeManager {
                 preset_prompt.as_deref(),
                 self.connections_context.as_deref(),
                 self.local_api_key.as_deref(),
+                config.agent == "pi" && pi_package_enabled("pi-subagents"),
             );
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
@@ -4760,6 +4762,7 @@ impl PipeManager {
                         preset_prompt.as_deref(),
                         connections_context.as_deref(),
                         local_api_key.as_deref(),
+                        config.agent == "pi" && pi_package_enabled("pi-subagents"),
                     );
                     let prompt = render_prompt_with_port(
                         config,
@@ -5618,6 +5621,7 @@ fn render_pipe_system_prompt(
     system_prompt: Option<&str>,
     connections_context: Option<&str>,
     local_api_key: Option<&str>,
+    subagents_available: bool,
 ) -> String {
     let os = std::env::consts::OS;
     let mut sys = String::new();
@@ -5640,6 +5644,9 @@ fn render_pipe_system_prompt(
     sys.push_str(&format!(
         "CRITICAL: You ARE this pipe. You are already running inside it. NEVER run `screenpipe pipe run` — that would create a recursive duplicate. Execute the task directly using the tools available to you (bash, file I/O, HTTP requests, etc.).\n\nOS: {os}\nOutput directory: ./output/\nScreenpipe API: http://localhost:{api_port}{api_auth_note}\nPrefer bun/TypeScript for scripts. Python may not be installed.\nSend notifications via POST http://localhost:11435/notify with {{\"title\": \"...\", \"body\": \"...\"}}. Body supports markdown. File links MUST use absolute paths (e.g. [View log](/Users/me/file.md)), never relative paths like ./output/file.md — relative paths break the notification link handler.\nNotifications support action buttons (`\"actions\": [...]`) so you can ASK the user instead of sending a passive FYI — when a human decision or follow-up would help (send/share/draft/fix/dig deeper), attach actions rather than doing nothing or acting unilaterally. Schema + examples: screenpipe-api skill, Notifications section.\n\n"
     ));
+    if subagents_available {
+        sys.push_str("Subagents: the `subagent` tool is enabled. Use it when this task has at least two independent research, review, or implementation workstreams that can run in parallel, then synthesize the child results. Keep simple or sequential work in this agent. For read-only child tasks, pass `acceptance.level: \"none\"` so a successful child is not rejected for making no edits.\n\n");
+    }
     sys.push_str(body);
 
     if let Some(ctx) = connections_context {
@@ -8116,7 +8123,7 @@ mod tests {
         assert!(prompt.contains("Time range:"));
         assert!(prompt.contains("Do the work described above now."));
         // Port / body go into system prompt, not user prompt
-        let sys = render_pipe_system_prompt("body text", 3031, None, None, None);
+        let sys = render_pipe_system_prompt("body text", 3031, None, None, None, false);
         assert!(sys.contains("http://localhost:3031"));
         assert!(!sys.contains("http://localhost:3030"));
         assert!(sys.contains("body text"));
@@ -8145,7 +8152,7 @@ mod tests {
             artifacts: vec![],
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("hello", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("hello", 3030, None, None, None, false);
         assert!(sys.contains("http://localhost:3030"));
     }
 
@@ -8178,6 +8185,7 @@ mod tests {
             Some("You are a helpful assistant"),
             None,
             None,
+            false,
         );
         assert!(sys.starts_with("You are a helpful assistant\n\n"));
         assert!(sys.contains("body text"));
@@ -8207,14 +8215,14 @@ mod tests {
             artifacts: vec![],
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("body text", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("body text", 3030, None, None, None, false);
         assert!(!sys.contains("System prompt:"));
         assert!(sys.contains("body text"));
     }
 
     #[test]
     fn test_system_prompt_contains_anti_recursion_warning() {
-        let sys = render_pipe_system_prompt("task body", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("task body", 3030, None, None, None, false);
         assert!(sys.contains("NEVER run `screenpipe pipe run`"));
         assert!(sys.contains("You ARE this pipe"));
     }
@@ -8224,7 +8232,8 @@ mod tests {
         // Pass the key explicitly — the renderer must not depend on parent
         // process env (which is empty in tests and was the root cause of the
         // 403 reported by the security-requests-grc pipe in prod).
-        let sys = render_pipe_system_prompt("task body", 3030, None, None, Some("sp-test-key"));
+        let sys =
+            render_pipe_system_prompt("task body", 3030, None, None, Some("sp-test-key"), false);
         assert!(
             sys.contains("API Authentication: REQUIRED"),
             "auth note must be emitted when local_api_key is Some"
@@ -8234,11 +8243,21 @@ mod tests {
 
     #[test]
     fn test_system_prompt_omits_auth_note_when_no_key() {
-        let sys = render_pipe_system_prompt("task body", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("task body", 3030, None, None, None, false);
         assert!(
             !sys.contains("API Authentication: REQUIRED"),
             "auth note must not be emitted when local_api_key is None"
         );
+    }
+
+    #[test]
+    fn test_system_prompt_explains_enabled_subagent_tool() {
+        let enabled = render_pipe_system_prompt("task body", 3030, None, None, None, true);
+        assert!(enabled.contains("the `subagent` tool is enabled"));
+        assert!(enabled.contains("acceptance.level: \"none\""));
+
+        let disabled = render_pipe_system_prompt("task body", 3030, None, None, None, false);
+        assert!(!disabled.contains("the `subagent` tool is enabled"));
     }
 
     // -- PipeExecution / SchedulerState serde roundtrip ----------------------

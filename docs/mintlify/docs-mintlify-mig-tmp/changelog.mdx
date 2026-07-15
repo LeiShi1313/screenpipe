@@ -13,6 +13,7 @@ icon: "newspaper"
 
 ### bug fixes
 
+- **auto-update no longer gets stuck in a restart loop** — applying an update from the tray or the in-app banner used to be able to fire twice, so the app would tear down and relaunch in parallel and the health watchdog would respawn the server mid-restart. Restart-to-update now runs exactly once regardless of how it's triggered, so updates finish cleanly on the first try. See [getting started](/getting-started).
 - **pipe sidebar now shows exact run counts** — the run count next to each pipe in the sidebar now reflects the true number of executions stored locally, not just the recent chat sessions loaded in memory. Older runs load 10 at a time as you scroll, so opening a long-running pipe like `digital-clone` now shows its real history instead of an undercount. See [pipe store](/pipe-store).
 
 ## week of july 6, 2026

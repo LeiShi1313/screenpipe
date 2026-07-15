@@ -160,7 +160,7 @@ export default function GeneralSettings() {
       toast({
         title: checked ? "auto-start enabled" : "auto-start disabled",
         description: checked
-          ? "screenpipe will start in the background when you log in"
+          ? "screenpipe will launch when your computer starts"
           : "screenpipe won't launch at startup",
       });
     } catch (e: any) {
@@ -231,7 +231,7 @@ export default function GeneralSettings() {
                 <Rocket className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
                   <h3 className="text-sm font-medium text-foreground">Auto-start</h3>
-                  <p className="text-xs text-muted-foreground">Start in the background when you log in</p>
+                  <p className="text-xs text-muted-foreground">Launch when your computer starts</p>
                 </div>
               </div>
               <Switch

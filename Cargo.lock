@@ -8497,6 +8497,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3 0.10.9",
  "sqlx",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tinfoil",

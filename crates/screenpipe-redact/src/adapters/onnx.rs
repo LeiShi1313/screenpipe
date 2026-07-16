@@ -794,14 +794,11 @@ mod runtime {
                     // pool burned ~4 cores in ThreadPoolTempl::WorkerLoop while the
                     // redaction backlog drained (340% CPU regression after 3b9a1a105).
                     .with_intra_op_spinning(false)?
-                    // A quarter of the cores (min 1) is plenty for this
-                    // background batch worker and caps the height of each CPU
-                    // burst — combined with the worker's per-batch duty-cycle
-                    // cooldown the redaction backlog drains as a low flat band
-                    // instead of pinning half the machine. Latency is a
-                    // non-goal here: nothing waits on this redactor
-                    // synchronously.
-                    .with_intra_threads((num_cpus_physical() / 4).max(1))?;
+                    // This is background reconciliation, so latency is a
+                    // non-goal. A single ORT thread prevents one inference from
+                    // fanning out to 100-300% CPU before the worker's adaptive
+                    // process-level cooldown can react.
+                    .with_intra_threads(1)?;
                 // NO CoreML EP here, deliberately: this text model is int8-quantized
                 // RoBERTa with dynamic sequence lengths, and the ANE compiler rejects
                 // every layer ("E5RT: unbounded dimension is not supported"), so
@@ -829,14 +826,6 @@ mod runtime {
                 )))
             }
         }
-    }
-
-    /// Best-effort physical core count for ORT intra-op threads.
-    /// Pinned to a small max to avoid oversubscribing on big servers.
-    fn num_cpus_physical() -> usize {
-        std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
-            .unwrap_or(4)
     }
 
     #[cfg(test)]

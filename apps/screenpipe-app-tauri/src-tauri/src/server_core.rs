@@ -1084,6 +1084,10 @@ impl ServerCore {
                     let pipeline = pipeline.with_pseudonyms(pseudonymizer);
                     let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
                     let cfg = WorkerConfig {
+                        // Local inference is CPU-bound. Keep bursts short so
+                        // the adaptive whole-process 30% controller can react
+                        // quickly; cloud/enclave batching remains at 16.
+                        batch_size: 4,
                         tables: ALL_TARGET_TABLES.to_vec(),
                         ..Default::default()
                     };

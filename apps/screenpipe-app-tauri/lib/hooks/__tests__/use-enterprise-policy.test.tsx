@@ -320,4 +320,14 @@ describe("useEnterprisePolicy manual activation", () => {
     expect(result.current.needsLicenseKey).toBe(true);
     expect(result.current.licenseStatus).toBe("required");
   });
+
+  it("lets a fresh shared device choose organization-key enrollment", async () => {
+    mockEnterpriseApi({});
+    const { result } = await renderEnterprisePolicy();
+
+    expect(result.current.licenseStatus).toBe("member_login");
+    act(() => result.current.requestOrganizationKey());
+    expect(result.current.needsLicenseKey).toBe(true);
+    expect(result.current.licenseStatus).toBe("required");
+  });
 });

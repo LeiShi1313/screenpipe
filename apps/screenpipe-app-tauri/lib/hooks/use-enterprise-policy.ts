@@ -935,6 +935,11 @@ export function useEnterprisePolicy() {
     },
     [policy.lockedSettings]
   );
+  const requestOrganizationKey = useCallback(() => {
+    if (!isEnterprise) return;
+    setNeedsLicenseKey(true);
+    setLicenseStatus("required");
+  }, [isEnterprise]);
 
   return {
     policy: isEnterprise ? policy : EMPTY_POLICY,
@@ -945,5 +950,6 @@ export function useEnterprisePolicy() {
     needsLicenseKey: isEnterprise ? needsLicenseKey : false,
     licenseStatus: isEnterprise ? licenseStatus : "active",
     submitLicenseKey,
+    requestOrganizationKey,
   };
 }

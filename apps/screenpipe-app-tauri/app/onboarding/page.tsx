@@ -48,6 +48,7 @@ export default function OnboardingPage() {
   const {
     licenseStatus,
     policy: enterprisePolicy,
+    requestOrganizationKey,
     submitLicenseKey,
   } = useEnterprisePolicy();
 
@@ -196,7 +197,16 @@ export default function OnboardingPage() {
               ) : (licenseStatus === "active" &&
                   enterprisePolicy.enrollmentMode === "member_sign_in") ||
                 licenseStatus === "member_login" ? (
-                <OnboardingLogin handleNextSlide={handleNextSlide} />
+                <div className="flex flex-col items-center">
+                  <OnboardingLogin handleNextSlide={handleNextSlide} />
+                  <button
+                    type="button"
+                    onClick={requestOrganizationKey}
+                    className="mt-3 font-mono text-xs text-muted-foreground/70 underline underline-offset-4 decoration-muted-foreground/40 transition-colors hover:text-foreground hover:decoration-foreground"
+                  >
+                    use organization key
+                  </button>
+                </div>
               ) : (
                 <div className="flex min-h-[400px] items-center justify-center">
                   <div className="h-6 w-6 animate-spin rounded-full border border-foreground border-t-transparent" />

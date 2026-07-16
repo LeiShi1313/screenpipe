@@ -90,7 +90,7 @@ fn layout(target: &str) -> Result<AgentLayout> {
         },
         "codex" => AgentLayout {
             name: "Codex",
-            skills_dir: None,
+            skills_dir: Some(h.join(".codex/skills")),
             mcp_path: h.join(".codex/config.toml"),
             mcp_format: McpFormat::Toml,
         },
@@ -150,13 +150,13 @@ fn setup(target: &str, api_url: &str) -> Result<()> {
     let remote = host_port(api_url) != "localhost:3030";
     println!("wiring screenpipe → {} (api: {})", l.name, api_url);
 
-    if let Some(skills_dir) = &l.skills_dir {
-        let api_path = write_skill(skills_dir, "screenpipe-api", API_SKILL_MD, api_url)?;
-        let cli_path = write_skill(skills_dir, "screenpipe-cli", CLI_SKILL_MD, api_url)?;
-        println!("  ✓ skill {}", api_path.display());
-        println!("  ✓ skill {}", cli_path.display());
-    } else {
+    let installed_skills = install_skills(target, api_url)?;
+    if installed_skills.is_empty() {
         println!("  · {} is MCP-only (no skills dir)", l.name);
+    } else {
+        for path in installed_skills {
+            println!("  ✓ skill {}", path.display());
+        }
     }
 
     match l.mcp_format {
@@ -175,6 +175,23 @@ fn setup(target: &str, api_url: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Install the canonical screenpipe API and CLI skills for an external agent.
+///
+/// This is separate from [`setup`] so the desktop app can keep using its
+/// bundled-bun MCP configuration (including the local API key) while sharing
+/// the exact same skill installation behavior as `screenpipe agent setup`.
+pub fn install_skills(target: &str, api_url: &str) -> Result<Vec<PathBuf>> {
+    let l = layout(target)?;
+    let Some(skills_dir) = &l.skills_dir else {
+        return Ok(Vec::new());
+    };
+
+    Ok(vec![
+        write_skill(skills_dir, "screenpipe-api", API_SKILL_MD, api_url)?,
+        write_skill(skills_dir, "screenpipe-cli", CLI_SKILL_MD, api_url)?,
+    ])
 }
 
 /// Idempotently add the `screenpipe` server to a JSON MCP config (OpenClaw,
@@ -305,6 +322,21 @@ mod tests {
         let md = "use http://localhost:3030/search";
         let out = md.replace("localhost:3030", host_port("http://10.0.0.5:3030"));
         assert_eq!(out, "use http://10.0.0.5:3030/search");
+    }
+
+    #[test]
+    fn test_codex_and_claude_code_have_skill_directories() {
+        let codex = layout("codex").unwrap();
+        assert!(codex
+            .skills_dir
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".codex/skills")));
+
+        let claude = layout("claude-code").unwrap();
+        assert!(claude
+            .skills_dir
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".claude/skills")));
     }
 
     #[test]

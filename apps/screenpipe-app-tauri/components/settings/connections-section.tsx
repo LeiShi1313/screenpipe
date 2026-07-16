@@ -48,6 +48,10 @@ import { CustomMcpCard } from "./custom-mcp-card";
 import { SkillsCard } from "./skills-card";
 import { PiExtensionsCard } from "./pi-extensions-card";
 import posthog from "posthog-js";
+import {
+  areExternalAgentSkillsInstalled,
+  installExternalAgentSkills,
+} from "@/lib/external-agent-skills";
 
 // ---------------------------------------------------------------------------
 // Utility functions (unchanged)
@@ -1160,6 +1164,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
   useEffect(() => {
     getInstalledClaudeScreenpipeEntry().then(async (entry) => {
       if (!entry) return;
+      if (!(await areExternalAgentSkillsInstalled("claude"))) return;
       setState("connected");
       onConnected?.();
       // Auto-repair legacy/keyless configs (older builds, hand-authored npx
@@ -1216,6 +1221,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
     try {
       setState("connecting");
       const mcp = await writeClaudeScreenpipeConfig();
+      await installExternalAgentSkills("claude");
       setState("connected");
       onConnected?.();
       // The desktop app ships a bundled `bun`, so an npx fallback here means bun
@@ -1264,7 +1270,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Search your screen recordings and audio with natural language.
+        Install the screenpipe MCP plus API and CLI skills for Claude in one click.
       </p>
       <div className="flex flex-wrap gap-2">
         {state === "connected" ? (
@@ -1288,7 +1294,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
       </div>
       {state === "connected" && (
         <p className="text-xs text-muted-foreground">
-          <strong>connected!</strong> restart claude desktop and ask: &quot;what did I do in the last 5 minutes?&quot;
+          <strong>connected!</strong> MCP + both skills installed. Restart Claude and ask: &quot;what did I do in the last 5 minutes?&quot;
         </p>
       )}
     </div>
@@ -1377,7 +1383,15 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
 
 function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void }) {
   const [state, setState] = useState<"idle" | "installing" | "installed">("idle");
-  useEffect(() => { isCodexMcpInstalled().then(ok => { if (ok) { setState("installed"); onConnected?.(); } }); }, []);
+  useEffect(() => {
+    Promise.all([isCodexMcpInstalled(), areExternalAgentSkillsInstalled("codex")])
+      .then(([hasMcp, hasSkills]) => {
+        if (hasMcp && hasSkills) {
+          setState("installed");
+          onConnected?.();
+        }
+      });
+  }, []);
 
   const manualConfig = useMemo(() => buildCodexMcpToml({
     command: "npx",
@@ -1388,6 +1402,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
     try {
       setState("installing");
       await installCodexMcp();
+      await installExternalAgentSkills("codex");
       setState("installed");
       onConnected?.();
     } catch (error) {
@@ -1417,7 +1432,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-muted-foreground">Give Codex access to your screen &amp; audio history via MCP.</p>
+      <p className="text-xs text-muted-foreground">Install the screenpipe MCP plus API and CLI skills for Codex in one click.</p>
       <div className="flex flex-wrap gap-2">
         {state === "installed" ? (
           <Button onClick={handleDisconnect} variant="outline" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
@@ -1434,7 +1449,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
       </div>
       {state === "installed" && (
         <p className="text-xs text-muted-foreground">
-          <strong>connected!</strong> open a new Codex session and ask: &quot;what did I do in the last 5 minutes?&quot;
+          <strong>connected!</strong> MCP + both skills installed. Open a new Codex session and ask: &quot;what did I do in the last 5 minutes?&quot;
         </p>
       )}
       <details className="text-xs text-muted-foreground">

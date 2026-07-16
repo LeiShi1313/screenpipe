@@ -20,6 +20,10 @@ import { readTextFile, writeFile, mkdir } from "@tauri-apps/plugin-fs";
 import { homeDir, join, dirname } from "@tauri-apps/api/path";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
+import {
+  areExternalAgentSkillsInstalled,
+  installExternalAgentSkills,
+} from "@/lib/external-agent-skills";
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
 
@@ -323,7 +327,7 @@ const INTEGRATIONS: Integration[] = [
     id: "codex",
     cardKey: "codex",
     name: "Codex",
-    valueProp: "give OpenAI Codex full memory of your work",
+    valueProp: "install MCP + API and CLI skills in one click",
     isPro: false,
     type: "codex",
   },
@@ -340,7 +344,7 @@ const INTEGRATIONS: Integration[] = [
     id: "claude",
     cardKey: "claude",
     name: "Claude",
-    valueProp: "give Claude Desktop full memory of your screen",
+    valueProp: "install MCP + API and CLI skills in one click",
     isPro: false,
     type: "claude",
   },
@@ -569,12 +573,22 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
 
       // Claude Desktop MCP
       try {
-        if (await isClaudeMcpInstalled()) stateUpdates["claude"] = "connected";
+        if (
+          (await isClaudeMcpInstalled()) &&
+          (await areExternalAgentSkillsInstalled("claude"))
+        ) {
+          stateUpdates["claude"] = "connected";
+        }
       } catch { /* ignore */ }
 
       // Codex MCP
       try {
-        if (await isCodexMcpInstalled()) stateUpdates["codex"] = "connected";
+        if (
+          (await isCodexMcpInstalled()) &&
+          (await areExternalAgentSkillsInstalled("codex"))
+        ) {
+          stateUpdates["codex"] = "connected";
+        }
       } catch { /* ignore */ }
 
       // Obsidian (via local API)
@@ -696,6 +710,7 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
 
         if (integration.type === "claude") {
           await installClaudeMcp();
+          await installExternalAgentSkills("claude");
           setCardState(integration.cardKey, "connected");
           posthog.capture("onboarding_integration_connected", { integration: integration.id });
           return;
@@ -703,6 +718,7 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
 
         if (integration.type === "codex") {
           await installCodexMcp();
+          await installExternalAgentSkills("codex");
           setCardState(integration.cardKey, "connected");
           posthog.capture("onboarding_integration_connected", { integration: integration.id });
           return;

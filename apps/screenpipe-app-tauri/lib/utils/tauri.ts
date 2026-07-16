@@ -844,6 +844,19 @@ async initSync(password: string) : Promise<Result<boolean, string>> {
 }
 },
 /**
+ * Install the two built-in screenpipe skills into a supported external agent.
+ * MCP registration stays in the frontend because that path uses the app's
+ * bundled bun binary and injects the current local API key.
+ */
+async installExternalAgentSkills(target: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_external_agent_skills", { target }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Install a catalog skill: download its folder into a staging dir, then swap it
  * into the store atomically so a failed download never leaves a half-written
  * skill behind. Re-installing the same name refreshes it.

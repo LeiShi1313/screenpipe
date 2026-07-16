@@ -12,6 +12,6 @@ license-file.workspace = true
 edition.workspace = true
 
 [dependencies]
+serde = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
-

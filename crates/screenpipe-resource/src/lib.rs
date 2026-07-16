@@ -9,8 +9,13 @@
 //! decision around every small unit of optional background work.
 
 mod cpu;
+mod monitor;
 
 pub use cpu::{
     CpuBudgetConfig, CpuBudgetPermit, CpuBudgetSample, ResourceGovernor,
     DEFAULT_BACKGROUND_CPU_PERCENT,
+};
+pub use monitor::{
+    LoadAverage, ProcessBreakdown, ProcessGroupUsage, ProcessUsage, ResourceSampler,
+    ResourceSnapshot,
 };

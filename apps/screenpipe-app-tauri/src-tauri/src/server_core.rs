@@ -20,7 +20,8 @@ use screenpipe_audio::transcription::stt::{
 use screenpipe_db::DatabaseManager;
 use screenpipe_engine::{
     analytics, hot_frame_cache::HotFrameCache, power::PowerManagerHandle, server::bind_listener,
-    start_power_manager_with_pref, start_sleep_monitor, RecordingConfig, ResourceMonitor, SCServer,
+    start_power_manager_with_pref, start_sleep_monitor, RecordingConfig, ResourceTelemetryReporter,
+    SCServer,
 };
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
@@ -446,8 +447,8 @@ impl ServerCore {
         let manual_meeting = Arc::new(tokio::sync::RwLock::new(None::<i64>));
 
         // --- Resource + sleep monitors (long-lived) ---
-        let resource_monitor = ResourceMonitor::new(config.analytics_enabled);
-        resource_monitor.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
+        let resource_reporter = ResourceTelemetryReporter::new(config.analytics_enabled);
+        resource_reporter.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
         start_sleep_monitor();
 
         // --- HTTP server ---

@@ -11309,6 +11309,7 @@ dependencies = [
  "screenpipe-db",
  "screenpipe-events",
  "screenpipe-redact",
+ "screenpipe-resource",
  "screenpipe-screen",
  "screenpipe-secrets",
  "screenpipe-vault",
@@ -11390,6 +11391,7 @@ dependencies = [
 name = "screenpipe-resource"
 version = "0.4.25"
 dependencies = [
+ "serde",
  "sysinfo",
  "tokio",
 ]

@@ -21,6 +21,7 @@ screenpipe-audio = { path = "../screenpipe-audio" }
 screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
 screenpipe-db = { path = "../screenpipe-db" }
 screenpipe-redact = { path = "../screenpipe-redact", features = ["opf-text"] }
+screenpipe-resource = { path = "../screenpipe-resource" }
 screenpipe-a11y = { path = "../screenpipe-a11y", features = ["db"] }
 screenpipe-capture = { path = "../screenpipe-capture" }
 screenpipe-config = { path = "../screenpipe-config" }

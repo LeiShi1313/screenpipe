@@ -4,77 +4,20 @@
 
 use chrono::Local;
 use reqwest::Client;
+use screenpipe_resource::{ProcessBreakdown, ResourceSampler, ResourceSnapshot};
 use serde_json::{json, Map};
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sysinfo::{CpuExt, PidExt, ProcessExt, ProcessRefreshKind, System, SystemExt};
+use sysinfo::{CpuExt, System, SystemExt};
 use tracing::debug;
 use tracing::trace;
 use tracing::{error, info, warn};
 
 use crate::telemetry_context::TelemetryContext;
-
-/// Read this process's physical memory footprint (bytes) via
-/// `proc_pid_rusage(RUSAGE_INFO_V0)`. `ri_phys_footprint` is the exact value
-/// Activity Monitor reports under "Memory" — it includes compressed and
-/// swapped-out dirty pages, unlike resident set size. That makes it the metric
-/// that actually surfaces a cold-memory leak (pages written once then paged
-/// out), which RSS-based telemetry misses entirely. Returns `None` if the
-/// syscall fails (never panics; caller falls back to RSS).
-#[cfg(target_os = "macos")]
-fn macos_phys_footprint_bytes() -> Option<u64> {
-    // rusage_info_v0 layout from <sys/resource.h>. `ri_phys_footprint` is
-    // present from v0, so we don't need a newer flavor. Fields after it are
-    // included only to size the struct correctly for the kernel copy-out.
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct RUsageInfoV0 {
-        ri_uuid: [u8; 16],
-        ri_user_time: u64,
-        ri_system_time: u64,
-        ri_pkg_idle_wkups: u64,
-        ri_interrupt_wkups: u64,
-        ri_pageins: u64,
-        ri_wired_size: u64,
-        ri_resident_size: u64,
-        ri_phys_footprint: u64,
-        ri_proc_start_abstime: u64,
-        ri_proc_exit_abstime: u64,
-        ri_child_user_time: u64,
-        ri_child_system_time: u64,
-        ri_child_pkg_idle_wkups: u64,
-        ri_child_interrupt_wkups: u64,
-        ri_child_pageins: u64,
-        ri_child_elapsed_abstime: u64,
-        ri_diskio_bytesread: u64,
-        ri_diskio_byteswritten: u64,
-    }
-
-    extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
-    }
-    const RUSAGE_INFO_V0: i32 = 0;
-
-    let mut info = RUsageInfoV0::default();
-    let pid = std::process::id() as i32;
-    let rc = unsafe {
-        proc_pid_rusage(
-            pid,
-            RUSAGE_INFO_V0,
-            &mut info as *mut RUsageInfoV0 as *mut std::ffi::c_void,
-        )
-    };
-    if rc == 0 {
-        Some(info.ri_phys_footprint)
-    } else {
-        None
-    }
-}
 
 // --- memory-leak sentinel -------------------------------------------------
 // A leak that users actually feel ("screenpipe ate 10GB overnight") is slow
@@ -172,7 +115,10 @@ fn analyze_memory_trend(samples: &[(f64, f64)]) -> Option<LeakStats> {
     })
 }
 
-pub struct ResourceMonitor {
+/// Application-level reporter. Pure process measurement and background CPU
+/// governance live in `screenpipe-resource`; this type owns only reporting,
+/// leak policy, and engine telemetry integrations.
+pub struct ResourceTelemetryReporter {
     start_time: Instant,
     resource_log_file: Option<String>, // analyse output here: https://colab.research.google.com/drive/1zELlGdzGdjChWKikSqZTHekm5XRxY-1r?usp=sharing
     posthog_client: Option<Client>,
@@ -187,6 +133,11 @@ pub struct ResourceMonitor {
     leak_alerted: std::sync::atomic::AtomicBool,
 }
 
+/// Compatibility name for downstream users. New code should use
+/// [`ResourceTelemetryReporter`] to distinguish reporting from measurement and
+/// governance in `screenpipe-resource`.
+pub type ResourceMonitor = ResourceTelemetryReporter;
+
 /// Static host info collected once at startup.
 /// Only contains general OS/model names — no serial numbers, UUIDs, or PII.
 #[derive(Clone, Debug)]
@@ -198,139 +149,6 @@ struct HardwareInfo {
     os_name: String,
     os_version: String,
     kernel_version: String,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct LoadAverage {
-    one_minute: f64,
-    five_minutes: f64,
-    fifteen_minutes: f64,
-}
-
-impl LoadAverage {
-    fn from_sysinfo(load: sysinfo::LoadAvg) -> Self {
-        Self {
-            one_minute: load.one,
-            five_minutes: load.five,
-            fifteen_minutes: load.fifteen,
-        }
-    }
-
-    fn per_cpu(self, cpu_count: usize) -> Self {
-        let cpu_count = cpu_count.max(1) as f64;
-        Self {
-            one_minute: self.one_minute / cpu_count,
-            five_minutes: self.five_minutes / cpu_count,
-            fifteen_minutes: self.fifteen_minutes / cpu_count,
-        }
-    }
-}
-
-/// Aggregated resource usage for a screenpipe-related process group.
-#[derive(Clone, Debug, serde::Serialize)]
-struct ProcessGroupUsage {
-    group: String,
-    process_count: usize,
-    rss_gb: f64,
-    cpu_percent: f32,
-}
-
-/// A single process row kept intentionally small for local diagnostics.
-///
-/// We log process names, not full command lines, to avoid leaking prompt text,
-/// file paths, or tokens through the resource log.
-#[derive(Clone, Debug, serde::Serialize)]
-struct ProcessUsage {
-    pid: u32,
-    parent_pid: Option<u32>,
-    parent_name: Option<String>,
-    name: String,
-    group: String,
-    rss_mb: f64,
-    cpu_percent: f32,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct ProcessBreakdown {
-    groups: Vec<ProcessGroupUsage>,
-    top_related_by_memory: Vec<ProcessUsage>,
-    top_related_by_cpu: Vec<ProcessUsage>,
-}
-
-impl ProcessBreakdown {
-    fn empty() -> Self {
-        Self {
-            groups: Vec::new(),
-            top_related_by_memory: Vec::new(),
-            top_related_by_cpu: Vec::new(),
-        }
-    }
-
-    fn group(&self, name: &str) -> Option<&ProcessGroupUsage> {
-        self.groups.iter().find(|group| group.group == name)
-    }
-
-    fn mcp_count(&self) -> usize {
-        self.group("screenpipe_mcp_child")
-            .map(|group| group.process_count)
-            .unwrap_or(0)
-            + self
-                .group("screenpipe_mcp_external")
-                .map(|group| group.process_count)
-                .unwrap_or(0)
-    }
-
-    fn mcp_child_count(&self) -> usize {
-        self.group("screenpipe_mcp_child")
-            .map(|group| group.process_count)
-            .unwrap_or(0)
-    }
-
-    fn mcp_rss_gb(&self) -> f64 {
-        self.group("screenpipe_mcp_child")
-            .map(|group| group.rss_gb)
-            .unwrap_or(0.0)
-            + self
-                .group("screenpipe_mcp_external")
-                .map(|group| group.rss_gb)
-                .unwrap_or(0.0)
-    }
-
-    fn related_rss_gb(&self) -> f64 {
-        self.groups.iter().map(|group| group.rss_gb).sum()
-    }
-
-    fn related_cpu_percent(&self) -> f32 {
-        self.groups.iter().map(|group| group.cpu_percent).sum()
-    }
-
-    fn should_warn(&self) -> bool {
-        self.mcp_child_count() >= 3
-            || self.mcp_count() >= 10
-            || self.mcp_rss_gb() >= 1.0
-            || self.related_rss_gb() >= 8.0
-            || self.related_cpu_percent() >= 250.0
-    }
-
-    fn compact_summary(&self) -> String {
-        let groups = self
-            .groups
-            .iter()
-            .map(|group| {
-                format!(
-                    "{}={}p/{:.2}GB/{:.0}%cpu",
-                    group.group, group.process_count, group.rss_gb, group.cpu_percent
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if groups.is_empty() {
-            "no screenpipe-related processes found".to_string()
-        } else {
-            groups
-        }
-    }
 }
 
 impl HardwareInfo {
@@ -407,100 +225,6 @@ fn detect_gpus_platform() -> Vec<String> {
     {
         Vec::new()
     }
-}
-
-fn process_search_text(process: &sysinfo::Process) -> String {
-    let mut text = process.name().to_ascii_lowercase();
-    let cmd = process.cmd();
-    if !cmd.is_empty() {
-        text.push(' ');
-        text.push_str(&cmd.join(" ").to_ascii_lowercase());
-    }
-    text
-}
-
-fn safe_process_name(process: &sysinfo::Process) -> String {
-    let name = process.name().trim();
-    let name = if name.is_empty() { "unknown" } else { name };
-    if name.len() > 120 {
-        name[..120].to_string()
-    } else {
-        name.to_string()
-    }
-}
-
-fn descendant_process_ids(
-    root_pid: u32,
-    relationships: impl IntoIterator<Item = (u32, Option<u32>)>,
-) -> HashSet<u32> {
-    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (pid, parent_pid) in relationships {
-        if let Some(parent_pid) = parent_pid {
-            children_by_parent.entry(parent_pid).or_default().push(pid);
-        }
-    }
-
-    let mut descendants = HashSet::new();
-    let mut pending = vec![root_pid];
-    while let Some(parent_pid) = pending.pop() {
-        let Some(children) = children_by_parent.get(&parent_pid) else {
-            continue;
-        };
-        for &child_pid in children {
-            if child_pid == root_pid {
-                continue;
-            }
-            if descendants.insert(child_pid) {
-                pending.push(child_pid);
-            }
-        }
-    }
-    descendants
-}
-
-fn screenpipe_descendant_ids(sys: &System, current_pid: sysinfo::Pid) -> HashSet<u32> {
-    descendant_process_ids(
-        current_pid.as_u32(),
-        sys.processes().iter().map(|(pid, process)| {
-            (
-                pid.as_u32(),
-                process.parent().map(|parent_pid| parent_pid.as_u32()),
-            )
-        }),
-    )
-}
-
-fn related_process_group(
-    current_pid: sysinfo::Pid,
-    pid: sysinfo::Pid,
-    process: &sysinfo::Process,
-    descendant_ids: &HashSet<u32>,
-) -> Option<&'static str> {
-    let text = process_search_text(process);
-
-    if pid == current_pid {
-        return Some("screenpipe_app");
-    }
-
-    if text.contains("screenpipe-mcp") && descendant_ids.contains(&pid.as_u32()) {
-        return Some("screenpipe_mcp_child");
-    }
-
-    if text.contains("screenpipe-mcp") {
-        return Some("screenpipe_mcp_external");
-    }
-
-    if descendant_ids.contains(&pid.as_u32()) {
-        // Keep the established group key for dashboard compatibility; it now
-        // includes the full child tree rather than only direct children.
-        return Some("screenpipe_app_child");
-    }
-
-    if text.contains("screenpipe") {
-        return Some("screenpipe_other");
-    }
-
-    None
 }
 
 /// Run a command with a timeout to avoid blocking startup if a tool hangs.
@@ -641,7 +365,7 @@ pub enum RestartSignal {
     RecordingTasks,
 }
 
-impl ResourceMonitor {
+impl ResourceTelemetryReporter {
     pub fn new(telemetry_enabled: bool) -> Arc<Self> {
         // CI / automation always wins over the settings opt-in (see
         // analytics::telemetry_disabled_by_env).
@@ -766,14 +490,8 @@ impl ResourceMonitor {
 
     async fn send_to_posthog(
         &self,
-        total_memory_gb: f64,
-        system_total_memory: f64,
-        available_memory_gb: f64,
-        used_swap_gb: f64,
-        total_swap_gb: f64,
-        total_cpu: f32,
-        load_average: LoadAverage,
-        phys_footprint_gb: f64,
+        snapshot: &ResourceSnapshot,
+        runtime: Duration,
         mem_trend: Option<&LeakStats>,
     ) {
         let Some(client) = &self.posthog_client else {
@@ -784,39 +502,48 @@ impl ResourceMonitor {
         let mut properties = Map::new();
         properties.insert("distinct_id".to_string(), json!(&self.distinct_id));
         properties.insert("$lib".to_string(), json!("rust-reqwest"));
-        properties.insert("total_memory_gb".to_string(), json!(total_memory_gb));
+        properties.insert(
+            "total_memory_gb".to_string(),
+            json!(snapshot.total_memory_gb),
+        );
         // Activity-Monitor "Memory" — surfaces cold/compressed/swapped leaks
         // that resident set size (`total_memory_gb`) hides. See
-        // `macos_phys_footprint_bytes`.
-        properties.insert("phys_footprint_gb".to_string(), json!(phys_footprint_gb));
+        // `screenpipe-resource` obtains this from `proc_pid_rusage` on macOS.
+        properties.insert(
+            "phys_footprint_gb".to_string(),
+            json!(snapshot.phys_footprint_gb),
+        );
         properties.insert(
             "system_total_memory_gb".to_string(),
-            json!(system_total_memory),
+            json!(snapshot.system_total_memory_gb),
         );
         properties.insert(
             "memory_usage_percent".to_string(),
-            json!((total_memory_gb / system_total_memory) * 100.0),
+            json!(snapshot.memory_usage_percent),
         );
         properties.insert(
             "available_memory_gb".to_string(),
-            json!(available_memory_gb),
+            json!(snapshot.available_memory_gb),
         );
-        properties.insert("used_swap_gb".to_string(), json!(used_swap_gb));
-        properties.insert("total_swap_gb".to_string(), json!(total_swap_gb));
-        properties.insert("total_cpu_percent".to_string(), json!(total_cpu));
+        properties.insert("used_swap_gb".to_string(), json!(snapshot.used_swap_gb));
+        properties.insert("total_swap_gb".to_string(), json!(snapshot.total_swap_gb));
+        properties.insert(
+            "total_cpu_percent".to_string(),
+            json!(snapshot.total_cpu_percent),
+        );
         properties.insert(
             "load_average_1m".to_string(),
-            json!(load_average.one_minute),
+            json!(snapshot.load_average.one_minute),
         );
         properties.insert(
             "load_average_5m".to_string(),
-            json!(load_average.five_minutes),
+            json!(snapshot.load_average.five_minutes),
         );
         properties.insert(
             "load_average_15m".to_string(),
-            json!(load_average.fifteen_minutes),
+            json!(snapshot.load_average.fifteen_minutes),
         );
-        let normalized_load = load_average.per_cpu(self.hw_info.cpu_count);
+        let normalized_load = snapshot.load_average.per_cpu(self.hw_info.cpu_count);
         properties.insert(
             "load_average_1m_per_cpu".to_string(),
             json!(normalized_load.one_minute),
@@ -829,10 +556,7 @@ impl ResourceMonitor {
             "load_average_15m_per_cpu".to_string(),
             json!(normalized_load.fifteen_minutes),
         );
-        properties.insert(
-            "runtime_seconds".to_string(),
-            json!(self.start_time.elapsed().as_secs()),
-        );
+        properties.insert("runtime_seconds".to_string(), json!(runtime.as_secs()));
         properties.insert("os_name".to_string(), json!(&self.hw_info.os_name));
         properties.insert("os_version".to_string(), json!(&self.hw_info.os_version));
         properties.insert(
@@ -884,138 +608,36 @@ impl ResourceMonitor {
         }
     }
 
-    async fn collect_metrics(
-        &self,
-        sys: &System,
-    ) -> (
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f32,
-        f64,
-        LoadAverage,
-        Duration,
-        f64,
-    ) {
-        let pid = std::process::id();
-        let mut total_memory = 0.0;
-        let mut max_virtual_memory: f64 = 0.0; // Changed from total to max
-        let mut total_cpu = 0.0;
-
-        let current_pid = sysinfo::Pid::from_u32(pid);
-        if sys.process(current_pid).is_some() {
-            let descendant_ids = screenpipe_descendant_ids(sys, current_pid);
-            for (process_pid, process) in sys.processes() {
-                if *process_pid != current_pid && !descendant_ids.contains(&process_pid.as_u32()) {
-                    continue;
-                }
-                total_memory += process.memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-                max_virtual_memory = max_virtual_memory
-                    .max(process.virtual_memory() as f64 / (1024.0 * 1024.0 * 1024.0));
-                total_cpu += process.cpu_usage();
-            }
-        }
-
-        let system_total_memory = sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let available_memory_gb = sys.available_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let used_swap_gb = sys.used_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let total_swap_gb = sys.total_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let memory_usage_percent = (total_memory / system_total_memory) * 100.0;
-        let load_average = LoadAverage::from_sysinfo(sys.load_average());
-        let runtime = self.start_time.elapsed();
-
-        // Physical footprint = the "Memory" number Activity Monitor shows, and
-        // the one that actually tracks a leak: it counts compressed + swapped
-        // dirty pages, which `memory()` (resident set size) does NOT. A cold
-        // leak (pages written once, never re-read) gets compressed/swapped out,
-        // so RSS stays flat while footprint climbs to the GBs users report.
-        // On non-macOS we fall back to RSS (≈ footprint there, and `malloc_trim`
-        // keeps Linux RSS honest), so the field is always populated.
-        #[cfg(target_os = "macos")]
-        let phys_footprint_gb = macos_phys_footprint_bytes()
-            .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
-            .unwrap_or(total_memory);
-        #[cfg(not(target_os = "macos"))]
-        let phys_footprint_gb = total_memory;
-
-        (
-            total_memory,
-            system_total_memory,
-            available_memory_gb,
-            used_swap_gb,
-            total_swap_gb,
-            memory_usage_percent,
-            total_cpu,
-            max_virtual_memory,
-            load_average,
-            runtime,
-            phys_footprint_gb,
-        )
-    }
-
     /// Max resource log file size (10 MB). When exceeded the file is truncated.
     const MAX_RESOURCE_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
-    async fn log_to_file(
-        &self,
-        metrics: (
-            f64,
-            f64,
-            f64,
-            f64,
-            f64,
-            f64,
-            f32,
-            f64,
-            LoadAverage,
-            Duration,
-            f64,
-        ),
-        breakdown: &ProcessBreakdown,
-    ) {
-        let (
-            total_memory_gb,
-            system_total_memory,
-            available_memory_gb,
-            used_swap_gb,
-            total_swap_gb,
-            memory_usage_percent,
-            total_cpu,
-            total_virtual_memory_gb,
-            load_average,
-            runtime,
-            phys_footprint_gb,
-        ) = metrics;
-
+    async fn log_to_file(&self, snapshot: &ResourceSnapshot, runtime: Duration) {
         if let Some(ref filename) = self.resource_log_file {
             let json_data = json!({
                 "timestamp": Local::now().to_rfc3339(),
                 "runtime_seconds": runtime.as_secs(),
-                "total_memory_gb": total_memory_gb,
-                "system_total_memory_gb": system_total_memory,
-                "memory_usage_percent": memory_usage_percent,
-                "available_memory_gb": available_memory_gb,
-                "used_swap_gb": used_swap_gb,
-                "total_swap_gb": total_swap_gb,
-                "total_cpu_percent": total_cpu,
-                "total_virtual_memory_gb": total_virtual_memory_gb,
-                "load_average_1m": load_average.one_minute,
-                "load_average_5m": load_average.five_minutes,
-                "load_average_15m": load_average.fifteen_minutes,
-                "load_average_1m_per_cpu": load_average
+                "total_memory_gb": snapshot.total_memory_gb,
+                "system_total_memory_gb": snapshot.system_total_memory_gb,
+                "memory_usage_percent": snapshot.memory_usage_percent,
+                "available_memory_gb": snapshot.available_memory_gb,
+                "used_swap_gb": snapshot.used_swap_gb,
+                "total_swap_gb": snapshot.total_swap_gb,
+                "total_cpu_percent": snapshot.total_cpu_percent,
+                "total_virtual_memory_gb": snapshot.max_virtual_memory_gb,
+                "load_average_1m": snapshot.load_average.one_minute,
+                "load_average_5m": snapshot.load_average.five_minutes,
+                "load_average_15m": snapshot.load_average.fifteen_minutes,
+                "load_average_1m_per_cpu": snapshot.load_average
                     .per_cpu(self.hw_info.cpu_count)
                     .one_minute,
-                "load_average_5m_per_cpu": load_average
+                "load_average_5m_per_cpu": snapshot.load_average
                     .per_cpu(self.hw_info.cpu_count)
                     .five_minutes,
-                "load_average_15m_per_cpu": load_average
+                "load_average_15m_per_cpu": snapshot.load_average
                     .per_cpu(self.hw_info.cpu_count)
                     .fifteen_minutes,
-                "phys_footprint_gb": phys_footprint_gb,
-                "process_breakdown": breakdown,
+                "phys_footprint_gb": snapshot.phys_footprint_gb,
+                "process_breakdown": &snapshot.process_breakdown,
             });
 
             // Append-only JSONL: one JSON object per line, no read-back needed.
@@ -1042,78 +664,6 @@ impl ResourceMonitor {
         }
     }
 
-    fn collect_process_breakdown(sys: &System) -> ProcessBreakdown {
-        let current_pid = sysinfo::Pid::from_u32(std::process::id());
-        let descendant_ids = screenpipe_descendant_ids(sys, current_pid);
-        let mut groups: BTreeMap<&'static str, (usize, f64, f32)> = BTreeMap::new();
-        let mut related_processes = Vec::new();
-
-        for (pid, process) in sys.processes() {
-            let Some(group) = related_process_group(current_pid, *pid, process, &descendant_ids)
-            else {
-                continue;
-            };
-
-            let rss_gb = process.memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-            let cpu_percent = process.cpu_usage();
-            let entry = groups.entry(group).or_insert((0, 0.0, 0.0));
-            entry.0 += 1;
-            entry.1 += rss_gb;
-            entry.2 += cpu_percent;
-
-            related_processes.push(ProcessUsage {
-                pid: pid.as_u32(),
-                parent_pid: process.parent().map(|parent_pid| parent_pid.as_u32()),
-                parent_name: process
-                    .parent()
-                    .and_then(|parent_pid| sys.process(parent_pid))
-                    .map(safe_process_name),
-                name: safe_process_name(process),
-                group: group.to_string(),
-                rss_mb: rss_gb * 1024.0,
-                cpu_percent,
-            });
-        }
-
-        if related_processes.is_empty() {
-            return ProcessBreakdown::empty();
-        }
-
-        let mut top_related_by_memory = related_processes.clone();
-        top_related_by_memory.sort_by(|a, b| {
-            b.rss_mb
-                .partial_cmp(&a.rss_mb)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        top_related_by_memory.truncate(12);
-
-        let mut top_related_by_cpu = related_processes;
-        top_related_by_cpu.sort_by(|a, b| {
-            b.cpu_percent
-                .partial_cmp(&a.cpu_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        top_related_by_cpu.truncate(12);
-
-        let groups = groups
-            .into_iter()
-            .map(
-                |(group, (process_count, rss_gb, cpu_percent))| ProcessGroupUsage {
-                    group: group.to_string(),
-                    process_count,
-                    rss_gb,
-                    cpu_percent,
-                },
-            )
-            .collect();
-
-        ProcessBreakdown {
-            groups,
-            top_related_by_memory,
-            top_related_by_cpu,
-        }
-    }
-
     fn log_process_breakdown(breakdown: &ProcessBreakdown) {
         if breakdown.should_warn() {
             warn!(
@@ -1135,62 +685,41 @@ impl ResourceMonitor {
         }
     }
 
-    async fn log_status(&self, sys: &System) {
-        let metrics = self.collect_metrics(sys).await;
-        let (
-            total_memory_gb,
-            system_total_memory,
-            available_memory_gb,
-            used_swap_gb,
-            total_swap_gb,
-            memory_usage_percent,
-            total_cpu,
-            total_virtual_memory_gb,
-            load_average,
-            runtime,
-            phys_footprint_gb,
-        ) = metrics;
-        let breakdown = Self::collect_process_breakdown(sys);
-
+    fn log_snapshot(&self, snapshot: &ResourceSnapshot, runtime: Duration) {
         // Log to console with virtual memory. Let tracing format lazily so
         // release builds with debug logging disabled avoid the String allocation.
         debug!(
             "Runtime: {}s, Memory: {:.0}% ({:.2} GB / {:.2} GB, {:.2} GB available), Swap: {:.2}/{:.2} GB, Footprint: {:.2} GB, Virtual: {:.2} GB, CPU: {:.0}%, Load: {:.2}/{:.2}/{:.2}",
             runtime.as_secs(),
-            memory_usage_percent,
-            total_memory_gb,
-            system_total_memory,
-            available_memory_gb,
-            used_swap_gb,
-            total_swap_gb,
-            phys_footprint_gb,
-            total_virtual_memory_gb,
-            total_cpu,
-            load_average.one_minute,
-            load_average.five_minutes,
-            load_average.fifteen_minutes,
+            snapshot.memory_usage_percent,
+            snapshot.total_memory_gb,
+            snapshot.system_total_memory_gb,
+            snapshot.available_memory_gb,
+            snapshot.used_swap_gb,
+            snapshot.total_swap_gb,
+            snapshot.phys_footprint_gb,
+            snapshot.max_virtual_memory_gb,
+            snapshot.total_cpu_percent,
+            snapshot.load_average.one_minute,
+            snapshot.load_average.five_minutes,
+            snapshot.load_average.fifteen_minutes,
         );
-        Self::log_process_breakdown(&breakdown);
+        Self::log_process_breakdown(&snapshot.process_breakdown);
+    }
+
+    async fn log_status(&self, snapshot: &ResourceSnapshot) {
+        let runtime = self.start_time.elapsed();
+        self.log_snapshot(snapshot, runtime);
 
         // Log to file
-        self.log_to_file(metrics, &breakdown).await;
+        self.log_to_file(snapshot, runtime).await;
 
-        let mem_trend = self.record_leak_sample(runtime.as_secs_f64(), total_memory_gb);
+        let mem_trend = self.record_leak_sample(runtime.as_secs_f64(), snapshot.total_memory_gb);
 
         // Send to PostHog if enabled
         if self.posthog_enabled {
             tokio::select! {
-                _ = self.send_to_posthog(
-                    total_memory_gb,
-                    system_total_memory,
-                    available_memory_gb,
-                    used_swap_gb,
-                    total_swap_gb,
-                    total_cpu,
-                    load_average,
-                    phys_footprint_gb,
-                    mem_trend.as_ref(),
-                ) => {},
+                _ = self.send_to_posthog(snapshot, runtime, mem_trend.as_ref()) => {},
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     warn!("PostHog request timed out");
                 }
@@ -1210,26 +739,12 @@ impl ResourceMonitor {
         let mut last_posthog_update = Instant::now();
 
         tokio::spawn(async move {
-            // Only load process + CPU info — skip disks, networks, components.
-            let mut sys = System::new();
-            sys.refresh_cpu();
-            // Refresh per-process CPU only (memory/parent are always collected).
-            // Skipping per-process disk-usage and user lookups avoids the extra
-            // per-PID syscalls that make a full refresh costly on Windows.
-            sys.refresh_processes_specifics(ProcessRefreshKind::new().with_cpu());
-            sys.refresh_memory();
+            let mut sampler = ResourceSampler::new();
 
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        // Only refresh what collect_metrics actually uses:
-                        // CPU + process list + system memory totals.
-                        // Skips disks, networks, components — saves allocations.
-                        sys.refresh_cpu();
-                        // CPU-only process refresh: skip per-PID disk/user
-                        // syscalls (the expensive part on Windows).
-                        sys.refresh_processes_specifics(ProcessRefreshKind::new().with_cpu());
-                        sys.refresh_memory();
+                        sampler.refresh();
 
                         // Tell the system allocator to return freed pages to the OS.
                         // Without this, the default macOS allocator holds freed large
@@ -1258,13 +773,13 @@ impl ResourceMonitor {
                         }
                         let now = Instant::now();
                         let should_send_to_posthog = now.duration_since(last_posthog_update) >= posthog_interval;
+                        let snapshot = sampler.snapshot();
 
                         if should_send_to_posthog {
                             last_posthog_update = now;
-                            monitor.log_status(&sys).await;
+                            monitor.log_status(&snapshot).await;
                         } else {
-                            // Log status without sending to PostHog
-                            monitor.log_status_local(&sys).await;
+                            monitor.log_status_local(&snapshot).await;
                         }
                     }
                 }
@@ -1272,50 +787,16 @@ impl ResourceMonitor {
         });
     }
 
-    // New method for logging without PostHog
-    async fn log_status_local(&self, sys: &System) {
-        let metrics = self.collect_metrics(sys).await;
-        let (
-            total_memory_gb,
-            system_total_memory,
-            available_memory_gb,
-            used_swap_gb,
-            total_swap_gb,
-            memory_usage_percent,
-            total_cpu,
-            total_virtual_memory_gb,
-            load_average,
-            runtime,
-            phys_footprint_gb,
-        ) = metrics;
-        let breakdown = Self::collect_process_breakdown(sys);
-
-        // Log to console with virtual memory. Let tracing format lazily so
-        // release builds with debug logging disabled avoid the String allocation.
-        debug!(
-            "Runtime: {}s, Memory: {:.0}% ({:.2} GB / {:.2} GB, {:.2} GB available), Swap: {:.2}/{:.2} GB, Footprint: {:.2} GB, Virtual: {:.2} GB, CPU: {:.0}%, Load: {:.2}/{:.2}/{:.2}",
-            runtime.as_secs(),
-            memory_usage_percent,
-            total_memory_gb,
-            system_total_memory,
-            available_memory_gb,
-            used_swap_gb,
-            total_swap_gb,
-            phys_footprint_gb,
-            total_virtual_memory_gb,
-            total_cpu,
-            load_average.one_minute,
-            load_average.five_minutes,
-            load_average.fifteen_minutes,
-        );
-        Self::log_process_breakdown(&breakdown);
+    async fn log_status_local(&self, snapshot: &ResourceSnapshot) {
+        let runtime = self.start_time.elapsed();
+        self.log_snapshot(snapshot, runtime);
 
         // Log to file
-        self.log_to_file(metrics, &breakdown).await;
+        self.log_to_file(snapshot, runtime).await;
 
         // Every tick feeds the leak sentinel — alerting must not depend on
         // the (less frequent) PostHog cadence.
-        let _ = self.record_leak_sample(runtime.as_secs_f64(), total_memory_gb);
+        let _ = self.record_leak_sample(runtime.as_secs_f64(), snapshot.total_memory_gb);
     }
 
     pub async fn shutdown(&self) {
@@ -1333,62 +814,7 @@ impl ResourceMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_memory_trend, descendant_process_ids, LoadAverage, LEAK_WARMUP_SECS};
-
-    #[test]
-    fn descendant_process_ids_walks_the_full_tree() {
-        let relationships = [
-            (10, Some(1)),
-            (11, Some(10)),
-            (12, Some(11)),
-            (13, Some(10)),
-            (99, Some(1)),
-        ];
-
-        let descendants = descendant_process_ids(10, relationships);
-
-        assert_eq!(descendants.len(), 3);
-        assert!(descendants.contains(&11));
-        assert!(descendants.contains(&12));
-        assert!(descendants.contains(&13));
-        assert!(!descendants.contains(&10));
-        assert!(!descendants.contains(&99));
-    }
-
-    #[test]
-    fn descendant_process_ids_tolerates_cycles() {
-        let descendants = descendant_process_ids(10, [(11, Some(10)), (10, Some(11))]);
-
-        assert!(descendants.contains(&11));
-        assert!(!descendants.contains(&10));
-        assert_eq!(descendants.len(), 1);
-    }
-
-    #[test]
-    fn load_average_is_normalized_by_logical_cpu_count() {
-        let load = LoadAverage {
-            one_minute: 6.0,
-            five_minutes: 3.0,
-            fifteen_minutes: 1.5,
-        };
-
-        let normalized = load.per_cpu(6);
-
-        assert_eq!(normalized.one_minute, 1.0);
-        assert_eq!(normalized.five_minutes, 0.5);
-        assert_eq!(normalized.fifteen_minutes, 0.25);
-    }
-
-    #[test]
-    fn load_average_uses_one_cpu_when_cpu_count_is_zero() {
-        let load = LoadAverage {
-            one_minute: 2.0,
-            five_minutes: 1.0,
-            fifteen_minutes: 0.5,
-        };
-
-        assert_eq!(load.per_cpu(0).one_minute, 2.0);
-    }
+    use super::{analyze_memory_trend, LEAK_WARMUP_SECS};
 
     /// (runtime_secs, mem_gb) samples at 30s cadence starting after warmup.
     fn samples_over(hours: f64, mem_at: impl Fn(f64) -> f64) -> Vec<(f64, f64)> {
@@ -1479,24 +905,5 @@ mod tests {
         let stats = analyze_memory_trend(&s).expect("5h window should be judged");
         assert!(stats.r2 > 0.99);
         assert!(!stats.is_leak(), "30 MB/h flagged: {:?}", stats);
-    }
-
-    /// Validates the `proc_pid_rusage` FFI: a live process always has a
-    /// non-zero physical footprint. Guards against a wrong `rusage_info_v0`
-    /// struct layout (which would silently read garbage / the wrong field).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn phys_footprint_is_plausible() {
-        let bytes = super::macos_phys_footprint_bytes()
-            .expect("proc_pid_rusage(RUSAGE_INFO_V0) should succeed for self");
-        // A running test process is comfortably above 1 MB and below 100 GB.
-        assert!(
-            bytes > 1024 * 1024,
-            "phys_footprint suspiciously small ({bytes} bytes) — struct layout likely wrong"
-        );
-        assert!(
-            bytes < 100 * 1024 * 1024 * 1024,
-            "phys_footprint suspiciously large ({bytes} bytes) — struct layout likely wrong"
-        );
     }
 }

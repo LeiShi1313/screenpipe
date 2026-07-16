@@ -43,7 +43,7 @@ use screenpipe_engine::{
     start_meeting_watcher, start_power_manager, start_sleep_monitor, start_speaker_identification,
     start_ui_recording,
     vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
-    watch_pid, ResourceMonitor, SCServer,
+    watch_pid, ResourceTelemetryReporter, SCServer,
 };
 use screenpipe_screen::monitor::list_monitors;
 use serde_json::json;
@@ -904,8 +904,8 @@ async fn main() -> anyhow::Result<()> {
 
     let audio_devices_clone = audio_devices.clone();
 
-    let resource_monitor = ResourceMonitor::new(config.analytics_enabled);
-    resource_monitor.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
+    let resource_reporter = ResourceTelemetryReporter::new(config.analytics_enabled);
+    resource_reporter.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
 
     // Initialize analytics for API tracking
     analytics::init(config.analytics_enabled);

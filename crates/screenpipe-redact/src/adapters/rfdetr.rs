@@ -68,6 +68,15 @@ const CLASSES: [SpanLabel; NUM_CLASSES] = [
     SpanLabel::Secret,  // 11
 ];
 
+/// Per-class score floors applied on top of `conf_threshold` (the higher
+/// wins). `secret` demands 0.85: on the held-out eval every observed
+/// secret-class false fire scored ≤ 0.80, so this floor eliminates them
+/// with no measured recall cost — and `secret` is the one class the
+/// default [`crate::image::ImageRedactionPolicy`] acts on.
+#[cfg(feature = "onnx-cpu")]
+const CLASS_MIN_SCORE: [f32; NUM_CLASSES] =
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.85];
+
 /// Configuration for [`RfdetrRedactor`].
 #[derive(Debug, Clone)]
 pub struct RfdetrConfig {
@@ -401,7 +410,8 @@ mod imp {
                         best_class = c;
                     }
                 }
-                if best_score < self.cfg.conf_threshold {
+                let floor = self.cfg.conf_threshold.max(CLASS_MIN_SCORE[best_class]);
+                if best_score < floor {
                     continue;
                 }
                 let bo = q * 4;

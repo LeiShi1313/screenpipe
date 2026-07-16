@@ -11,6 +11,10 @@ icon: "newspaper"
 
 ## week of july 13, 2026
 
+### updates
+
+- **faster, broader browser URL detection** — capturing the URL of the active browser tab no longer shells out to AppleScript on every walk of the accessibility tree. screenpipe now reads the URL directly from the browser's web area, dropping per-check cost from ~150–200 ms to ~2 ms and cutting background CPU during recording. The new path also covers every Chromium-family browser (Chrome, Edge, Brave, Vivaldi, Opera, Arc) and Electron apps, not just Arc. Non-web schemes like `chrome://` and `arc://` are filtered out so they no longer pollute your browsing history. See [search screen history](/search-screen-history).
+
 ### bug fixes
 
 - **auto-update no longer gets stuck in a restart loop** — applying an update from the tray or the in-app banner used to be able to fire twice, so the app would tear down and relaunch in parallel and the health watchdog would respawn the server mid-restart. Restart-to-update now runs exactly once regardless of how it's triggered, so updates finish cleanly on the first try. See [getting started](/getting-started).

@@ -53,7 +53,71 @@ pub enum WhatsAppStatus {
     WaitingForQr,
     QrReady { qr: String },
     Connected { name: String, phone: String },
+    Reconnecting { message: String },
+    ReauthRequired { message: String },
     Error { message: String },
+}
+
+async fn apply_gateway_event(
+    event: GatewayEvent,
+    status: &Arc<Mutex<WhatsAppStatus>>,
+    http_port: &Arc<Mutex<Option<u16>>>,
+    auto_restart: &Arc<AtomicBool>,
+    session_dir: &PathBuf,
+) {
+    match event {
+        GatewayEvent::Qr { data } => {
+            info!("whatsapp: qr code received");
+            *status.lock().await = WhatsAppStatus::QrReady { qr: data };
+        }
+        GatewayEvent::Connected { name, phone } => {
+            info!("whatsapp: connected as {}", name);
+            *status.lock().await = WhatsAppStatus::Connected { name, phone };
+        }
+        GatewayEvent::Disconnected { reason } => {
+            warn!("whatsapp: disconnected — {}", reason);
+            if reason == "logged_out" {
+                // WhatsApp has explicitly invalidated these credentials. Keeping
+                // them makes every later pairing attempt immediately log out again,
+                // so remove only this unusable session and ask the user to re-pair.
+                auto_restart.store(false, Ordering::SeqCst);
+                *http_port.lock().await = None;
+                let cleanup_error = match std::fs::remove_dir_all(session_dir) {
+                    Ok(()) => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => Some(error),
+                };
+                *status.lock().await = if let Some(error) = cleanup_error {
+                    WhatsAppStatus::Error {
+                        message: format!(
+                            "WhatsApp signed this device out, but screenpipe could not reset the old session: {}",
+                            error
+                        ),
+                    }
+                } else {
+                    WhatsAppStatus::ReauthRequired {
+                        message: "WhatsApp signed this device out. Pair it again to continue."
+                            .to_string(),
+                    }
+                };
+            } else {
+                *status.lock().await = WhatsAppStatus::Reconnecting {
+                    message: "Connection interrupted. Reconnecting to WhatsApp…".to_string(),
+                };
+            }
+        }
+        GatewayEvent::Error { message } => {
+            error!("whatsapp gateway error: {}", message);
+            *status.lock().await = WhatsAppStatus::Error { message };
+        }
+        GatewayEvent::Http { port } => {
+            info!("whatsapp: gateway HTTP on port {}", port);
+            *http_port.lock().await = Some(port);
+        }
+        GatewayEvent::SendResult { .. } => {
+            // Send results are logged but do not change connection state.
+        }
+    }
 }
 
 pub struct WhatsAppGateway {
@@ -112,10 +176,13 @@ impl WhatsAppGateway {
         *self.bun_path.lock().await = bun_path.clone();
 
         self.ensure_deps(&bun_path).await?;
-        self.spawn_gateway(&bun_path).await?;
-
-        // Enable auto-restart now that we've successfully started
+        // Enable before spawning so an immediately emitted logged_out event
+        // cannot be overwritten by a later store(true) in this function.
         self.auto_restart.store(true, Ordering::SeqCst);
+        if let Err(error) = self.spawn_gateway(&bun_path).await {
+            self.auto_restart.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
 
         // Spawn watchdog that restarts the gateway if it dies unexpectedly.
         // It will exit if generation changes (meaning start_pairing was called again).
@@ -193,6 +260,7 @@ impl WhatsAppGateway {
         let status = self.status.clone();
         let http_port = self.http_port.clone();
         let auto_restart = self.auto_restart.clone();
+        let session_dir = session_dir.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -206,32 +274,15 @@ impl WhatsAppGateway {
                     continue;
                 }
                 match serde_json::from_str::<GatewayEvent>(trimmed) {
-                    Ok(GatewayEvent::Qr { data }) => {
-                        info!("whatsapp: qr code received");
-                        *status.lock().await = WhatsAppStatus::QrReady { qr: data };
-                    }
-                    Ok(GatewayEvent::Connected { name, phone }) => {
-                        info!("whatsapp: connected as {}", name);
-                        *status.lock().await = WhatsAppStatus::Connected { name, phone };
-                    }
-                    Ok(GatewayEvent::Disconnected { reason }) => {
-                        warn!("whatsapp: disconnected — {}", reason);
-                        if reason == "logged_out" {
-                            // User logged out — don't auto-restart
-                            auto_restart.store(false, Ordering::SeqCst);
-                            *status.lock().await = WhatsAppStatus::Disconnected;
-                        }
-                    }
-                    Ok(GatewayEvent::Error { message }) => {
-                        error!("whatsapp gateway error: {}", message);
-                        *status.lock().await = WhatsAppStatus::Error { message };
-                    }
-                    Ok(GatewayEvent::Http { port }) => {
-                        info!("whatsapp: gateway HTTP on port {}", port);
-                        *http_port.lock().await = Some(port);
-                    }
-                    Ok(GatewayEvent::SendResult { .. }) => {
-                        // send results are logged but not tracked in status
+                    Ok(event) => {
+                        apply_gateway_event(
+                            event,
+                            &status,
+                            &http_port,
+                            &auto_restart,
+                            &session_dir,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         debug!("whatsapp gateway unparseable line: {} ({})", line, e);
@@ -325,7 +376,13 @@ impl WhatsAppGateway {
                     info!(
                         "whatsapp: gateway exited and auto-restart is disabled, watchdog stopping"
                     );
-                    *status.lock().await = WhatsAppStatus::Disconnected;
+                    let mut current = status.lock().await;
+                    if !matches!(
+                        *current,
+                        WhatsAppStatus::ReauthRequired { .. } | WhatsAppStatus::Error { .. }
+                    ) {
+                        *current = WhatsAppStatus::Disconnected;
+                    }
                     *http_port.lock().await = None;
                     return;
                 }
@@ -395,6 +452,7 @@ impl WhatsAppGateway {
                         let s = status.clone();
                         let hp = http_port.clone();
                         let ar = auto_restart.clone();
+                        let restarted_session_dir = session_dir.clone();
                         tokio::spawn(async move {
                             let reader = BufReader::new(stdout);
                             let mut lines = reader.lines();
@@ -406,30 +464,16 @@ impl WhatsAppGateway {
                                     continue;
                                 }
                                 match serde_json::from_str::<GatewayEvent>(trimmed) {
-                                    Ok(GatewayEvent::Qr { data }) => {
-                                        info!("whatsapp: qr code received");
-                                        *s.lock().await = WhatsAppStatus::QrReady { qr: data };
+                                    Ok(event) => {
+                                        apply_gateway_event(
+                                            event,
+                                            &s,
+                                            &hp,
+                                            &ar,
+                                            &restarted_session_dir,
+                                        )
+                                        .await;
                                     }
-                                    Ok(GatewayEvent::Connected { name, phone }) => {
-                                        info!("whatsapp: connected as {}", name);
-                                        *s.lock().await = WhatsAppStatus::Connected { name, phone };
-                                    }
-                                    Ok(GatewayEvent::Disconnected { reason }) => {
-                                        warn!("whatsapp: disconnected — {}", reason);
-                                        if reason == "logged_out" {
-                                            ar.store(false, Ordering::SeqCst);
-                                            *s.lock().await = WhatsAppStatus::Disconnected;
-                                        }
-                                    }
-                                    Ok(GatewayEvent::Error { message }) => {
-                                        error!("whatsapp gateway error: {}", message);
-                                        *s.lock().await = WhatsAppStatus::Error { message };
-                                    }
-                                    Ok(GatewayEvent::Http { port }) => {
-                                        info!("whatsapp: gateway HTTP on port {}", port);
-                                        *hp.lock().await = Some(port);
-                                    }
-                                    Ok(GatewayEvent::SendResult { .. }) => {}
                                     Err(e) => {
                                         debug!(
                                             "whatsapp gateway unparseable line: {} ({})",
@@ -596,6 +640,97 @@ fn which_executable(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event_state() -> (
+        Arc<Mutex<WhatsAppStatus>>,
+        Arc<Mutex<Option<u16>>>,
+        Arc<AtomicBool>,
+    ) {
+        (
+            Arc::new(Mutex::new(WhatsAppStatus::WaitingForQr)),
+            Arc::new(Mutex::new(Some(3035))),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    #[tokio::test]
+    async fn logged_out_clears_invalid_session_and_requires_reauth() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = temp.path().join("whatsapp-session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("creds.json"), "stale").unwrap();
+        let (status, http_port, auto_restart) = event_state();
+
+        apply_gateway_event(
+            GatewayEvent::Disconnected {
+                reason: "logged_out".to_string(),
+            },
+            &status,
+            &http_port,
+            &auto_restart,
+            &session_dir,
+        )
+        .await;
+
+        assert!(!session_dir.exists());
+        assert!(!auto_restart.load(Ordering::SeqCst));
+        assert_eq!(*http_port.lock().await, None);
+        assert!(matches!(
+            *status.lock().await,
+            WhatsAppStatus::ReauthRequired { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn transient_disconnect_preserves_session_while_reconnecting() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = temp.path().join("whatsapp-session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("creds.json"), "valid").unwrap();
+        let (status, http_port, auto_restart) = event_state();
+
+        apply_gateway_event(
+            GatewayEvent::Disconnected {
+                reason: "reconnecting (code 428)".to_string(),
+            },
+            &status,
+            &http_port,
+            &auto_restart,
+            &session_dir,
+        )
+        .await;
+
+        assert!(session_dir.join("creds.json").exists());
+        assert!(auto_restart.load(Ordering::SeqCst));
+        assert_eq!(*http_port.lock().await, Some(3035));
+        assert!(matches!(
+            *status.lock().await,
+            WhatsAppStatus::Reconnecting { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_session_cleanup_is_reported_instead_of_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = temp.path().join("whatsapp-session");
+        // A file at the directory path makes remove_dir_all fail reliably.
+        std::fs::write(&session_dir, "not a directory").unwrap();
+        let (status, http_port, auto_restart) = event_state();
+
+        apply_gateway_event(
+            GatewayEvent::Disconnected {
+                reason: "logged_out".to_string(),
+            },
+            &status,
+            &http_port,
+            &auto_restart,
+            &session_dir,
+        )
+        .await;
+
+        assert!(session_dir.exists());
+        assert!(matches!(*status.lock().await, WhatsAppStatus::Error { .. }));
+    }
 
     /// An absolute hint pointing at an existing file is returned verbatim —
     /// this is the escape hatch for users who want to force a specific bun.

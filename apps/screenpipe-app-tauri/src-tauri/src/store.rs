@@ -1602,9 +1602,10 @@ impl SettingsStore {
     }
 
     pub fn app_entitled_or_dev(&self) -> bool {
-        // Debug builds (`bun tauri dev`, e2e, signed dev builds) are never gated.
-        // Release builds must not be bypassable via a runtime env var.
-        if cfg!(debug_assertions) {
+        // Debug builds and explicit self-hosted source builds may always run
+        // local capture + the localhost API. Cloud transcription keeps using
+        // `has_current_app_entitlement()` below and is not unlocked by this.
+        if cfg!(debug_assertions) || cfg!(feature = "self-hosted") {
             return true;
         }
 

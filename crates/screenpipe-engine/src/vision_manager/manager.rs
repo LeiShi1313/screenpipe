@@ -49,6 +49,9 @@ pub struct VisionManagerConfig {
     pub video_quality: String,
     /// Skip screenshot pixels/JPEG/OCR while keeping accessibility-tree capture.
     pub disable_screenshots: bool,
+    /// Use request-scoped screenshots on a fixed cadence instead of a
+    /// persistent OS capture stream and event-driven screenshots.
+    pub low_power_capture: bool,
 
     /// Mitsukeru fork: overrides for `EventDrivenCaptureConfig`.
     /// Each field is applied only when `Some(_)`. None = follow active PowerProfile.
@@ -489,6 +492,7 @@ impl VisionManager {
         let mut capture_config = EventDrivenCaptureConfig {
             jpeg_quality: baseline_q,
             disable_screenshots: self.config.disable_screenshots,
+            low_power_capture: self.config.low_power_capture,
             ..EventDrivenCaptureConfig::default()
         };
         // Mitsukeru fork: apply per-parameter CLI / settings overrides if any.
@@ -499,6 +503,12 @@ impl VisionManager {
         capture_config.idle_capture_interval_override_ms = self.config.idle_capture_interval_ms;
         if let Some(v) = self.config.idle_capture_interval_ms {
             capture_config.idle_capture_interval_ms = v;
+        } else if self.config.low_power_capture {
+            // Dayflow-style snapshot mode is intentionally predictable: one
+            // request-scoped screenshot every ten seconds unless the user
+            // explicitly chooses another interval.
+            capture_config.idle_capture_interval_ms = 10_000;
+            capture_config.idle_capture_interval_override_ms = Some(10_000);
         }
         if let Some(v) = self.config.visual_check_interval_ms {
             capture_config.visual_check_interval_ms = v;
@@ -752,6 +762,7 @@ mod tests {
             languages: vec![Language::English],
             video_quality: "balanced".to_string(),
             disable_screenshots: false,
+            low_power_capture: true,
             idle_capture_interval_ms: None,
             visual_check_interval_ms: None,
             visual_change_threshold: None,

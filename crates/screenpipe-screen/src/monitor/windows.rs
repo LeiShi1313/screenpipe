@@ -42,6 +42,32 @@ impl SafeMonitor {
         self.capture_image_inner(false).await
     }
 
+    /// Capture one image with a fresh WGC session and close it before return.
+    pub async fn capture_image_request_scoped(&self) -> Result<DynamicImage> {
+        let monitor_id = self.monitor_id;
+        let persistent = self.persistent_capture.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = persistent
+                .lock()
+                .map_err(|e| anyhow::anyhow!("WGC capture mutex poisoned: {}", e))?;
+            if let Some(mut capture) = guard.take() {
+                capture.stop();
+            }
+            let result = Self::request_scoped_wgc_capture(monitor_id).or_else(|error| {
+                tracing::debug!(
+                    "request-scoped WGC capture failed for monitor {}, falling back to xcap: {}",
+                    monitor_id,
+                    error
+                );
+                Self::per_frame_capture(monitor_id)
+            });
+            drop(guard);
+            result
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("request-scoped capture task panicked: {}", e))?
+    }
+
     /// Capture a frame as part of a sustained recording loop.
     ///
     /// Unlike one-shot [`Self::capture_image`] calls, an explicit streaming caller

@@ -83,9 +83,9 @@ pub enum AudioCaptureMode {
     /// Capture continuously, 24/7. Historical behavior and engine default.
     #[default]
     Always,
-    /// Capture only while a meeting / audio session is detected. Audio outside
-    /// meetings is dropped before it is persisted or transcribed — saving cloud
-    /// transcription cost, disk, and the PII/transcription CPU pipeline.
+    /// Capture only while a meeting / audio session is detected. Background
+    /// device streams are closed outside meetings, and any in-flight chunk is
+    /// still dropped before persistence/transcription as a race-safe backstop.
     /// Requires the meeting detector; if it is disabled this mode falls back to
     /// `Always` so it can never silently drop *all* audio.
     MeetingsOnly,
@@ -142,7 +142,7 @@ pub struct AudioManagerOptions {
     /// `Realtime` = immediate (default), `Batch` = accumulate longer chunks for quality.
     pub transcription_mode: TranscriptionMode,
     /// Controls when audio is captured. `Always` (default) = continuous 24/7.
-    /// `MeetingsOnly` = drop audio outside detected meetings.
+    /// `MeetingsOnly` = keep background audio devices closed outside meetings.
     pub audio_capture_mode: AudioCaptureMode,
     /// Meeting detector for batch mode — used for metadata/summaries.
     /// Shared with UI recorder which feeds app switch events into it.

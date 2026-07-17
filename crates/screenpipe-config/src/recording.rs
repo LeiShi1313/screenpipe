@@ -252,6 +252,14 @@ pub struct RecordingSettings {
     #[serde(rename = "disableScreenshots", default)]
     pub disable_screenshots: bool,
 
+    /// Capture screenshots with a fresh, request-scoped OS capture session and
+    /// release it immediately after each image. This avoids keeping
+    /// ScreenCaptureKit/WGC active between snapshots and disables UI-event and
+    /// visual-change triggered screenshots. Manual HD recording remains a
+    /// separate streaming path.
+    #[serde(rename = "lowPowerCapture")]
+    pub low_power_capture: bool,
+
     /// Disable the timeline / rewind feature. When true, the engine skips
     /// timeline-only work: warming the hot frame cache from the DB at startup
     /// and buffering captured frames/audio into the in-memory hot cache that
@@ -727,6 +735,7 @@ impl Default for RecordingSettings {
             vocabulary: vec![],
             disable_vision: false,
             disable_screenshots: false,
+            low_power_capture: true,
             disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
@@ -900,6 +909,10 @@ mod tests {
         assert!(!settings.macos_input_vpio_enabled);
         assert_eq!(settings.aec_mode, AecMode::Off);
         assert_eq!(settings.effective_aec_flags(), (false, false, false));
+        assert!(
+            settings.low_power_capture,
+            "new and pre-existing stores should default to request-scoped snapshots"
+        );
     }
 
     #[test]

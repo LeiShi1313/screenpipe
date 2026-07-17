@@ -202,6 +202,27 @@ pub async fn capture_monitor_image(
     Ok((image, capture_duration))
 }
 
+/// Capture a monitor image with no OS capture session retained between calls.
+///
+/// macOS uses SCScreenshotManager, Windows creates and closes a WGC session,
+/// and Linux delegates to its already request-scoped xcap/grim path.
+pub async fn capture_monitor_image_request_scoped(
+    monitor: &SafeMonitor,
+    excluded_window_ids: &[u32],
+) -> Result<(DynamicImage, Duration), anyhow::Error> {
+    let start = Instant::now();
+    #[cfg(target_os = "macos")]
+    let image = monitor
+        .capture_image_request_scoped_excluding(excluded_window_ids)
+        .await?;
+    #[cfg(not(target_os = "macos"))]
+    let image = {
+        let _ = excluded_window_ids;
+        monitor.capture_image_request_scoped().await?
+    };
+    Ok((image, start.elapsed()))
+}
+
 /// Capture all visible windows on a monitor (called only when frame changed).
 pub async fn capture_windows(
     monitor: &SafeMonitor,

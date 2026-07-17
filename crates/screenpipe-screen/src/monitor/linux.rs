@@ -50,6 +50,11 @@ impl SafeMonitor {
         Ok(image)
     }
 
+    /// Linux xcap/grim captures are already request-scoped.
+    pub async fn capture_image_request_scoped(&self) -> Result<DynamicImage> {
+        self.capture_image().await
+    }
+
     /// Per-frame xcap capture with cached index.
     fn per_frame_capture_with_cache(
         monitor_id: u32,

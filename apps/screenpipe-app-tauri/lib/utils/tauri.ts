@@ -1017,7 +1017,7 @@ async lockSync() : Promise<Result<null, string>> {
  * Cancel any in-flight OAuth flow(s) for the given integration.
  * Dropping the stored sender makes the awaiting `oauth_connect` call fail fast
  * with "OAuth channel closed before code was received" instead of hanging for
- * the full 120s timeout.
+ * the full callback timeout.
  */
 async oauthCancel(integrationId: string) : Promise<Result<null, string>> {
     try {
@@ -2848,6 +2848,14 @@ disableVision: boolean;
  * UI events are enough and screen pixels are too expensive or sensitive.
  */
 disableScreenshots?: boolean;
+/**
+ * Capture screenshots with a fresh, request-scoped OS capture session and
+ * release it immediately after each image. This avoids keeping
+ * ScreenCaptureKit/WGC active between snapshots and disables UI-event and
+ * visual-change triggered screenshots. Manual HD recording remains a
+ * separate streaming path.
+ */
+lowPowerCapture: boolean;
 /**
  * Disable the timeline / rewind feature. When true, the engine skips
  * timeline-only work: warming the hot frame cache from the DB at startup

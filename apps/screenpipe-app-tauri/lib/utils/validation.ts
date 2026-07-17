@@ -85,6 +85,7 @@ export const settingsStoreSchema = z.object({
   ignoredUrls: z.array(z.string()),
   disableVision: z.boolean(),
   disableScreenshots: z.boolean().optional(),
+  lowPowerCapture: z.boolean().optional(),
   useAllMonitors: z.boolean(),
   fps: z.number().min(0.1, "FPS must be at least 0.1").max(60, "FPS cannot exceed 60"),
 

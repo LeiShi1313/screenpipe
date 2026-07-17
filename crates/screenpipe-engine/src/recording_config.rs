@@ -34,6 +34,9 @@ pub struct RecordingConfig {
     /// capture alive. This skips visual-diff images, full screenshot capture,
     /// JPEG writes, and OCR fallback.
     pub disable_screenshots: bool,
+    /// Use request-scoped screenshots and a fixed timer instead of keeping an
+    /// OS capture stream and UI-event hooks alive between frames.
+    pub low_power_capture: bool,
     /// Disable the timeline / rewind feature. Skips timeline-only backend work
     /// (hot frame cache warm-up + per-frame/audio buffering into the hot cache
     /// that only the timeline streaming endpoint consumes).
@@ -283,6 +286,7 @@ impl RecordingConfig {
                 || settings.audio_capture_mode.eq_ignore_ascii_case("disabled"),
             disable_vision: settings.disable_vision,
             disable_screenshots: settings.disable_screenshots,
+            low_power_capture: settings.low_power_capture,
             disable_timeline: settings.disable_timeline,
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
@@ -437,13 +441,14 @@ impl RecordingConfig {
     /// Build a `UiRecorderConfig` from this recording config.
     pub fn to_ui_recorder_config(&self) -> crate::ui_recorder::UiRecorderConfig {
         let defaults = crate::ui_recorder::UiRecorderConfig::default();
+        let event_capture_enabled = !self.low_power_capture;
         let capture_on_clipboard = self
             .capture_on_clipboard
             .unwrap_or(defaults.capture_on_clipboard);
         crate::ui_recorder::UiRecorderConfig {
-            enabled: true,
-            enable_tree_walker: true,
-            record_input_events: true,
+            enabled: event_capture_enabled,
+            enable_tree_walker: event_capture_enabled,
+            record_input_events: event_capture_enabled,
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
@@ -529,6 +534,7 @@ impl RecordingConfig {
             languages: self.languages.clone(),
             video_quality: self.video_quality.clone(),
             disable_screenshots: self.disable_screenshots,
+            low_power_capture: self.low_power_capture,
             idle_capture_interval_ms: self.idle_capture_interval_ms,
             visual_check_interval_ms: self.visual_check_interval_ms,
             visual_change_threshold: self.visual_change_threshold,
@@ -572,6 +578,27 @@ mod tests {
 
     fn build(s: &screenpipe_config::RecordingSettings) -> RecordingConfig {
         RecordingConfig::from_settings(s, std::path::PathBuf::from("/tmp/sp_test"), None)
+    }
+
+    #[test]
+    fn low_power_capture_disables_ui_hooks_and_flows_to_vision() {
+        let config = build(&screenpipe_config::RecordingSettings::default());
+        let ui = config.to_ui_recorder_config();
+        assert!(!ui.enabled);
+        assert!(!ui.enable_tree_walker);
+        assert!(!ui.record_input_events);
+
+        let vision = config.to_vision_manager_config(
+            "capture-output".to_string(),
+            std::sync::Arc::new(PipelineMetrics::new()),
+        );
+        assert!(vision.low_power_capture);
+
+        let event_driven = screenpipe_config::RecordingSettings {
+            low_power_capture: false,
+            ..Default::default()
+        };
+        assert!(build(&event_driven).to_ui_recorder_config().enabled);
     }
 
     #[test]
@@ -776,6 +803,7 @@ mod tests {
         assert!(vision.pause_on_drm_content);
         assert_eq!(vision.video_quality, "high");
         assert!(!vision.disable_screenshots);
+        assert!(vision.low_power_capture);
         assert_eq!(vision.idle_capture_interval_ms, Some(2_000));
         assert_eq!(vision.visual_check_interval_ms, Some(350));
         assert_eq!(vision.visual_change_threshold, Some(0.18));

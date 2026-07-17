@@ -37,6 +37,7 @@ export const searchIndex: SettingsField[] = [
   { label: "Bluetooth microphones", keywords: ["bluetooth", "airpods", "headset", "a2dp", "sco", "meeting"], conditional: true },
   { label: "Screen context capture", keywords: ["screen", "video", "accessibility"] },
   { label: "Screenshot images", keywords: ["screenshot", "pixels", "ocr", "jpeg"] },
+  { label: "Low-power snapshots", keywords: ["battery", "cpu", "replayd", "dayflow", "timer", "snapshot"], conditional: true },
   { label: "Use all monitors", keywords: ["monitor", "display"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
   { label: "Monitors", conditional: true },
@@ -3837,6 +3838,30 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
+        {screenshotImagesEnabled && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center space-x-2.5">
+                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground">Low-power snapshots</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Take screenshots on a fixed timer and fully release the OS capture session between shots. Event-triggered screenshots are disabled; meeting detection and HD recording still work.
+                    </p>
+                  </div>
+                </div>
+                <ManagedSwitch
+                  settingKey="lowPowerCapture"
+                  id="lowPowerCapture"
+                  checked={settings.lowPowerCapture ?? true}
+                  onCheckedChange={(checked) => handleSettingsChange({ lowPowerCapture: checked }, true)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Use All Monitors - right below screen capture toggles */}
         {screenshotImagesEnabled && (
           <Card className="border-border bg-card">
@@ -3969,7 +3994,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             (null = follow the power profile). Needs a recording restart to
             take effect, hence handleSettingsChange(..., true). */}
         {screenshotImagesEnabled && (() => {
-          const idleMs = settings.idleCaptureIntervalMs ?? null;
+          const lowPower = settings.lowPowerCapture ?? true;
+          const idleMs = settings.idleCaptureIntervalMs ?? (lowPower ? 10_000 : null);
           const seconds = idleMs == null ? 0 : Math.round(idleMs / 1000);
           return (
             <Card className="border-border bg-card">
@@ -3979,8 +4005,9 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div className="min-w-0">
                     <h3 className="text-sm font-medium text-foreground">Capture frequency</h3>
                     <p className="text-xs text-muted-foreground">
-                      Always take a screenshot at least this often, even when the screen
-                      isn&apos;t changing. Lower = fewer missed moments + more disk used.
+                      {lowPower
+                        ? "Take one request-scoped screenshot at this fixed interval. Lower = more detail and more CPU/disk use."
+                        : "Always take a screenshot at least this often, even when the screen isn't changing. Lower = fewer missed moments + more disk used."}
                     </p>
                   </div>
                 </div>
@@ -4002,13 +4029,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       true,
                     )
                   }
-                  min={0}
+                  min={lowPower ? 1 : 0}
                   max={10}
                   step={1}
                   className="w-full"
                 />
                 <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
-                  <span>auto</span>
+                  <span>{lowPower ? "every 1s" : "auto"}</span>
                   <span>every 10s</span>
                 </div>
                 <CaptureFrequencyPreview seconds={seconds} />

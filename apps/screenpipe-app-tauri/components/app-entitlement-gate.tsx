@@ -20,6 +20,7 @@ import {
   hasPersistedEntitlementEvidence,
   isDevBillingBypassEnabled,
   isDevLoginEnabled,
+  isSelfHostedBuild,
   isTokenHydrationPending,
   needsAppEntitlementRefresh,
   normalizePlanLabel,
@@ -127,7 +128,9 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const gateReportedRef = useRef(false);
   const rehydratingRef = useRef(false);
   const user = settings.user as AppUser | null | undefined;
-  const devBypass = isDevBillingBypassEnabled();
+  // Self-hosted source builds bypass only the desktop recording wall. Cloud
+  // capabilities still use their independent entitlement checks.
+  const devBypass = isSelfHostedBuild() || isDevBillingBypassEnabled();
   const isEntitled = hasAppEntitlement(user);
   const hasConsumerSubscription = hasConsumerAppSubscription(user);
   const needsRefresh = needsAppEntitlementRefresh(user);

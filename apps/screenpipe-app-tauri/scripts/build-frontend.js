@@ -31,6 +31,10 @@ import fs from 'fs/promises'
 import os from 'os'
 import path from 'path'
 
+// This fork packages the local recorder/API as a self-hosted desktop build.
+// Next.js inlines NEXT_PUBLIC_* values during the static export.
+process.env.NEXT_PUBLIC_SCREENPIPE_SELF_HOSTED ??= 'true'
+
 const appRoot = path.resolve(__dirname, '..')
 const outDir = path.join(appRoot, 'out')
 

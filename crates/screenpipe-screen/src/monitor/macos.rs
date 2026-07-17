@@ -6,7 +6,8 @@ use super::{
     update_monitor_cache, MonitorData, MonitorListError, SafeMonitor, SckMonitor, XcapMonitor,
 };
 use anyhow::Result;
-use image::DynamicImage;
+use cidre::{api, cv, ns, sc};
+use image::{DynamicImage, RgbaImage};
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 
@@ -14,6 +15,135 @@ use std::sync::Arc;
 /// calls avoids concurrent multi-monitor spikes while preserving capture order.
 static MACOS_CAPTURE_SEMAPHORE: Lazy<tokio::sync::Semaphore> =
     Lazy::new(|| tokio::sync::Semaphore::new(1));
+
+/// ScreenshotManager is async, while the surrounding autorelease pool must
+/// stay on one blocking thread. A small dedicated runtime lets us keep the
+/// complete request (including retained Objective-C objects) inside that pool.
+static MACOS_SNAPSHOT_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create macOS snapshot runtime")
+});
+
+extern "C" {
+    fn CVPixelBufferGetBytesPerRow(pixel_buffer: *const std::ffi::c_void) -> usize;
+    fn CVPixelBufferGetBaseAddress(pixel_buffer: *const std::ffi::c_void) -> *const u8;
+}
+
+fn scaled_capture_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_width == 0 || max_width >= src_w {
+        return (src_w.max(1), src_h.max(1));
+    }
+    let target_h = ((max_width as u64 * src_h as u64) + (src_w as u64 / 2)) / src_w as u64;
+    (max_width, (target_h as u32).max(1))
+}
+
+fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> std::result::Result<RgbaImage, String> {
+    let width = image_buf.width();
+    let height = image_buf.height();
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return Err(format!(
+            "invalid screenshot dimensions: {}x{}",
+            width, height
+        ));
+    }
+
+    let lock_flags = cv::pixel_buffer::LockFlags::READ_ONLY;
+    let lock_status = unsafe { image_buf.lock_base_addr(lock_flags) };
+    if lock_status.is_err() {
+        return Err(format!(
+            "failed to lock screenshot pixel buffer: {:?}",
+            lock_status
+        ));
+    }
+
+    let plane_count = image_buf.plane_count();
+    let (bytes_per_row, pixels_ptr) = if plane_count == 0 {
+        unsafe {
+            (
+                CVPixelBufferGetBytesPerRow(image_buf as *const _ as *const std::ffi::c_void),
+                CVPixelBufferGetBaseAddress(image_buf as *const _ as *const std::ffi::c_void),
+            )
+        }
+    } else {
+        (
+            image_buf.plane_bytes_per_row(0),
+            image_buf.plane_base_address(0),
+        )
+    };
+
+    let result = (|| {
+        if pixels_ptr.is_null() || bytes_per_row < width.saturating_mul(4) {
+            return Err("invalid screenshot pixel-buffer layout".to_string());
+        }
+        let data_size = bytes_per_row
+            .checked_mul(height)
+            .ok_or_else(|| "screenshot pixel-buffer size overflow".to_string())?;
+        let pixels = unsafe { std::slice::from_raw_parts(pixels_ptr, data_size) };
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for row in 0..height {
+            let row_start = row * bytes_per_row;
+            for col in 0..width {
+                let pixel = row_start + col * 4;
+                rgba.extend_from_slice(&[
+                    pixels[pixel + 2],
+                    pixels[pixel + 1],
+                    pixels[pixel],
+                    pixels[pixel + 3],
+                ]);
+            }
+        }
+        RgbaImage::from_raw(width as u32, height as u32, rgba)
+            .ok_or_else(|| "failed to construct screenshot image".to_string())
+    })();
+
+    let _ = unsafe { image_buf.unlock_lock_base_addr(lock_flags) };
+    result
+}
+
+async fn screenshot_manager_capture(
+    monitor_id: u32,
+    width: u32,
+    height: u32,
+    excluded_window_ids: Vec<u32>,
+) -> std::result::Result<DynamicImage, String> {
+    let content = sc::ShareableContent::current()
+        .await
+        .map_err(|e| format!("failed to get shareable content: {:?}", e))?;
+    let displays = content.displays();
+    let display = displays
+        .iter()
+        .find(|display| display.display_id().0 == monitor_id)
+        .ok_or_else(|| format!("monitor {} not found", monitor_id))?;
+
+    let windows = content.windows();
+    let matching_windows: Vec<&sc::Window> = windows
+        .iter()
+        .filter(|window| excluded_window_ids.contains(&window.id()))
+        .collect();
+    let excluded = ns::Array::from_slice(&matching_windows);
+    let filter = sc::ContentFilter::with_display_excluding_windows(display, &excluded);
+
+    let mut cfg = sc::StreamCfg::new();
+    cfg.set_width(width as usize);
+    cfg.set_height(height as usize);
+    cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
+    cfg.set_shows_cursor(false);
+    if api::macos_available("15.0") {
+        cfg.set_show_mouse_clicks(false);
+    }
+    cfg.set_scales_to_fit(false);
+
+    let sample = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
+        .await
+        .map_err(|e| format!("request-scoped screenshot failed: {:?}", e))?;
+    let mut image_buf = sample
+        .image_buf()
+        .ok_or_else(|| "screenshot did not contain an image buffer".to_string())?
+        .retained();
+    image_buf_to_rgba(&mut image_buf).map(DynamicImage::ImageRgba8)
+}
 
 /// Optional cap on captured width for the macOS SCK stream. The GPU
 /// downscales to fit before `replayd` delivers the framebuffer, so
@@ -208,6 +338,81 @@ impl SafeMonitor {
         .map_err(|e| anyhow::anyhow!("capture task panicked: {}", e))??;
 
         Ok(image)
+    }
+
+    /// Capture one image without retaining an SCStream between requests.
+    pub async fn capture_image_request_scoped(&self) -> Result<DynamicImage> {
+        self.capture_image_request_scoped_excluding(&[]).await
+    }
+
+    /// Request-scoped capture with native ScreenCaptureKit window exclusion.
+    pub async fn capture_image_request_scoped_excluding(
+        &self,
+        excluded_window_ids: &[u32],
+    ) -> Result<DynamicImage> {
+        // xcap is already one-shot. ScreenshotManager itself requires macOS 14.
+        if !self.use_sck {
+            return self.capture_image().await;
+        }
+        if !api::macos_available("14.0") {
+            let result = if excluded_window_ids.is_empty() {
+                self.capture_image().await
+            } else {
+                self.capture_image_excluding(excluded_window_ids).await
+            };
+            self.release_capture_stream();
+            return result;
+        }
+
+        let permit = MACOS_CAPTURE_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("macOS capture semaphore closed: {}", e))?;
+
+        // Hold the same lock used by the persistent path while clearing both
+        // sides of the request. This closes a stream that may have been
+        // initialized concurrently during startup and guarantees low-power
+        // callers leave no replayd-backed stream alive after the screenshot.
+        self.release_capture_stream();
+        let monitor_id = self.monitor_id;
+        let (width, height) = scaled_capture_dims(
+            self.monitor_data.width,
+            self.monitor_data.height,
+            sck_capture_max_width(),
+        );
+        let excluded = excluded_window_ids.to_vec();
+        let request = tokio::task::spawn_blocking(move || {
+            cidre::objc::ar_pool(|| {
+                MACOS_SNAPSHOT_RUNTIME.block_on(screenshot_manager_capture(
+                    monitor_id, width, height, excluded,
+                ))
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("request-scoped capture task panicked: {}", e))?;
+
+        // Keep the permit until cleanup is complete so another capture cannot
+        // create a persistent stream between the one-shot result and teardown.
+        self.release_capture_stream();
+        drop(permit);
+
+        match request {
+            Ok(image) => Ok(image),
+            Err(error) => {
+                tracing::warn!(
+                    "request-scoped capture failed for monitor {}, falling back once: {}",
+                    self.monitor_id,
+                    error
+                );
+                let result = if excluded_window_ids.is_empty() {
+                    self.capture_image().await
+                } else {
+                    self.capture_image_excluding(excluded_window_ids).await
+                };
+                self.release_capture_stream();
+                result
+            }
+        }
     }
 
     /// Capture an image excluding the given SCK window IDs (macOS only).

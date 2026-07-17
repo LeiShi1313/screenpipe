@@ -670,6 +670,7 @@ let DEFAULT_SETTINGS: Settings = {
 			lockVaultShortcut: "Super+Shift+L",
 			disableVision: false,
 			disableScreenshots: false,
+			lowPowerCapture: true,
 			useAllMonitors: true,
 			showShortcutOverlay: true,
 			chatHistory: {

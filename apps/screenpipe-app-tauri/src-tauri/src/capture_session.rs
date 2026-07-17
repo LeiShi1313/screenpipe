@@ -69,6 +69,9 @@ impl CaptureSession {
     ) -> Result<Self, String> {
         info!("Starting capture session");
 
+        #[cfg(target_os = "macos")]
+        crate::tray_monitor_preview::set_low_power_capture(config.low_power_capture);
+
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         reconfigure_audio_manager(server, config).await?;
 
@@ -200,9 +203,10 @@ impl CaptureSession {
         // AXIsProcessTrustedWithOptions(prompt: true) which shows Apple's
         // native accessibility TCC dialog for users who haven't granted it yet.
         // AXIsProcessTrusted() (used by check_accessibility) is silent.
+        let ui_config = config.to_ui_recorder_config();
         #[cfg(target_os = "macos")]
         let accessibility_permitted =
-            screenpipe_core::permissions::check_accessibility().is_granted();
+            !ui_config.enabled || screenpipe_core::permissions::check_accessibility().is_granted();
         #[cfg(not(target_os = "macos"))]
         let accessibility_permitted = true;
 
@@ -215,7 +219,6 @@ impl CaptureSession {
             );
             None
         } else {
-            let ui_config = config.to_ui_recorder_config();
             let db_clone = server.db.clone();
             match start_ui_recording(
                 db_clone,

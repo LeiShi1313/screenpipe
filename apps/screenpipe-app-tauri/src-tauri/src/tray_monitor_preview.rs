@@ -10,6 +10,7 @@
 //! AppKit/ImageIO objects on macOS.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -23,6 +24,7 @@ use tauri::AppHandle;
 use tracing::{debug, warn};
 
 use crate::health::{get_recording_info, DeviceKind};
+use crate::store::SettingsStore;
 
 const PREVIEW_WIDTH: u32 = 150;
 const PREVIEW_HEIGHT: u32 = 84;
@@ -54,9 +56,22 @@ static PLACEHOLDER: Lazy<Image<'static>> = Lazy::new(|| {
 });
 static LAST_MENU_REFRESH: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
 static BOOTSTRAP_TX: OnceLock<mpsc::Sender<u32>> = OnceLock::new();
+static LOW_POWER_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// Keep the decorative tray preview from opening its own permanent 2 FPS
+/// ScreenCaptureKit stream while request-scoped capture is selected.
+pub fn set_low_power_capture(enabled: bool) {
+    LOW_POWER_CAPTURE.store(enabled, Ordering::Relaxed);
+}
 
 /// Call once at tray setup — polls SCK frame sequence for cached tray previews.
 pub fn install(app: &AppHandle) {
+    let low_power_capture = SettingsStore::get(app)
+        .ok()
+        .flatten()
+        .map(|settings| settings.recording.low_power_capture)
+        .unwrap_or_default();
+    set_low_power_capture(low_power_capture);
     start_sck_preview_thread(app.clone());
 }
 
@@ -66,6 +81,9 @@ pub fn clear_registrations() {
 
 /// Read the latest latched SCK frame before building the tray menu (main thread safe).
 pub fn sync_refresh_monitors(monitor_ids: &[u32]) {
+    if LOW_POWER_CAPTURE.load(Ordering::Relaxed) {
+        return;
+    }
     for &monitor_id in monitor_ids {
         let update = refresh_monitor_from_sck(monitor_id);
         if update != PreviewUpdate::NoFrame {
@@ -113,11 +131,33 @@ fn start_sck_preview_thread(app: AppHandle) {
                 .expect("tray preview tokio runtime");
 
             rt.block_on(async move {
-                for monitor_id in active_monitor_ids() {
-                    queue_sck_bootstrap(monitor_id);
+                let mut low_power_suspended = LOW_POWER_CAPTURE.load(Ordering::Relaxed);
+                if low_power_suspended {
+                    screenpipe_screen::stream_invalidation::invalidate_streams();
+                    debug!("tray preview suspended because low-power capture is enabled");
+                } else {
+                    for monitor_id in active_monitor_ids() {
+                        queue_sck_bootstrap(monitor_id);
+                    }
                 }
 
                 loop {
+                    if LOW_POWER_CAPTURE.load(Ordering::Relaxed) {
+                        if !low_power_suspended {
+                            screenpipe_screen::stream_invalidation::invalidate_streams();
+                            debug!("tray preview suspended because low-power capture is enabled");
+                            low_power_suspended = true;
+                        }
+                        tokio::time::sleep(SCK_POLL_INTERVAL).await;
+                        continue;
+                    }
+
+                    if low_power_suspended {
+                        for monitor_id in active_monitor_ids() {
+                            queue_sck_bootstrap(monitor_id);
+                        }
+                        low_power_suspended = false;
+                    }
                     drain_bootstrap_requests(&rx, &app).await;
                     poll_sck_frames(&app).await;
                     tokio::time::sleep(SCK_POLL_INTERVAL).await;

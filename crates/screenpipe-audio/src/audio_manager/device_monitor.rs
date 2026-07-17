@@ -584,6 +584,7 @@ pub async fn start_device_monitor(
         // tap + resolved-mic capture during meetings, with total fallback to
         // the stable path on any gap. Pure decider in `meeting_piggyback.rs`.
         let mut piggyback_state = super::meeting_piggyback::PiggybackState::default();
+        let mut meetings_only_suspended = false;
 
         // Initialize tracker with current defaults
         let _ = default_tracker.check_input_changed();
@@ -605,6 +606,45 @@ pub async fn start_device_monitor(
 
         loop {
             if audio_manager.status().await == AudioManagerStatus::Running {
+                if audio_manager.meetings_only_without_active_meeting().await {
+                    // Let the piggyback state machine tear down any per-process
+                    // meeting tap and lift its stable-device suspensions before
+                    // we stop all remaining background streams.
+                    let _ = super::meeting_piggyback::run_meeting_piggyback_sweep(
+                        &audio_manager,
+                        &mut piggyback_state,
+                    )
+                    .await;
+                    let session_devices = audio_manager.session_devices();
+                    for device in audio_manager.current_devices() {
+                        let result = if session_devices.contains(&device.to_string()) {
+                            audio_manager.stop_session_device(&device).await
+                        } else {
+                            audio_manager.stop_device_recording(&device).await
+                        };
+                        if let Err(error) = result {
+                            debug!(
+                                "meetings-only capture: failed to stop idle device {}: {}",
+                                device, error
+                            );
+                        }
+                    }
+                    if !meetings_only_suspended {
+                        info!(
+                            "meetings-only capture: background audio devices suspended until a meeting is detected"
+                        );
+                        meetings_only_suspended = true;
+                    }
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                if meetings_only_suspended {
+                    info!(
+                        "meetings-only capture: meeting detected, background audio devices may start"
+                    );
+                    meetings_only_suspended = false;
+                }
+
                 // Check if sleep/wake or display reconfiguration requested
                 // audio stream invalidation. Force-cycle all running devices
                 // to recover from silent CoreAudio stream failures.

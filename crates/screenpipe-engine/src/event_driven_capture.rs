@@ -22,7 +22,7 @@ use screenpipe_screen::capture_screenshot_by_window::{get_excluded_sck_window_id
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_screen::monitor::{list_monitors, SafeMonitor};
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
-use screenpipe_screen::utils::capture_monitor_image;
+use screenpipe_screen::utils::{capture_monitor_image, capture_monitor_image_request_scoped};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -72,6 +72,7 @@ pub struct CaptureParams<'a> {
     pub use_pii_removal: bool,
     pub pause_on_drm_content: bool,
     pub languages: &'a [screenpipe_core::Language],
+    pub low_power_capture: bool,
 }
 
 async fn capture_with_timeout<F, T>(
@@ -322,6 +323,10 @@ pub struct EventDrivenCaptureConfig {
     /// When true, visual checks, full screenshot capture, JPEG writes, and OCR
     /// fallback are skipped.
     pub disable_screenshots: bool,
+    /// Use one request-scoped OS capture session per screenshot. While true,
+    /// visual-change and UI-event triggers are ignored and only the periodic
+    /// idle timer (plus explicit Manual triggers) captures a frame.
+    pub low_power_capture: bool,
     /// User-pinned guaranteed-capture floor (ms). When `Some`, this is an
     /// explicit "always capture at least every N ms" choice and it must
     /// survive PowerProfile transitions — a battery-saver switch (whose
@@ -343,6 +348,7 @@ impl Default for EventDrivenCaptureConfig {
             visual_check_interval_ms: 3_000, // check every 3 seconds
             visual_change_threshold: 0.05,   // ~5% difference triggers capture
             disable_screenshots: false,
+            low_power_capture: false,
             idle_capture_interval_override_ms: None, // follow PowerProfile unless pinned
         }
     }
@@ -402,7 +408,9 @@ impl EventDrivenCapture {
     /// so it never *raises* an already-shorter interval set by HD or an
     /// aggressive power profile.
     fn effective_idle_capture_interval_ms(&self) -> u64 {
-        if self.in_meeting {
+        if self.config.low_power_capture {
+            self.config.idle_capture_interval_ms
+        } else if self.in_meeting {
             self.config
                 .idle_capture_interval_ms
                 .min(MEETING_IDLE_CAPTURE_INTERVAL_MS)
@@ -686,11 +694,21 @@ pub async fn event_driven_capture_loop(
 
     let screenshots_disabled_by_config = config.disable_screenshots;
     let mut screenshot_disabled = screenshots_disabled_by_config;
-    let mut visual_check_enabled = config.visual_check_interval_ms > 0 && !screenshot_disabled;
+    let mut visual_check_enabled =
+        !config.low_power_capture && config.visual_check_interval_ms > 0 && !screenshot_disabled;
     let mut visual_check_interval = Duration::from_millis(config.visual_check_interval_ms);
     let mut visual_change_threshold = config.visual_change_threshold;
 
     let mut state = EventDrivenCapture::new(config);
+    if state.config.low_power_capture {
+        // Clean up a stream left by a previous configuration before the first
+        // request-scoped snapshot. Subsequent captures never retain one.
+        monitor.release_capture_stream();
+        info!(
+            "low-power snapshot mode enabled for monitor {} (interval={}ms)",
+            monitor_id, state.config.idle_capture_interval_ms
+        );
+    }
     let mut power_profile_rx = power_profile_rx;
     // High-FPS override: takes ownership of `min_capture_interval_ms` while
     // active (manual toggle or auto-detected meeting). The reducer forwards
@@ -805,6 +823,7 @@ pub async fn event_driven_capture_loop(
         use_pii_removal,
         pause_on_drm_content,
         languages: &languages,
+        low_power_capture: state.config.low_power_capture,
     };
 
     // Capture immediately on startup so the timeline has a frame right away.
@@ -939,7 +958,7 @@ pub async fn event_driven_capture_loop(
         // detection. This lets the Warm path capture only when pixels
         // actually changed without duplicating the whole capture machinery.
         let mut warm_trigger_override: Option<CaptureTrigger> = None;
-        {
+        if !state.config.low_power_capture {
             use crate::focus_aware_controller::CaptureState;
             let capture_state = focus_controller.state_for_monitor(&monitor);
 
@@ -1160,7 +1179,9 @@ pub async fn event_driven_capture_loop(
                 visual_check_interval = Duration::from_millis(profile.visual_check_interval_ms);
                 visual_change_threshold = profile.visual_change_threshold;
                 screenshot_disabled = screenshots_disabled_by_config || profile.screenshot_disabled;
-                visual_check_enabled = profile.visual_check_interval_ms > 0 && !screenshot_disabled;
+                visual_check_enabled = !state.config.low_power_capture
+                    && profile.visual_check_interval_ms > 0
+                    && !screenshot_disabled;
                 if visual_check_enabled && frame_comparer.is_none() {
                     frame_comparer =
                         Some(FrameComparer::new(FrameComparisonConfig::max_performance()));
@@ -1234,7 +1255,51 @@ pub async fn event_driven_capture_loop(
         // their frame_id link.
         let mut correlation_ids: Vec<crate::frame_linker::CorrelationId> = Vec::new();
         let mut trigger: Option<CaptureTrigger>;
-        if let Some(warm) = warm_trigger_override.take() {
+        if state.config.low_power_capture {
+            // UI-event hooks are disabled in this mode, but other producers may
+            // still share the broadcast channel. Ignore all event-driven work;
+            // retain only an explicit Manual request and the fixed idle timer.
+            let mut manual_requested = false;
+            let mut dropped_corr_ids = Vec::new();
+            loop {
+                match trigger_rx.try_recv() {
+                    Ok(msg) => {
+                        if matches!(msg.trigger, CaptureTrigger::Manual) {
+                            manual_requested = true;
+                        } else if let Some(id) = msg.correlation_id {
+                            dropped_corr_ids.push(id);
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        report_triggers_dropped(
+                            linker_tx.as_ref(),
+                            Vec::new(),
+                            crate::frame_linker::DropReason::Lagged,
+                        );
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        trigger_channel_closed = true;
+                        break;
+                    }
+                }
+            }
+            if !dropped_corr_ids.is_empty() {
+                report_triggers_dropped(
+                    linker_tx.as_ref(),
+                    dropped_corr_ids,
+                    crate::frame_linker::DropReason::Other,
+                );
+            }
+            trigger = if manual_requested {
+                Some(CaptureTrigger::Manual)
+            } else {
+                state.poll_activity()
+            };
+            if trigger.is_none() {
+                tokio::time::sleep(poll_interval).await;
+            }
+        } else if let Some(warm) = warm_trigger_override.take() {
             trigger = Some(warm);
         } else if trigger_channel_closed {
             trigger = state.poll_activity();
@@ -1578,7 +1643,8 @@ pub async fn event_driven_capture_loop(
                         // buffer. Deterministic — idle content, look-alike
                         // window switches, and other-monitor activity all still
                         // advance the sequence, so none of them can false-trip.
-                        if !screenshot_disabled
+                        if !state.config.low_power_capture
+                            && !screenshot_disabled
                             && freeze_watch.observe(monitor.last_capture_seq(), Instant::now())
                         {
                             warn!(
@@ -2331,7 +2397,11 @@ async fn do_capture(
         excluded_ids.dedup();
 
         // Take screenshot (with ignored windows excluded at the OS level)
-        let (image, capture_dur) = capture_monitor_image(params.monitor, &excluded_ids).await?;
+        let (image, capture_dur) = if params.low_power_capture {
+            capture_monitor_image_request_scoped(params.monitor, &excluded_ids).await?
+        } else {
+            capture_monitor_image(params.monitor, &excluded_ids).await?
+        };
         debug!(
             "screenshot captured in {:?} for monitor {}",
             capture_dur, params.monitor_id
@@ -3778,6 +3848,30 @@ mod tests {
         state.config.idle_capture_interval_ms = 1_000;
         state.last_idle_reference = Instant::now()
             .checked_sub(Duration::from_millis(1_200))
+            .unwrap_or(Instant::now());
+        assert!(state.needs_idle_capture());
+    }
+
+    #[test]
+    fn low_power_capture_keeps_fixed_interval_during_meetings() {
+        let config = EventDrivenCaptureConfig {
+            idle_capture_interval_ms: 10_000,
+            idle_capture_interval_override_ms: Some(10_000),
+            low_power_capture: true,
+            ..Default::default()
+        };
+        let mut state = EventDrivenCapture::new(config);
+        state.in_meeting = true;
+        state.last_idle_reference = Instant::now()
+            .checked_sub(Duration::from_millis(6_000))
+            .unwrap_or(Instant::now());
+
+        assert!(
+            !state.needs_idle_capture(),
+            "meeting detection must not increase the ordinary low-power cadence"
+        );
+        state.last_idle_reference = Instant::now()
+            .checked_sub(Duration::from_millis(10_001))
             .unwrap_or(Instant::now());
         assert!(state.needs_idle_capture());
     }

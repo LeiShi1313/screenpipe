@@ -414,9 +414,10 @@ impl AudioManager {
             }
         };
         info!(
-            "audio_manager apply_options: background_engine={} transcription_mode={:?} deepgram[{}]",
+            "audio_manager apply_options: background_engine={} transcription_mode={:?} capture_mode={:?} deepgram[{}]",
             options.transcription_engine,
             options.transcription_mode,
+            options.audio_capture_mode,
             deepgram_status
         );
 
@@ -774,6 +775,17 @@ impl AudioManager {
         if self.options.read().await.is_disabled {
             debug!(
                 "skipping start of audio device because audio capture is disabled: {}",
+                device
+            );
+            return Ok(());
+        }
+
+        // Meetings-only is a physical capture gate, not merely a DB/transcript
+        // filter. Keeping SCK system-audio or microphone streams open while no
+        // meeting exists wastes CPU and keeps replayd active on macOS.
+        if self.meetings_only_without_active_meeting().await {
+            debug!(
+                "skipping start of audio device outside an active meeting: {}",
                 device
             );
             return Ok(());
@@ -1624,6 +1636,19 @@ impl AudioManager {
     /// Returns the current capture-owned meeting detector, if enabled.
     pub async fn meeting_detector(&self) -> Option<Arc<MeetingDetector>> {
         self.meeting_detector.read().await.clone()
+    }
+
+    /// Whether ordinary background device streams must stay closed right now.
+    /// No detector means we cannot establish meeting state, so retain the
+    /// historical fail-open behavior instead of silently dropping all audio.
+    pub(crate) async fn meetings_only_without_active_meeting(&self) -> bool {
+        if self.options.read().await.audio_capture_mode != AudioCaptureMode::MeetingsOnly {
+            return false;
+        }
+        self.meeting_detector()
+            .await
+            .map(|detector| !detector.is_in_audio_session())
+            .unwrap_or(false)
     }
 
     /// Whether the meeting piggyback ("smart recording") flag is on. Consumed

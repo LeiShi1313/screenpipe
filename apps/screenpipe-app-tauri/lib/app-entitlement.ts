@@ -69,6 +69,10 @@ export const ENTERPRISE_DOWNLOAD_URL = screenpipeWebUrl("/api/download", "https:
 // to honor in production too.
 export const E2E_FORCE_BILLING_GATE_KEY = "screenpipe_e2e_force_billing_gate";
 
+export function isSelfHostedBuild() {
+  return process.env.NEXT_PUBLIC_SCREENPIPE_SELF_HOSTED === "true";
+}
+
 export function isDevBillingBypassEnabled() {
   if (typeof window !== "undefined") {
     try {

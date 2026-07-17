@@ -116,6 +116,7 @@ export const MANAGED_SETTING_DEFINITIONS: readonly ManagedSettingDefinition[] = 
 
   bool("disableVision", false),
   bool("disableScreenshots", false),
+  bool("lowPowerCapture", true),
   bool("disableTimeline", false),
   bool("useAllMonitors", true),
   enumeration("videoQuality", ["low", "balanced", "high", "max"], "balanced"),

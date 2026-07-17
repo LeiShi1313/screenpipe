@@ -13,7 +13,7 @@ use axum::{
     response::Json as JsonResponse,
 };
 use oasgen::{oasgen, OaSchema};
-use screenpipe_screen::monitor::list_monitors;
+use screenpipe_screen::monitor::get_cached_monitors;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -130,8 +130,11 @@ pub(crate) async fn vision_device_status(
         .into_iter()
         .collect();
 
-    let entries: Vec<VisionDeviceStatusEntry> = list_monitors()
-        .await
+    // This endpoint is polled once per second by the desktop tray. Re-enumerating
+    // ScreenCaptureKit here kept replayd and the app busy even when no screenshot
+    // was eligible. Vision startup and topology-change callbacks already seed and
+    // refresh this cache, so status reads must stay purely in-memory.
+    let entries: Vec<VisionDeviceStatusEntry> = get_cached_monitors()
         .into_iter()
         // Only surface monitors the user actually selected for recording, so the
         // popover matches the displays shown in /health.

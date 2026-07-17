@@ -6,10 +6,11 @@ use super::{
     update_monitor_cache, MonitorData, MonitorListError, SafeMonitor, SckMonitor, XcapMonitor,
 };
 use anyhow::Result;
-use cidre::{api, cv, ns, sc};
+use cidre::{api, arc, cv, ns, sc};
 use image::{DynamicImage, RgbaImage};
 use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// macOS display capture is mediated by WindowServer/replayd. Serializing these
 /// calls avoids concurrent multi-monitor spikes while preserving capture order.
@@ -26,6 +27,26 @@ static MACOS_SNAPSHOT_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .expect("failed to create macOS snapshot runtime")
 });
 
+/// Dayflow keeps its `SCShareableContent`/display snapshot for the lifetime of
+/// the recorder and refreshes it only after a capture error. Keep a bounded
+/// version of that cache so new displays/windows are eventually discovered,
+/// while avoiding the expensive WindowServer enumeration on every 10-second
+/// screenshot. Captures still use `SCScreenshotManager`; this is not a stream.
+struct CachedShareableContent {
+    content: arc::R<sc::ShareableContent>,
+    refreshed_at: Instant,
+}
+
+const SHAREABLE_CONTENT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+static SHAREABLE_CONTENT_CACHE: Lazy<std::sync::Mutex<Option<CachedShareableContent>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+fn invalidate_shareable_content_cache() {
+    if let Ok(mut cache) = SHAREABLE_CONTENT_CACHE.lock() {
+        *cache = None;
+    }
+}
+
 extern "C" {
     fn CVPixelBufferGetBytesPerRow(pixel_buffer: *const std::ffi::c_void) -> usize;
     fn CVPixelBufferGetBaseAddress(pixel_buffer: *const std::ffi::c_void) -> *const u8;
@@ -37,6 +58,21 @@ fn scaled_capture_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
     }
     let target_h = ((max_width as u64 * src_h as u64) + (src_w as u64 / 2)) / src_w as u64;
     (max_width, (target_h as u32).max(1))
+}
+
+fn scaled_capture_dims_for_height(src_w: u32, src_h: u32, target_height: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || target_height == 0 || src_h <= target_height {
+        return (src_w.max(1), src_h.max(1));
+    }
+    // Swift's `Int(Double(...))` truncates before Dayflow rounds odd widths up.
+    let target_w = (target_height as u64 * src_w as u64) / src_h as u64;
+    let target_w = (target_w as u32).max(1);
+    // ScreenCaptureKit/encoders are happiest with even dimensions, matching
+    // Dayflow's `scaledCaptureSize` implementation.
+    (
+        target_w + (target_w & 1),
+        target_height + (target_height & 1),
+    )
 }
 
 fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> std::result::Result<RgbaImage, String> {
@@ -81,18 +117,23 @@ fn image_buf_to_rgba(image_buf: &mut cv::ImageBuf) -> std::result::Result<RgbaIm
             .checked_mul(height)
             .ok_or_else(|| "screenshot pixel-buffer size overflow".to_string())?;
         let pixels = unsafe { std::slice::from_raw_parts(pixels_ptr, data_size) };
-        let mut rgba = Vec::with_capacity(width * height * 4);
+        let packed_row_bytes = width
+            .checked_mul(4)
+            .ok_or_else(|| "screenshot row size overflow".to_string())?;
+        let packed_size = packed_row_bytes
+            .checked_mul(height)
+            .ok_or_else(|| "screenshot image size overflow".to_string())?;
+        let mut rgba = vec![0; packed_size];
         for row in 0..height {
-            let row_start = row * bytes_per_row;
-            for col in 0..width {
-                let pixel = row_start + col * 4;
-                rgba.extend_from_slice(&[
-                    pixels[pixel + 2],
-                    pixels[pixel + 1],
-                    pixels[pixel],
-                    pixels[pixel + 3],
-                ]);
-            }
+            let source_start = row * bytes_per_row;
+            let target_start = row * packed_row_bytes;
+            rgba[target_start..target_start + packed_row_bytes]
+                .copy_from_slice(&pixels[source_start..source_start + packed_row_bytes]);
+        }
+        // SCK supplies BGRA. Swapping channels in-place after row copies avoids
+        // four tiny pushes per pixel in the previous conversion loop.
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
         }
         RgbaImage::from_raw(width as u32, height as u32, rgba)
             .ok_or_else(|| "failed to construct screenshot image".to_string())
@@ -108,14 +149,40 @@ async fn screenshot_manager_capture(
     height: u32,
     excluded_window_ids: Vec<u32>,
 ) -> std::result::Result<DynamicImage, String> {
-    let content = sc::ShareableContent::current()
-        .await
-        .map_err(|e| format!("failed to get shareable content: {:?}", e))?;
+    let cached = SHAREABLE_CONTENT_CACHE
+        .lock()
+        .map_err(|_| "shareable content cache lock poisoned".to_string())?
+        .as_ref()
+        .filter(|cached| cached.refreshed_at.elapsed() < SHAREABLE_CONTENT_CACHE_TTL)
+        .map(|cached| cached.content.clone());
+    let content = match cached {
+        Some(content) => content,
+        None => {
+            let content = sc::ShareableContent::current()
+                .await
+                .map_err(|e| format!("failed to get shareable content: {:?}", e))?;
+            let retained = content.clone();
+            *SHAREABLE_CONTENT_CACHE
+                .lock()
+                .map_err(|_| "shareable content cache lock poisoned".to_string())? =
+                Some(CachedShareableContent {
+                    content,
+                    refreshed_at: Instant::now(),
+                });
+            retained
+        }
+    };
     let displays = content.displays();
-    let display = displays
+    let display = match displays
         .iter()
         .find(|display| display.display_id().0 == monitor_id)
-        .ok_or_else(|| format!("monitor {} not found", monitor_id))?;
+    {
+        Some(display) => display,
+        None => {
+            invalidate_shareable_content_cache();
+            return Err(format!("monitor {} not found", monitor_id));
+        }
+    };
 
     let windows = content.windows();
     let matching_windows: Vec<&sc::Window> = windows
@@ -135,9 +202,16 @@ async fn screenshot_manager_capture(
     }
     cfg.set_scales_to_fit(false);
 
-    let sample = sc::ScreenshotManager::capture_sample_buf(&filter, &cfg)
-        .await
-        .map_err(|e| format!("request-scoped screenshot failed: {:?}", e))?;
+    let sample = match sc::ScreenshotManager::capture_sample_buf(&filter, &cfg).await {
+        Ok(sample) => sample,
+        Err(error) => {
+            // A stale display/window snapshot is the common recoverable cause.
+            // The current request uses the existing fallback; the next one
+            // refreshes shareable content instead of retaining bad state.
+            invalidate_shareable_content_cache();
+            return Err(format!("request-scoped screenshot failed: {:?}", error));
+        }
+    };
     let mut image_buf = sample
         .image_buf()
         .ok_or_else(|| "screenshot did not contain an image buffer".to_string())?
@@ -350,6 +424,18 @@ impl SafeMonitor {
         &self,
         excluded_window_ids: &[u32],
     ) -> Result<DynamicImage> {
+        self.capture_image_request_scoped_excluding_at_height(excluded_window_ids, None)
+            .await
+    }
+
+    /// Request-scoped capture with an optional output-height cap applied by
+    /// ScreenCaptureKit before pixel readback. `None` preserves the configured
+    /// quality-width behavior; `Some(1080)` matches Dayflow's snapshot path.
+    pub async fn capture_image_request_scoped_excluding_at_height(
+        &self,
+        excluded_window_ids: &[u32],
+        target_height: Option<u32>,
+    ) -> Result<DynamicImage> {
         // xcap is already one-shot. ScreenshotManager itself requires macOS 14.
         if !self.use_sck {
             return self.capture_image().await;
@@ -375,11 +461,18 @@ impl SafeMonitor {
         // callers leave no replayd-backed stream alive after the screenshot.
         self.release_capture_stream();
         let monitor_id = self.monitor_id;
-        let (width, height) = scaled_capture_dims(
-            self.monitor_data.width,
-            self.monitor_data.height,
-            sck_capture_max_width(),
-        );
+        let (width, height) = match target_height {
+            Some(target_height) => scaled_capture_dims_for_height(
+                self.monitor_data.width,
+                self.monitor_data.height,
+                target_height,
+            ),
+            None => scaled_capture_dims(
+                self.monitor_data.width,
+                self.monitor_data.height,
+                sck_capture_max_width(),
+            ),
+        };
         let excluded = excluded_window_ids.to_vec();
         let request = tokio::task::spawn_blocking(move || {
             cidre::objc::ar_pool(|| {
@@ -780,6 +873,28 @@ impl SafeMonitor {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn dayflow_dimensions_cap_height_and_preserve_aspect_ratio() {
+        assert_eq!(
+            scaled_capture_dims_for_height(3840, 2160, 1080),
+            (1920, 1080)
+        );
+        assert_eq!(
+            scaled_capture_dims_for_height(3440, 1440, 1080),
+            (2580, 1080)
+        );
+        assert_eq!(
+            scaled_capture_dims_for_height(1920, 1080, 1080),
+            (1920, 1080)
+        );
+        assert_eq!(
+            scaled_capture_dims_for_height(1728, 1117, 1080),
+            (1670, 1080)
+        );
+    }
+
     /// Reproduction for the macOS memory leak reported 2026-04-22
     /// (user's screenpipe at 13.2 GB RSS after ~48 h).
     ///

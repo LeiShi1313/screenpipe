@@ -22,7 +22,9 @@ use screenpipe_screen::capture_screenshot_by_window::{get_excluded_sck_window_id
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_screen::monitor::{list_monitors, SafeMonitor};
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
-use screenpipe_screen::utils::{capture_monitor_image, capture_monitor_image_request_scoped};
+use screenpipe_screen::utils::{
+    capture_monitor_image, capture_monitor_image_request_scoped_at_height,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2377,6 +2379,14 @@ async fn do_capture(
     in_meeting: bool,
     monitor_hosts_focus: bool,
 ) -> Result<CaptureOutput> {
+    // Low-power capture intentionally uses a separate Dayflow-style ingestion
+    // path. Keep this branch before screenshot capture and accessibility work:
+    // the whole point is to avoid paying for rich indexing and even avoid
+    // asking ScreenCaptureKit for a frame when the foreground app is filtered.
+    if params.low_power_capture {
+        return do_low_power_capture(params, trigger, screenshot_disabled).await;
+    }
+
     let captured_at = Utc::now();
     let bypass_capture_throttles = bypasses_capture_throttles(trigger);
 
@@ -2397,11 +2407,7 @@ async fn do_capture(
         excluded_ids.dedup();
 
         // Take screenshot (with ignored windows excluded at the OS level)
-        let (image, capture_dur) = if params.low_power_capture {
-            capture_monitor_image_request_scoped(params.monitor, &excluded_ids).await?
-        } else {
-            capture_monitor_image(params.monitor, &excluded_ids).await?
-        };
+        let (image, capture_dur) = capture_monitor_image(params.monitor, &excluded_ids).await?;
         debug!(
             "screenshot captured in {:?} for monitor {}",
             capture_dur, params.monitor_id
@@ -2840,6 +2846,183 @@ async fn do_capture(
         result: Some(result),
         image,
         elements_deduped: deduped,
+        corrupt: None,
+    })
+}
+
+/// Dayflow-style screenshot ingestion for low-power mode.
+///
+/// This path deliberately does only four things: cheaply resolve the foreground
+/// app, apply privacy/allowlist filters before capture, request one screenshot,
+/// and persist one JPEG plus a minimal frame row. Accessibility traversal, OCR,
+/// PII processing, visual dedup, and structured-element writes belong to the
+/// rich capture path and are intentionally absent here.
+async fn do_low_power_capture(
+    params: &CaptureParams<'_>,
+    trigger: &CaptureTrigger,
+    screenshot_disabled: bool,
+) -> Result<CaptureOutput> {
+    let started_at = Instant::now();
+    let captured_at = Utc::now();
+
+    if screenshot_disabled {
+        debug!(
+            "low-power capture skipped while screenshots are disabled for monitor {}",
+            params.monitor_id
+        );
+        return Ok(CaptureOutput {
+            result: None,
+            image: image::DynamicImage::new_rgba8(1, 1),
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+
+    // Prefer event payloads when they contain the relevant half of the focused
+    // metadata, then fill missing fields with a platform-lightweight lookup.
+    // Crucially this happens before ScreenCaptureKit enumeration/capture.
+    let lightweight_metadata = match tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(get_focused_metadata_lightweight),
+    )
+    .await
+    {
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(err)) => {
+            debug!("low-power focused metadata lookup task failed: {}", err);
+            None
+        }
+        Err(_) => {
+            debug!("low-power focused metadata lookup timed out");
+            None
+        }
+    };
+
+    let app_name = match trigger {
+        CaptureTrigger::AppSwitch { app_name, .. } if !app_name.trim().is_empty() => {
+            Some(app_name.clone())
+        }
+        _ => lightweight_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.app_name.clone()),
+    };
+    let window_name = match trigger {
+        CaptureTrigger::WindowFocus { window_name, .. } if !window_name.trim().is_empty() => {
+            Some(window_name.clone())
+        }
+        _ => lightweight_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.window_name.clone()),
+    };
+
+    let filter_app = app_name.as_deref().unwrap_or_default();
+    let filter_window = window_name.as_deref().unwrap_or_default();
+    if !params.window_filters.is_valid(filter_app, filter_window) {
+        debug!(
+            "low-power capture gated before screenshot: app='{}', window='{}', monitor={}",
+            filter_app, filter_window, params.monitor_id
+        );
+        return Ok(CaptureOutput {
+            result: None,
+            image: image::DynamicImage::new_rgba8(1, 1),
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+
+    if let Some(app) = app_name.as_deref() {
+        if is_lock_screen_app(app) {
+            crate::sleep_monitor::set_screen_locked(true);
+            return Ok(CaptureOutput {
+                result: None,
+                image: image::DynamicImage::new_rgba8(1, 1),
+                elements_deduped: false,
+                corrupt: None,
+            });
+        }
+        if crate::sleep_monitor::screen_is_locked() {
+            crate::sleep_monitor::set_screen_locked(false);
+        }
+    } else if crate::sleep_monitor::screen_is_locked() {
+        return Ok(CaptureOutput {
+            result: None,
+            image: image::DynamicImage::new_rgba8(1, 1),
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+
+    let mut excluded_ids = get_excluded_sck_window_ids(&params.window_filters);
+    excluded_ids.sort_unstable();
+    excluded_ids.dedup();
+    let (image, capture_duration) =
+        capture_monitor_image_request_scoped_at_height(params.monitor, &excluded_ids, 1080).await?;
+
+    if let Some(kind) = frame_corruption(&image) {
+        debug!(
+            "low-power capture rejected corrupt frame {:?} on monitor {}",
+            kind, params.monitor_id
+        );
+        return Ok(CaptureOutput {
+            result: None,
+            image,
+            elements_deduped: false,
+            corrupt: Some(kind),
+        });
+    }
+
+    let snapshot_path = params
+        .snapshot_writer
+        .write(&image, captured_at, params.monitor_id)?;
+    let snapshot_path = snapshot_path.to_string_lossy().into_owned();
+    let frame_id = params
+        .db
+        .insert_snapshot_frame(
+            params.device_name,
+            captured_at,
+            &snapshot_path,
+            app_name.as_deref(),
+            window_name.as_deref(),
+            None,
+            true,
+            Some(trigger.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+
+    debug!(
+        "low-power capture stored frame {} for monitor {} in {}ms (screenshot={}ms)",
+        frame_id,
+        params.monitor_id,
+        duration_ms,
+        capture_duration.as_millis()
+    );
+
+    Ok(CaptureOutput {
+        result: Some(PairedCaptureResult {
+            frame_id,
+            snapshot_path,
+            accessibility_text: None,
+            text_source: None,
+            capture_trigger: trigger.as_str().to_string(),
+            captured_at,
+            duration_ms,
+            ocr_duration_ms: None,
+            ocr_was_empty: false,
+            ocr_gate_decision: None,
+            ocr_gate_detect_duration: None,
+            app_name,
+            window_name,
+            browser_url: None,
+            content_hash: None,
+        }),
+        image,
+        elements_deduped: false,
         corrupt: None,
     })
 }

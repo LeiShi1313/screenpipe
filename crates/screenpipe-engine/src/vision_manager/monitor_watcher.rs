@@ -56,6 +56,19 @@ const WEDGE_MIN_UPTIME_SECS: f64 = 120.0;
 /// (e.g. a disk still stalled) can't turn into a restart storm.
 const WEDGE_RESTART_COOLDOWN: Duration = Duration::from_secs(300);
 
+fn macos_monitor_backstop(callback_registered: bool, low_power_capture: bool) -> Duration {
+    if !callback_registered {
+        Duration::from_secs(5)
+    } else if low_power_capture {
+        // Dayflow-style mode relies on the immediate CoreGraphics display
+        // callback and keeps only a rare safety-net. SCShareableContent
+        // enumeration can take several seconds on process-heavy desktops.
+        Duration::from_secs(5 * 60)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
 // ── Gone-silent / dead-loop watchdog ────────────────────────────────────────
 //
 // The wedge watchdog above only fires while the loop is STILL ATTEMPTING
@@ -221,9 +234,11 @@ pub async fn start_monitor_watcher(
     // Stop existing watcher if any
     stop_monitor_watcher().await?;
 
+    let low_power_capture = vision_manager.low_power_capture_enabled();
     #[cfg(target_os = "macos")]
     info!(
-        "Starting monitor watcher (event-driven via CGDisplayRegisterReconfigurationCallback, 60s backstop poll)"
+        "Starting monitor watcher (event-driven via CGDisplayRegisterReconfigurationCallback, {}s backstop poll)",
+        macos_monitor_backstop(true, low_power_capture).as_secs()
     );
     #[cfg(not(target_os = "macos"))]
     info!("Starting monitor watcher (polling every 5 seconds)");
@@ -684,11 +699,10 @@ pub async fn start_monitor_watcher(
             //      regress to once-a-minute)
             #[cfg(target_os = "macos")]
             {
-                let backstop = if crate::sleep_monitor::display_reconfig_callback_registered() {
-                    Duration::from_secs(60)
-                } else {
-                    Duration::from_secs(5)
-                };
+                let backstop = macos_monitor_backstop(
+                    crate::sleep_monitor::display_reconfig_callback_registered(),
+                    low_power_capture,
+                );
                 let notify = crate::sleep_monitor::display_reconfig_notify();
                 tokio::select! {
                     _ = notify.notified() => {}
@@ -723,6 +737,16 @@ mod tests {
 
     // Fixed "now" so deltas are exact and the tests never depend on wall clock.
     const NOW: u64 = 2_000_000_000;
+
+    #[test]
+    fn macos_backstop_uses_callback_and_capture_mode() {
+        assert_eq!(macos_monitor_backstop(true, false), Duration::from_secs(60));
+        assert_eq!(
+            macos_monitor_backstop(true, true),
+            Duration::from_secs(5 * 60)
+        );
+        assert_eq!(macos_monitor_backstop(false, true), Duration::from_secs(5));
+    }
 
     #[test]
     fn healthy_recent_write_is_not_wedged() {

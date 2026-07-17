@@ -147,14 +147,21 @@ impl VisionManager {
             spawn_frame_linker(db.clone(), linker_rx, linker_stop.clone());
         }
 
-        // Focus-aware capture is always on. `new_tracker()` always succeeds —
-        // returns a null tracker on platforms without a native impl. Controller
-        // fallback handles `Unknown` events by treating all monitors as Active,
-        // so users whose systems can't report focus still get the pre-feature
-        // behaviour (every monitor captured at full rate).
+        // Dayflow-style low-power capture is timer-driven and stores every
+        // selected monitor; it never consumes focus-aware routing. On macOS the
+        // native tracker otherwise enumerates SCShareableContent every 5s just
+        // to map the cursor to a display — substantially more work than the
+        // 10-second screenshot path itself on machines with many processes.
+        // Use the null tracker here so low-power mode pays no hidden SCK cost.
+        // Rich event-driven capture keeps the native tracker unchanged.
         let focus_controller = {
             let _guard = vision_handle.enter();
-            let tracker = crate::focus_tracker::new_tracker();
+            let tracker: Arc<dyn crate::focus_tracker::FocusTracker> = if config.low_power_capture {
+                info!("low-power capture: native focus tracker disabled");
+                Arc::new(crate::focus_tracker::NullFocusTracker::new())
+            } else {
+                crate::focus_tracker::new_tracker()
+            };
             FocusAwareController::new(tracker)
         };
 
@@ -649,6 +656,10 @@ impl VisionManager {
     /// persists display-layout snapshots). Cheap Arc clone.
     pub(crate) fn db_handle(&self) -> Arc<DatabaseManager> {
         self.db.clone()
+    }
+
+    pub(crate) fn low_power_capture_enabled(&self) -> bool {
+        self.config.low_power_capture
     }
 
     pub async fn active_monitors(&self) -> Vec<u32> {

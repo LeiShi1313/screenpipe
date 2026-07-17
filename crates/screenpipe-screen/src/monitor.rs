@@ -40,10 +40,11 @@ use sck_rs::Monitor as SckMonitor;
 // xcap is used on Linux/Windows, and as fallback on older macOS.
 use xcap::Monitor as XcapMonitor;
 
-/// Cached monitor descriptions updated by the monitor watcher every 5s.
-/// Health check reads this instead of making a blocking system call.
+/// Cached monitor topology updated after every successful OS enumeration.
+/// Health/status callers read this instead of waking ScreenCaptureKit.
 static CACHED_MONITOR_DESCRIPTIONS: Lazy<RwLock<Vec<String>>> =
     Lazy::new(|| RwLock::new(Vec::new()));
+static CACHED_MONITORS: Lazy<RwLock<Vec<SafeMonitor>>> = Lazy::new(|| RwLock::new(Vec::new()));
 
 /// Get cached monitor descriptions without blocking system calls.
 /// Returns the list last updated by `list_monitors_detailed()`.
@@ -51,6 +52,16 @@ pub fn get_cached_monitor_descriptions() -> Vec<String> {
     CACHED_MONITOR_DESCRIPTIONS
         .read()
         .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+/// Return the most recently enumerated monitor handles without performing an
+/// OS query. Vision startup always seeds this cache before status polling
+/// begins, and the monitor watcher refreshes it after topology changes.
+pub fn get_cached_monitors() -> Vec<SafeMonitor> {
+    CACHED_MONITORS
+        .read()
+        .map(|monitors| monitors.clone())
         .unwrap_or_default()
 }
 
@@ -196,6 +207,9 @@ fn update_monitor_cache(monitors: &[SafeMonitor]) {
         .collect();
     if let Ok(mut cache) = CACHED_MONITOR_DESCRIPTIONS.write() {
         *cache = descriptions;
+    }
+    if let Ok(mut cache) = CACHED_MONITORS.write() {
+        *cache = monitors.to_vec();
     }
 }
 

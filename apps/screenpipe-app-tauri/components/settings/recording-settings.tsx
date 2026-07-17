@@ -6,11 +6,16 @@
 
 const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
-import React, { useEffect, useState, useMemo, useCallback } from "react";
+import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { useEventListener } from "@/lib/hooks/use-event-listener";
 import { useInterval } from "@/lib/hooks/use-interval";
 import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
 import { CaptureFrequencyPreview, AudioCaptureModePreview } from "./setting-previews";
+import {
+  createSettingsWriteQueue,
+  enqueueSettingsWrite,
+  flushSettingsWrites,
+} from "./settings-write-queue";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
@@ -1993,6 +1998,7 @@ export function RecordingSettings() {
 
   // Add new state to track if settings have changed
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const settingsWriteQueueRef = useRef(createSettingsWriteQueue());
 
   // Optimized debounced validation
   const debouncedValidateSettings = useMemo(
@@ -2042,8 +2048,11 @@ export function RecordingSettings() {
     // Validate new settings
     debouncedValidateSettings({ ...settings, ...sanitizedSettings });
     
-    // Update settings
-    updateSettings(sanitizedSettings);
+    // Persist settings in order. Apply waits for this queue before restarting
+    // capture so the engine cannot read the previous value from disk.
+    enqueueSettingsWrite(settingsWriteQueueRef.current, () =>
+      updateSettings(sanitizedSettings)
+    );
     
     if (restart) {
       setHasUnsavedChanges(true);
@@ -2291,6 +2300,8 @@ export function RecordingSettings() {
     });
 
     try {
+      await flushSettingsWrites(settingsWriteQueueRef.current);
+
       if (!settings.analyticsEnabled) {
         posthog.capture("telemetry", {
           enabled: false,
@@ -2647,6 +2658,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       <div className="flex items-center justify-end">
           {hasUnsavedChanges && (
             <Button
+              data-testid="recording-settings-apply-restart"
               onClick={handleUpdate}
               disabled={isUpdating || Object.keys(validationErrors).length > 0}
               size="sm"
@@ -3979,6 +3991,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   </span>
                 </div>
                 <Slider
+                  data-testid="capture-frequency-slider"
                   value={[seconds]}
                   onValueChange={([value]) =>
                     handleSettingsChange(

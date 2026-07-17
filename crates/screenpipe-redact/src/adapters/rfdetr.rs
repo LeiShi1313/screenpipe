@@ -276,13 +276,21 @@ mod imp {
                         .with_compute_units(ort::ep::coreml::ComputeUnits::All)
                         .with_subgraphs(true)
                         .build(),
-                    ort::ep::CPU::default().build(),
+                    ort::ep::CPU::default().with_arena_allocator(false).build(),
                 ])?;
                 #[cfg(feature = "onnx-directml")]
                 let mut builder = builder.with_execution_providers([
                     ort::ep::DirectML::default().with_device_id(0).build(),
-                    ort::ep::CPU::default().build(),
+                    ort::ep::CPU::default().with_arena_allocator(false).build(),
                 ])?;
+                // No arena for the CPU EP: this is an occasional background
+                // batch worker, and the arena never returns freed memory to
+                // the OS. Measured on the fp16 512px model: inference RSS
+                // 423 MB (arena) -> 193 MB (no arena) for +16 ms/frame.
+                #[cfg(not(any(feature = "onnx-coreml", feature = "onnx-directml")))]
+                let mut builder = builder.with_execution_providers([ort::ep::CPU::default()
+                    .with_arena_allocator(false)
+                    .build()])?;
                 builder.commit_from_file(model_path)
             },
         )) {

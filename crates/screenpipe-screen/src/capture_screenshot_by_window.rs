@@ -219,6 +219,16 @@ pub struct CapturedWindow {
     pub window_height: u32,
 }
 
+/// One directly captured application window plus the display it belongs to.
+/// The candidate count lets the low-power scheduler advance its round-robin
+/// cursor without exposing platform window handles outside this crate.
+#[derive(Debug, Clone)]
+pub struct DirectWindowCapture {
+    pub window: CapturedWindow,
+    pub monitor_id: u32,
+    pub candidate_count: usize,
+}
+
 pub struct WindowFilters {
     ignore_patterns: Vec<WindowPattern>,
     include_patterns: Vec<WindowPattern>,
@@ -262,6 +272,13 @@ impl WindowFilters {
 
         // Include list: empty = pass; non-empty applies scoped/legacy semantics.
         window_pattern::passes_includes(&self.include_patterns, &app_name_lower, &title_lower)
+    }
+
+    /// An empty include list preserves the traditional "current window"
+    /// behavior. A non-empty list enables background round-robin capture of
+    /// every matching application window.
+    pub fn has_includes(&self) -> bool {
+        !self.include_patterns.is_empty()
     }
 
     /// Check if a URL should be filtered out for privacy
@@ -979,6 +996,236 @@ pub fn get_excluded_sck_window_ids(_window_filters: &WindowFilters) -> Vec<u32> 
     Vec::new()
 }
 
+fn direct_window_is_eligible(
+    window_filters: &WindowFilters,
+    app_name: &str,
+    window_name: &str,
+    width: u32,
+    height: u32,
+) -> bool {
+    !app_name.is_empty()
+        && !window_name.is_empty()
+        && width >= 100
+        && height >= 100
+        && !app_name.to_lowercase().contains("screenpipe")
+        && !SKIP_APPS.contains(app_name)
+        && !SKIP_TITLES.contains(window_name)
+        && window_filters.is_valid(app_name, window_name)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct DirectWindowCandidate {
+    window_id: u32,
+    app_name: String,
+    window_name: String,
+    process_id: i32,
+    is_focused: bool,
+    bounds: Rect,
+    monitor_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn monitor_id_for_window(bounds: &Rect) -> u32 {
+    crate::monitor::get_cached_monitors()
+        .into_iter()
+        .max_by_key(|monitor| {
+            bounds.intersection_area(&Rect {
+                x: monitor.x(),
+                y: monitor.y(),
+                width: monitor.width(),
+                height: monitor.height(),
+            })
+        })
+        .filter(|monitor| {
+            bounds.intersection_area(&Rect {
+                x: monitor.x(),
+                y: monitor.y(),
+                width: monitor.width(),
+                height: monitor.height(),
+            }) > 0
+        })
+        .map(|monitor| monitor.id())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn direct_window_candidates(window_filters: &WindowFilters) -> Vec<DirectWindowCandidate> {
+    let frontmost_pid = get_frontmost_pid();
+    let (windows, _) = get_cg_window_list();
+    let mut candidates: Vec<_> = windows
+        .into_iter()
+        .filter(|window| window.layer == 0)
+        .filter(|window| {
+            direct_window_is_eligible(
+                window_filters,
+                &window.owner_name,
+                &window.window_name,
+                window.bounds.width,
+                window.bounds.height,
+            )
+        })
+        .map(|window| DirectWindowCandidate {
+            window_id: window.window_id,
+            app_name: window.owner_name,
+            window_name: window.window_name,
+            process_id: window.pid,
+            is_focused: frontmost_pid == Some(window.pid),
+            monitor_id: monitor_id_for_window(&window.bounds),
+            bounds: window.bounds,
+        })
+        .collect();
+
+    // Without an explicit allowlist, direct capture must not turn an empty
+    // setting into "record every background app". Keep only the topmost normal
+    // window, which is the closest equivalent to the previous foreground gate.
+    if !window_filters.has_includes() {
+        candidates.truncate(1);
+    }
+    candidates
+}
+
+/// Capture one eligible window without activating it or rendering unrelated
+/// applications. With an explicit include list, `selection_cursor` rotates
+/// through every matching open window. With no include list, only the topmost
+/// normal window is eligible for backward-compatible privacy behavior.
+#[cfg(target_os = "macos")]
+pub async fn capture_next_direct_window(
+    window_filters: &WindowFilters,
+    selection_cursor: usize,
+    target_height: u32,
+) -> anyhow::Result<Option<DirectWindowCapture>> {
+    let candidates = direct_window_candidates(window_filters);
+    let candidate_count = candidates.len();
+    let Some(candidate) = candidates
+        .get(selection_cursor.checked_rem(candidate_count).unwrap_or(0))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+
+    let image = crate::monitor::capture_window_image_request_scoped_at_height(
+        candidate.window_id,
+        target_height,
+    )
+    .await?;
+
+    Ok(Some(DirectWindowCapture {
+        monitor_id: candidate.monitor_id,
+        candidate_count,
+        window: CapturedWindow {
+            image,
+            app_name: candidate.app_name,
+            window_name: candidate.window_name,
+            process_id: candidate.process_id,
+            is_focused: candidate.is_focused,
+            browser_url: None,
+            window_x: candidate.bounds.x,
+            window_y: candidate.bounds.y,
+            window_width: candidate.bounds.width,
+            window_height: candidate.bounds.height,
+        },
+    }))
+}
+
+/// Windows uses Windows Graphics Capture through xcap; Linux uses its native
+/// xcap backend. Both paths enumerate metadata first and render only the one
+/// selected allowlisted window.
+#[cfg(not(target_os = "macos"))]
+pub async fn capture_next_direct_window(
+    window_filters: &WindowFilters,
+    selection_cursor: usize,
+    target_height: u32,
+) -> anyhow::Result<Option<DirectWindowCapture>> {
+    struct Candidate {
+        window: Window,
+        app_name: String,
+        window_name: String,
+        process_id: i32,
+        is_focused: bool,
+        monitor_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    }
+
+    let mut candidates = Vec::new();
+    for window in Window::all()? {
+        if window.is_minimized().unwrap_or(true) {
+            continue;
+        }
+        let mut app_name = window.app_name().unwrap_or_default();
+        #[cfg(target_os = "windows")]
+        if app_name.is_empty() {
+            app_name = window
+                .pid()
+                .ok()
+                .and_then(get_process_exe_name)
+                .unwrap_or_default();
+        }
+        let window_name = window.title().unwrap_or_default();
+        let width = window.width().unwrap_or(0);
+        let height = window.height().unwrap_or(0);
+        if !direct_window_is_eligible(window_filters, &app_name, &window_name, width, height) {
+            continue;
+        }
+        let monitor_id = window
+            .current_monitor()
+            .ok()
+            .and_then(|monitor| monitor.id().ok())
+            .unwrap_or(0);
+        candidates.push(Candidate {
+            process_id: window.pid().map(|pid| pid as i32).unwrap_or(-1),
+            is_focused: window.is_focused().unwrap_or(false),
+            monitor_id,
+            x: window.x().unwrap_or(0),
+            y: window.y().unwrap_or(0),
+            width,
+            height,
+            window,
+            app_name,
+            window_name,
+        });
+    }
+    if !window_filters.has_includes() {
+        candidates.truncate(1);
+    }
+
+    let candidate_count = candidates.len();
+    let Some(candidate) = candidates
+        .into_iter()
+        .nth(selection_cursor.checked_rem(candidate_count).unwrap_or(0))
+    else {
+        return Ok(None);
+    };
+    let mut image = DynamicImage::ImageRgba8(candidate.window.capture_image()?);
+    if target_height > 0 && image.height() > target_height {
+        image = image.resize(
+            u32::MAX,
+            target_height,
+            image::imageops::FilterType::Triangle,
+        );
+    }
+
+    Ok(Some(DirectWindowCapture {
+        monitor_id: candidate.monitor_id,
+        candidate_count,
+        window: CapturedWindow {
+            image,
+            app_name: candidate.app_name,
+            window_name: candidate.window_name,
+            process_id: candidate.process_id,
+            is_focused: candidate.is_focused,
+            browser_url: None,
+            window_x: candidate.x,
+            window_y: candidate.y,
+            window_width: candidate.width,
+            window_height: candidate.height,
+        },
+    }))
+}
+
 pub async fn capture_all_visible_windows(
     monitor: &SafeMonitor,
     window_filters: &WindowFilters,
@@ -1167,6 +1414,50 @@ pub async fn capture_all_visible_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_window_eligibility_requires_real_allowlisted_window() {
+        let filters = WindowFilters::new(&[], &["Microsoft Teams".to_string()], &[]);
+
+        assert!(direct_window_is_eligible(
+            &filters,
+            "Microsoft Teams",
+            "Weekly planning",
+            1200,
+            800,
+        ));
+        assert!(!direct_window_is_eligible(
+            &filters,
+            "Microsoft Teams",
+            "Weekly planning",
+            80,
+            80,
+        ));
+        assert!(!direct_window_is_eligible(
+            &filters,
+            "Safari",
+            "Private tab",
+            1200,
+            800,
+        ));
+        assert!(!direct_window_is_eligible(
+            &filters,
+            "screenpipe",
+            "Microsoft Teams",
+            1200,
+            800,
+        ));
+    }
+
+    #[test]
+    fn explicit_include_list_enables_background_rotation() {
+        let no_includes = WindowFilters::new(&[], &[], &[]);
+        let with_includes =
+            WindowFilters::new(&[], &["Teams".to_string(), "Outlook".to_string()], &[]);
+
+        assert!(!no_includes.has_includes());
+        assert!(with_includes.has_includes());
+    }
 
     // ==================== is_url_blocked tests ====================
 

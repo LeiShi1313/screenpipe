@@ -24,8 +24,9 @@ pub use linux::{
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    get_capture_backend, get_default_monitor, get_monitor_by_id, is_screen_capture_supported,
-    list_monitors, list_monitors_detailed, macos_version, set_sck_capture_max_width, HdCapture,
+    capture_window_image_request_scoped_at_height, get_capture_backend, get_default_monitor,
+    get_monitor_by_id, is_screen_capture_supported, list_monitors, list_monitors_detailed,
+    macos_version, set_sck_capture_max_width, HdCapture,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{

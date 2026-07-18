@@ -18,13 +18,13 @@ use screenpipe_capture::ocr_gate::OcrGate;
 use screenpipe_capture::paired_capture::{paired_capture, CaptureContext, PairedCaptureResult};
 use screenpipe_core::window_pattern::{self, WindowPattern};
 use screenpipe_db::DatabaseManager;
-use screenpipe_screen::capture_screenshot_by_window::{get_excluded_sck_window_ids, WindowFilters};
+use screenpipe_screen::capture_screenshot_by_window::{
+    capture_next_direct_window, get_excluded_sck_window_ids, WindowFilters,
+};
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_screen::monitor::{list_monitors, SafeMonitor};
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
-use screenpipe_screen::utils::{
-    capture_monitor_image, capture_monitor_image_request_scoped_at_height,
-};
+use screenpipe_screen::utils::capture_monitor_image;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,6 +35,20 @@ use tracing::{debug, error, info, warn};
 const CAPTURE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const WARM_VISUAL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const WARM_FOCUS_BACKSTOP_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Default)]
+struct LowPowerWindowScheduler {
+    last_attempt: Option<Instant>,
+    next_window_index: usize,
+}
+
+static LOW_POWER_WINDOW_SCHEDULER: OnceLock<tokio::sync::Mutex<LowPowerWindowScheduler>> =
+    OnceLock::new();
+
+fn low_power_window_scheduler() -> &'static tokio::sync::Mutex<LowPowerWindowScheduler> {
+    LOW_POWER_WINDOW_SCHEDULER
+        .get_or_init(|| tokio::sync::Mutex::new(LowPowerWindowScheduler::default()))
+}
 
 fn warm_visual_wait_duration(elapsed: Duration) -> Duration {
     WARM_VISUAL_CHECK_INTERVAL
@@ -75,6 +89,7 @@ pub struct CaptureParams<'a> {
     pub pause_on_drm_content: bool,
     pub languages: &'a [screenpipe_core::Language],
     pub low_power_capture: bool,
+    pub low_power_capture_interval: Duration,
 }
 
 async fn capture_with_timeout<F, T>(
@@ -826,6 +841,7 @@ pub async fn event_driven_capture_loop(
         pause_on_drm_content,
         languages: &languages,
         low_power_capture: state.config.low_power_capture,
+        low_power_capture_interval: Duration::from_millis(state.config.idle_capture_interval_ms),
     };
 
     // Capture immediately on startup so the timeline has a frame right away.
@@ -2382,7 +2398,7 @@ async fn do_capture(
     // Low-power capture intentionally uses a separate Dayflow-style ingestion
     // path. Keep this branch before screenshot capture and accessibility work:
     // the whole point is to avoid paying for rich indexing and even avoid
-    // asking ScreenCaptureKit for a frame when the foreground app is filtered.
+    // asking ScreenCaptureKit for pixels before window metadata is allowlisted.
     if params.low_power_capture {
         return do_low_power_capture(params, trigger, screenshot_disabled).await;
     }
@@ -2852,11 +2868,12 @@ async fn do_capture(
 
 /// Dayflow-style screenshot ingestion for low-power mode.
 ///
-/// This path deliberately does only four things: cheaply resolve the foreground
-/// app, apply privacy/allowlist filters before capture, request one screenshot,
-/// and persist one JPEG plus a minimal frame row. Accessibility traversal, OCR,
-/// PII processing, visual dedup, and structured-element writes belong to the
-/// rich capture path and are intentionally absent here.
+/// This path enumerates window metadata, applies the allowlist before pixels are
+/// requested, captures one compositor-backed application window, and persists
+/// one JPEG plus a minimal frame row. A process-global scheduler rotates through
+/// matching windows while enforcing one capture budget across all monitors.
+/// Accessibility traversal, OCR, PII processing, visual dedup, and structured-
+/// element writes belong to the rich capture path and are intentionally absent.
 async fn do_low_power_capture(
     params: &CaptureParams<'_>,
     trigger: &CaptureTrigger,
@@ -2878,50 +2895,24 @@ async fn do_low_power_capture(
         });
     }
 
-    // Prefer event payloads when they contain the relevant half of the focused
-    // metadata, then fill missing fields with a platform-lightweight lookup.
-    // Crucially this happens before ScreenCaptureKit enumeration/capture.
-    let lightweight_metadata = match tokio::time::timeout(
-        Duration::from_secs(1),
-        tokio::task::spawn_blocking(get_focused_metadata_lightweight),
-    )
-    .await
+    if crate::sleep_monitor::screen_is_locked() {
+        return Ok(CaptureOutput {
+            result: None,
+            image: image::DynamicImage::new_rgba8(1, 1),
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+
+    // Every monitor owns an event loop, but low-power window capture is a
+    // single process-wide workload. Holding the scheduler lock through the
+    // one-shot request prevents simultaneous startup/idle ticks from spending
+    // the same budget more than once.
+    let mut scheduler = low_power_window_scheduler().lock().await;
+    if scheduler
+        .last_attempt
+        .is_some_and(|last| last.elapsed() < params.low_power_capture_interval)
     {
-        Ok(Ok(metadata)) => metadata,
-        Ok(Err(err)) => {
-            debug!("low-power focused metadata lookup task failed: {}", err);
-            None
-        }
-        Err(_) => {
-            debug!("low-power focused metadata lookup timed out");
-            None
-        }
-    };
-
-    let app_name = match trigger {
-        CaptureTrigger::AppSwitch { app_name, .. } if !app_name.trim().is_empty() => {
-            Some(app_name.clone())
-        }
-        _ => lightweight_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.app_name.clone()),
-    };
-    let window_name = match trigger {
-        CaptureTrigger::WindowFocus { window_name, .. } if !window_name.trim().is_empty() => {
-            Some(window_name.clone())
-        }
-        _ => lightweight_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.window_name.clone()),
-    };
-
-    let filter_app = app_name.as_deref().unwrap_or_default();
-    let filter_window = window_name.as_deref().unwrap_or_default();
-    if !params.window_filters.is_valid(filter_app, filter_window) {
-        debug!(
-            "low-power capture gated before screenshot: app='{}', window='{}', monitor={}",
-            filter_app, filter_window, params.monitor_id
-        );
         return Ok(CaptureOutput {
             result: None,
             image: image::DynamicImage::new_rgba8(1, 1),
@@ -2929,39 +2920,48 @@ async fn do_low_power_capture(
             corrupt: None,
         });
     }
+    scheduler.last_attempt = Some(Instant::now());
+    let selection_cursor = scheduler.next_window_index;
+    // Advance before capture so a stale/uncapturable window cannot pin every
+    // future cycle to the same failing candidate.
+    scheduler.next_window_index = scheduler.next_window_index.wrapping_add(1);
 
-    if let Some(app) = app_name.as_deref() {
-        if is_lock_screen_app(app) {
-            crate::sleep_monitor::set_screen_locked(true);
-            return Ok(CaptureOutput {
-                result: None,
-                image: image::DynamicImage::new_rgba8(1, 1),
-                elements_deduped: false,
-                corrupt: None,
-            });
-        }
-        if crate::sleep_monitor::screen_is_locked() {
-            crate::sleep_monitor::set_screen_locked(false);
-        }
-    } else if crate::sleep_monitor::screen_is_locked() {
+    let capture_started = Instant::now();
+    let direct_capture =
+        capture_next_direct_window(&params.window_filters, selection_cursor, 1080).await?;
+    let capture_duration = capture_started.elapsed();
+    let Some(direct_capture) = direct_capture else {
+        debug!("low-power direct capture found no eligible open windows");
         return Ok(CaptureOutput {
             result: None,
             image: image::DynamicImage::new_rgba8(1, 1),
             elements_deduped: false,
             corrupt: None,
         });
-    }
+    };
+    scheduler.next_window_index = scheduler
+        .next_window_index
+        .checked_rem(direct_capture.candidate_count)
+        .unwrap_or(0);
+    drop(scheduler);
 
-    let mut excluded_ids = get_excluded_sck_window_ids(&params.window_filters);
-    excluded_ids.sort_unstable();
-    excluded_ids.dedup();
-    let (image, capture_duration) =
-        capture_monitor_image_request_scoped_at_height(params.monitor, &excluded_ids, 1080).await?;
+    let target_monitor_id = if direct_capture.monitor_id == 0 {
+        params.monitor_id
+    } else {
+        direct_capture.monitor_id
+    };
+    let target_device_name = format!("monitor_{}", target_monitor_id);
+    let app_name = Some(direct_capture.window.app_name);
+    let window_name = Some(direct_capture.window.window_name);
+    let focused = direct_capture.window.is_focused;
+    let image = direct_capture.window.image;
 
     if let Some(kind) = frame_corruption(&image) {
         debug!(
-            "low-power capture rejected corrupt frame {:?} on monitor {}",
-            kind, params.monitor_id
+            "low-power direct capture rejected corrupt frame {:?} for app='{}', window='{}'",
+            kind,
+            app_name.as_deref().unwrap_or_default(),
+            window_name.as_deref().unwrap_or_default()
         );
         return Ok(CaptureOutput {
             result: None,
@@ -2973,18 +2973,18 @@ async fn do_low_power_capture(
 
     let snapshot_path = params
         .snapshot_writer
-        .write(&image, captured_at, params.monitor_id)?;
+        .write(&image, captured_at, target_monitor_id)?;
     let snapshot_path = snapshot_path.to_string_lossy().into_owned();
     let frame_id = params
         .db
         .insert_snapshot_frame(
-            params.device_name,
+            &target_device_name,
             captured_at,
             &snapshot_path,
             app_name.as_deref(),
             window_name.as_deref(),
             None,
-            true,
+            focused,
             Some(trigger.as_str()),
             None,
             None,
@@ -2996,9 +2996,11 @@ async fn do_low_power_capture(
     let duration_ms = started_at.elapsed().as_millis() as u64;
 
     debug!(
-        "low-power capture stored frame {} for monitor {} in {}ms (screenshot={}ms)",
+        "low-power direct capture stored frame {} for app='{}', window='{}', monitor={} in {}ms (screenshot={}ms)",
         frame_id,
-        params.monitor_id,
+        app_name.as_deref().unwrap_or_default(),
+        window_name.as_deref().unwrap_or_default(),
+        target_monitor_id,
         duration_ms,
         capture_duration.as_millis()
     );

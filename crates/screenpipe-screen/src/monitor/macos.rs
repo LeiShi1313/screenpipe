@@ -149,29 +149,7 @@ async fn screenshot_manager_capture(
     height: u32,
     excluded_window_ids: Vec<u32>,
 ) -> std::result::Result<DynamicImage, String> {
-    let cached = SHAREABLE_CONTENT_CACHE
-        .lock()
-        .map_err(|_| "shareable content cache lock poisoned".to_string())?
-        .as_ref()
-        .filter(|cached| cached.refreshed_at.elapsed() < SHAREABLE_CONTENT_CACHE_TTL)
-        .map(|cached| cached.content.clone());
-    let content = match cached {
-        Some(content) => content,
-        None => {
-            let content = sc::ShareableContent::current()
-                .await
-                .map_err(|e| format!("failed to get shareable content: {:?}", e))?;
-            let retained = content.clone();
-            *SHAREABLE_CONTENT_CACHE
-                .lock()
-                .map_err(|_| "shareable content cache lock poisoned".to_string())? =
-                Some(CachedShareableContent {
-                    content,
-                    refreshed_at: Instant::now(),
-                });
-            retained
-        }
-    };
+    let content = cached_shareable_content().await?;
     let displays = content.displays();
     let display = match displays
         .iter()
@@ -202,6 +180,40 @@ async fn screenshot_manager_capture(
     }
     cfg.set_scales_to_fit(false);
 
+    capture_screenshot_with_filter(&filter, &cfg).await
+}
+
+async fn cached_shareable_content() -> std::result::Result<arc::R<sc::ShareableContent>, String> {
+    let cached = SHAREABLE_CONTENT_CACHE
+        .lock()
+        .map_err(|_| "shareable content cache lock poisoned".to_string())?
+        .as_ref()
+        .filter(|cached| cached.refreshed_at.elapsed() < SHAREABLE_CONTENT_CACHE_TTL)
+        .map(|cached| cached.content.clone());
+    let content = match cached {
+        Some(content) => content,
+        None => {
+            let content = sc::ShareableContent::current()
+                .await
+                .map_err(|e| format!("failed to get shareable content: {:?}", e))?;
+            let retained = content.clone();
+            *SHAREABLE_CONTENT_CACHE
+                .lock()
+                .map_err(|_| "shareable content cache lock poisoned".to_string())? =
+                Some(CachedShareableContent {
+                    content,
+                    refreshed_at: Instant::now(),
+                });
+            retained
+        }
+    };
+    Ok(content)
+}
+
+async fn capture_screenshot_with_filter(
+    filter: &sc::ContentFilter,
+    cfg: &sc::StreamCfg,
+) -> std::result::Result<DynamicImage, String> {
     let sample = match sc::ScreenshotManager::capture_sample_buf(&filter, &cfg).await {
         Ok(sample) => sample,
         Err(error) => {
@@ -217,6 +229,90 @@ async fn screenshot_manager_capture(
         .ok_or_else(|| "screenshot did not contain an image buffer".to_string())?
         .retained();
     image_buf_to_rgba(&mut image_buf).map(DynamicImage::ImageRgba8)
+}
+
+/// Capture only one window's compositor surface. Other applications are never
+/// rendered into the returned buffer, and the target does not need focus or to
+/// be topmost. Minimized/hidden windows are intentionally rejected by the
+/// metadata selector before this function is called.
+async fn screenshot_manager_capture_window(
+    window_id: u32,
+    target_height: u32,
+) -> std::result::Result<DynamicImage, String> {
+    let content = cached_shareable_content().await?;
+    let windows = content.windows();
+    let window = match windows.iter().find(|window| window.id() == window_id) {
+        Some(window) => window,
+        None => {
+            invalidate_shareable_content_cache();
+            return Err(format!(
+                "window {} not found in shareable content",
+                window_id
+            ));
+        }
+    };
+    let frame = window.frame();
+    let source_width = frame.size.width.max(1.0) as u32;
+    let source_height = frame.size.height.max(1.0) as u32;
+    let (width, height) =
+        scaled_capture_dims_for_height(source_width, source_height, target_height);
+
+    let filter = sc::ContentFilter::with_desktop_independent_window(window);
+    let mut cfg = sc::StreamCfg::new();
+    cfg.set_width(width as usize);
+    cfg.set_height(height as usize);
+    cfg.set_pixel_format(cv::PixelFormat::_32_BGRA);
+    cfg.set_shows_cursor(false);
+    cfg.set_scales_to_fit(false);
+    cfg.set_ignore_shadows_single_window(true);
+    cfg.set_should_be_opaque(true);
+    if api::macos_available("15.0") {
+        cfg.set_show_mouse_clicks(false);
+    }
+
+    capture_screenshot_with_filter(&filter, &cfg).await
+}
+
+/// Request one compositor-backed image for a specific macOS window.
+///
+/// This intentionally has no display-capture fallback: if direct capture
+/// fails, returning an error is safer than accidentally persisting pixels from
+/// applications outside the user's allowlist.
+pub async fn capture_window_image_request_scoped_at_height(
+    window_id: u32,
+    target_height: u32,
+) -> Result<DynamicImage> {
+    if !api::macos_available("14.0") {
+        return Err(anyhow::anyhow!(
+            "request-scoped window capture requires macOS 14 or newer"
+        ));
+    }
+
+    let _permit = MACOS_CAPTURE_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("macOS capture semaphore closed: {}", e))?;
+
+    let request = tokio::task::spawn_blocking(move || {
+        cidre::objc::ar_pool(|| {
+            MACOS_SNAPSHOT_RUNTIME.block_on(async move {
+                let first = screenshot_manager_capture_window(window_id, target_height).await;
+                if first.is_ok() {
+                    return first;
+                }
+
+                // The five-minute content cache may predate a newly opened
+                // window. Refresh once in-request so it can be captured on the
+                // first eligible cycle instead of ten seconds later.
+                invalidate_shareable_content_cache();
+                screenshot_manager_capture_window(window_id, target_height).await
+            })
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("window capture task panicked: {}", e))?;
+
+    request.map_err(anyhow::Error::msg)
 }
 
 /// Optional cap on captured width for the macOS SCK stream. The GPU
